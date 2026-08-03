@@ -1,0 +1,93 @@
+"""Server settings, from the environment.
+
+Environment variables rather than a config file: the server runs in Docker
+behind 1Panel, and env vars are what a panel can set without a shell.
+"""
+
+from __future__ import annotations
+
+import os
+import secrets
+from dataclasses import dataclass
+from pathlib import Path
+
+
+class ConfigError(Exception):
+    pass
+
+
+def _bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+@dataclass
+class Settings:
+    data_dir: Path = Path("/data")
+    host: str = "0.0.0.0"
+    port: int = 8080
+
+    # Shared secret the agent presents on /ws.  Generated on first start if
+    # unset, and written next to the database so it survives restarts.
+    agent_token: str = ""
+
+    session_ttl_hours: int = 24 * 14
+    # Messages older than this are deleted (PLAN.md section 10).  0 disables.
+    message_retention_days: int = 180
+    status_retention_days: int = 30
+
+    # Push retries *per channel*, on top of the first attempt.  A phone that
+    # missed a verification code is the failure mode worth spending time on.
+    notify_retries: int = 2
+    notify_timeout: float = 10.0
+
+    timezone: str = "Asia/Shanghai"
+    # Trust X-Forwarded-For — true behind the 1Panel reverse proxy.
+    behind_proxy: bool = True
+
+    @property
+    def db_path(self) -> Path:
+        return self.data_dir / "hub.db"
+
+    @property
+    def token_path(self) -> Path:
+        return self.data_dir / "agent_token"
+
+    @classmethod
+    def from_env(cls) -> "Settings":
+        settings = cls(
+            data_dir=Path(os.environ.get("HUB_DATA_DIR", "/data")),
+            host=os.environ.get("HUB_HOST", "0.0.0.0"),
+            port=int(os.environ.get("HUB_PORT", "8080")),
+            agent_token=os.environ.get("HUB_AGENT_TOKEN", "").strip(),
+            session_ttl_hours=int(os.environ.get("HUB_SESSION_TTL_HOURS", 24 * 14)),
+            message_retention_days=int(
+                os.environ.get("HUB_MESSAGE_RETENTION_DAYS", "180")
+            ),
+            status_retention_days=int(
+                os.environ.get("HUB_STATUS_RETENTION_DAYS", "30")
+            ),
+            notify_retries=int(os.environ.get("HUB_NOTIFY_RETRIES", "2")),
+            notify_timeout=float(os.environ.get("HUB_NOTIFY_TIMEOUT", "10")),
+            timezone=os.environ.get("HUB_TZ", "Asia/Shanghai"),
+            behind_proxy=_bool("HUB_BEHIND_PROXY", True),
+        )
+        settings.data_dir.mkdir(parents=True, exist_ok=True)
+        settings.ensure_agent_token()
+        return settings
+
+    def ensure_agent_token(self) -> str:
+        """Return the agent token, generating and persisting one if needed."""
+        if self.agent_token:
+            return self.agent_token
+        if self.token_path.exists():
+            self.agent_token = self.token_path.read_text().strip()
+            if self.agent_token:
+                return self.agent_token
+
+        self.agent_token = secrets.token_urlsafe(32)
+        self.token_path.write_text(self.agent_token + "\n")
+        self.token_path.chmod(0o600)
+        return self.agent_token

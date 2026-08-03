@@ -1,0 +1,51 @@
+# air780e-hub — server side.
+#
+# 1Panel: 容器编排 -> 创建编排, paste this file.
+# The container speaks plain HTTP on one port; TLS and the domain are handled
+# by 1Panel's OpenResty reverse proxy (see docs/deploy.md).
+
+services:
+  hub:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+    # Or pull a prebuilt image instead of building:
+    # image: ghcr.io/yourname/air780e-hub:latest
+    container_name: air780e-hub
+    restart: unless-stopped
+
+    ports:
+      # 1Panel's OpenResty usually runs in its own container, so binding to
+      # 127.0.0.1 would be unreachable from it.  Publishing on the host and
+      # keeping the port closed at the firewall is the combination that works.
+      # Only 443 should be open to the internet; 8080 stays LAN-only.
+      - "8080:8080"
+
+    volumes:
+      # SQLite database, agent token and settings.  Back this up.
+      - hub-data:/data
+
+    environment:
+      HUB_TZ: Asia/Shanghai
+      # Leave unset to have a token generated on first start; read it back with
+      #   docker exec air780e-hub hub-server token
+      # HUB_AGENT_TOKEN: ""
+      HUB_MESSAGE_RETENTION_DAYS: "180"
+      HUB_STATUS_RETENTION_DAYS: "30"
+      HUB_BEHIND_PROXY: "true"
+
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  hub-data:

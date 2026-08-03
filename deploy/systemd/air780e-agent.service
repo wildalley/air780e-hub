@@ -1,0 +1,41 @@
+[Unit]
+Description=air780e-hub local agent (owns the Air780E serial ports)
+Documentation=https://github.com/yourname/air780e-hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/air780e-agent/.venv/bin/air780e-agent --config /etc/air780e-agent/config.toml
+Restart=always
+RestartSec=5
+
+# Serial devices belong to the uucp group on Arch (dialout on Debian).
+# Check with: ls -l /dev/ttyACM*
+User=air780e
+Group=uucp
+SupplementaryGroups=uucp
+
+StateDirectory=air780e-agent
+WorkingDirectory=/opt/air780e-agent
+
+# The agent needs the serial ports and an outbound socket; nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ReadWritePaths=/var/lib/air780e-agent
+DeviceAllow=char-ttyACM rw
+
+# Message bodies never reach the journal, but be conservative anyway.
+SyslogIdentifier=air780e-agent
+
+[Install]
+WantedBy=multi-user.target

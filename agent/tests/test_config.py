@@ -1,0 +1,102 @@
+"""Config parsing."""
+
+from __future__ import annotations
+
+import pytest
+
+from air780e_agent.config import AgentConfig, ConfigError
+
+MINIMAL = b"""
+[[devices]]
+name = "a"
+port = "/dev/air780e-a"
+"""
+
+FULL = b"""
+[agent]
+id = "home-arch"
+db = "/tmp/agent.db"
+status_interval = 30.0
+
+[server]
+url = "wss://sms.example.com/ws"
+token = "secret"
+
+[[devices]]
+name = "a"
+label = "\xe7\xa7\xbb\xe5\x8a\xa8\xe5\x8d\xa1"
+port = "/dev/air780e-a"
+storage = "ME"
+
+[[devices]]
+name = "b"
+port = "/dev/air780e-b"
+"""
+
+
+def test_minimal_config_runs_standalone():
+    config = AgentConfig.parse(MINIMAL)
+    assert len(config.devices) == 1
+    assert config.devices[0].name == "a"
+    assert config.server.enabled is False, "no server means standalone, not an error"
+
+
+def test_full_config():
+    config = AgentConfig.parse(FULL)
+    assert config.agent_id == "home-arch"
+    assert config.status_interval == 30.0
+    assert config.server.enabled is True
+    assert config.server.token == "secret"
+    assert [d.name for d in config.devices] == ["a", "b"]
+    assert config.devices[0].label == "移动卡"
+    assert config.devices[0].storage == "ME"
+    assert config.devices[1].storage == "SM"  # default
+
+
+def test_devices_are_required():
+    with pytest.raises(ConfigError, match="no \\[\\[devices\\]\\]"):
+        AgentConfig.parse(b"[agent]\nid = 'x'\n")
+
+
+def test_duplicate_device_names_rejected():
+    raw = b"""
+[[devices]]
+name = "a"
+port = "/dev/one"
+
+[[devices]]
+name = "a"
+port = "/dev/two"
+"""
+    with pytest.raises(ConfigError, match="duplicate device name"):
+        AgentConfig.parse(raw)
+
+
+def test_device_needs_a_port():
+    with pytest.raises(ConfigError, match="name and port"):
+        AgentConfig.parse(b'[[devices]]\nname = "a"\n')
+
+
+def test_server_url_without_token_rejected():
+    raw = b"""
+[server]
+url = "wss://example.com/ws"
+
+[[devices]]
+name = "a"
+port = "/dev/one"
+"""
+    with pytest.raises(ConfigError, match="token is empty"):
+        AgentConfig.parse(raw)
+
+
+def test_bad_toml_is_reported_clearly():
+    with pytest.raises(ConfigError):
+        AgentConfig.parse(b"this is not toml [[[")
+
+
+def test_example_config_is_valid():
+    from air780e_agent.config import EXAMPLE_CONFIG
+
+    config = AgentConfig.parse(EXAMPLE_CONFIG.encode())
+    assert [d.name for d in config.devices] == ["a", "b"]

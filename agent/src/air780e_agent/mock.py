@@ -1,0 +1,419 @@
+"""A fake Air780E that speaks AT, so the whole agent can be built and tested
+before the hardware arrives.
+
+Response formats follow the openLuat AT manual
+(https://docs.openluat.com/air780e/at/app/at_command).  The parts worth
+imitating faithfully are the awkward ones:
+
+* ``AT+CMGS`` is two-step — it answers ``> `` and waits for a Ctrl-Z body.
+* Message storage is *small and finite*.  When it fills up, new messages are
+  silently dropped by the network side.  That is the single biggest
+  data-loss risk in this project, so the mock reproduces it and the agent is
+  tested against it.
+* URCs arrive whenever they feel like it, including mid-command.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+
+from .at.transport import Transport
+from .pdu import codec
+
+log = logging.getLogger(__name__)
+
+CRLF = "\r\n"
+
+STAT_REC_UNREAD = 0
+STAT_REC_READ = 1
+
+DEFAULT_MODEL = "AirM2M_780E_V1171_LTE_AT"
+
+
+@dataclass
+class StoredMessage:
+    index: int
+    stat: int
+    pdu: str
+
+    @property
+    def tpdu_len(self) -> int:
+        """Length ``+CMGL``/``+CMGR`` report: TPDU octets, excluding the SMSC."""
+        raw = bytes.fromhex(self.pdu)
+        return len(raw) - 1 - raw[0]
+
+
+@dataclass
+class MockAir780E:
+    transport: Transport
+
+    model: str = DEFAULT_MODEL
+    imei: str = "867567048825499"
+    iccid: str = "89860622180012345678"
+    smsc: str = "+8613800210500"
+    operator: str = "CHINA MOBILE"
+
+    # Storage is deliberately tiny by default — that is what a SIM gives you.
+    # 10 is what an AirM2M_780EPV_V1011 actually reported, for both "SM" and
+    # "ME" (measured 2026-08-03); the 20~50 assumed while planning was
+    # optimistic.
+    capacity: int = 10
+    storage: str = "SM"
+
+    rssi: int = 24  # 0..31, 99 = unknown
+    rsrp: int = 55  # +CESQ encoding
+    rsrq: int = 20
+    registered: bool = True
+    pin_ready: bool = True
+
+    # Failure injection for tests.
+    fail_next_send: bool = False
+    unsupported: set[str] = field(default_factory=set)
+    # Chop this many hex characters off the PDU that +CMGR returns, while the
+    # header keeps advertising the full length.  Real hardware did this once:
+    # the body came back short with no error on the wire.  Counts down, so 1
+    # means "corrupt the next read only".
+    truncate_reads: int = 0
+
+    _messages: dict[int, StoredMessage] = field(default_factory=dict)
+    _next_index: int = 1
+    _next_mr: int = 0
+    _echo: bool = False
+    _cmee: int = 2
+    _cmgf: int = 0
+    _pending_send: int | None = None
+    _send_buffer: str = ""
+    _buffer: bytearray = field(default_factory=bytearray)
+    sent: list[codec.DecodedSms] = field(default_factory=list)
+    pings: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.transport.set_reader(self._feed)
+
+    # -- lifecycle ---------------------------------------------------------
+
+    async def start(self) -> None:
+        await self.transport.open()
+
+    async def stop(self) -> None:
+        await self.transport.close()
+
+    # -- test/console hooks ------------------------------------------------
+
+    def deliver(self, sender: str, text: str, *, when: datetime | None = None) -> bool:
+        """Simulate an incoming SMS.
+
+        Returns False and drops the message when storage is full, exactly as a
+        real SIM does — no URC is emitted, so the agent never learns about it.
+        """
+        pdus = codec.encode_deliver(sender, text, when=when)
+        if len(self._messages) + len(pdus) > self.capacity:
+            log.warning("mock storage full (%d/%d), dropping message",
+                        len(self._messages), self.capacity)
+            return False
+        for pdu in pdus:
+            index = self._next_index
+            self._next_index += 1
+            self._messages[index] = StoredMessage(index, STAT_REC_UNREAD, pdu)
+            self._urc(f'+CMTI: "{self.storage}",{index}')
+        return True
+
+    @property
+    def stored_count(self) -> int:
+        return len(self._messages)
+
+    def fill_storage(self, count: int) -> None:
+        """Preload junk so tests can drive the near-full boundary."""
+        for i in range(count):
+            self.deliver("10086", f"filler {i}")
+
+    # -- wire --------------------------------------------------------------
+
+    def _write(self, text: str) -> None:
+        self.transport.write(text.encode())
+
+    def _urc(self, line: str) -> None:
+        self._write(f"{CRLF}{line}{CRLF}")
+
+    def _reply(self, lines: list[str] | None = None, final: str = "OK") -> None:
+        out = "".join(f"{CRLF}{line}{CRLF}" for line in (lines or []))
+        self._write(f"{out}{CRLF}{final}{CRLF}")
+
+    def _error(self, cms: int | None = None, cme: int | None = None) -> None:
+        if cms is not None:
+            self._reply(final=f"+CMS ERROR: {cms}")
+        elif cme is not None and self._cmee:
+            self._reply(final=f"+CME ERROR: {cme}")
+        else:
+            self._reply(final="ERROR")
+
+    def _feed(self, data: bytes) -> None:
+        self._buffer.extend(data)
+
+        # A pending AT+CMGS swallows everything up to Ctrl-Z as the PDU body.
+        if self._pending_send is not None:
+            text = self._buffer.decode("utf-8", errors="replace")
+            if "\x1a" in text:
+                body, _, rest = text.partition("\x1a")
+                self._buffer = bytearray(rest.encode())
+                self._finish_send(self._send_buffer + body)
+            elif "\x1b" in text:  # ESC aborts the send
+                self._buffer.clear()
+                self._pending_send = None
+                self._send_buffer = ""
+                self._reply(final="OK")
+            else:
+                self._send_buffer += text
+                self._buffer.clear()
+            return
+
+        while True:
+            index = self._buffer.find(b"\r")
+            if index < 0:
+                break
+            line = self._buffer[:index].decode("utf-8", errors="replace").strip()
+            del self._buffer[: index + 1]
+            if line:
+                if self._echo:
+                    self._write(line + "\r")
+                self._dispatch(line)
+
+    # -- command dispatch --------------------------------------------------
+
+    def _dispatch(self, line: str) -> None:
+        upper = line.upper()
+
+        for name in self.unsupported:
+            if upper.startswith(name.upper()):
+                self._error(cme=4)
+                return
+
+        if upper == "AT":
+            return self._reply()
+        if upper == "ATI":
+            return self._reply([self.model])
+        if upper in ("ATE0", "ATE1"):
+            self._echo = upper.endswith("1")
+            return self._reply()
+        if upper.startswith("AT+CMEE="):
+            self._cmee = int(upper.split("=", 1)[1] or 0)
+            return self._reply()
+        if upper.startswith("AT+CMGF="):
+            self._cmgf = int(upper.split("=", 1)[1] or 0)
+            return self._reply()
+        if upper.startswith("AT+CNMI="):
+            return self._reply()
+        if upper.startswith("AT+CSCS="):
+            return self._reply()
+
+        if upper == "AT+CPIN?":
+            if not self.pin_ready:
+                return self._error(cme=11)
+            return self._reply(["+CPIN: READY"])
+        if upper == "AT+CSQ":
+            return self._reply([f"+CSQ: {self.rssi},99"])
+        if upper == "AT+CESQ":
+            return self._reply([f"+CESQ: 99,99,255,255,{self.rsrq},{self.rsrp}"])
+        if upper == "AT+COPS?":
+            if not self.registered:
+                return self._reply(["+COPS: 0"])
+            return self._reply([f'+COPS: 0,0,"{self.operator}",7'])
+        if upper in ("AT+CEREG?", "AT+CREG?"):
+            name = "+CEREG" if "CEREG" in upper else "+CREG"
+            return self._reply([f"{name}: 0,{1 if self.registered else 2}"])
+        if upper in ("AT+ICCID", "AT+CCID"):
+            return self._reply([f"+ICCID: {self.iccid}"])
+        if upper == "AT+CGSN":
+            return self._reply([self.imei])
+        if upper == "AT+CGMR":
+            return self._reply([self.model])
+        if upper == "AT+CSCA?":
+            return self._reply([f'+CSCA: "{self.smsc}",145'])
+        if upper == "AT+CBC":
+            return self._reply(["+CBC: 0,80,4012"])
+        if upper == "AT+CCLK?":
+            now = datetime.now(timezone(timedelta(hours=8)))
+            return self._reply([f'+CCLK: "{now:%y/%m/%d,%H:%M:%S}+32"'])
+
+        if upper.startswith("AT+CPMS"):
+            return self._handle_cpms(line)
+        if upper.startswith("AT+CMGL"):
+            return self._handle_cmgl(line)
+        if upper.startswith("AT+CMGR"):
+            return self._handle_cmgr(line)
+        if upper.startswith("AT+CMGD"):
+            return self._handle_cmgd(line)
+        if upper.startswith("AT+CMGS"):
+            return self._handle_cmgs(line)
+        if upper.startswith("AT+CIPPING"):
+            return self._handle_ping(line)
+
+        self._error(cme=4)
+
+    def _handle_cpms(self, line: str) -> None:
+        used, cap = len(self._messages), self.capacity
+        if line.endswith("?"):
+            return self._reply(
+                [f'+CPMS: "{self.storage}",{used},{cap},'
+                 f'"{self.storage}",{used},{cap},'
+                 f'"{self.storage}",{used},{cap}']
+            )
+        match = re.search(r'"(\w+)"', line)
+        if match:
+            self.storage = match.group(1)
+        self._reply([f"+CPMS: {used},{cap},{used},{cap},{used},{cap}"])
+
+    def _handle_cmgl(self, line: str) -> None:
+        stat = 4
+        if "=" in line:
+            try:
+                stat = int(line.split("=", 1)[1].strip() or 4)
+            except ValueError:
+                return self._error(cms=304)
+
+        lines: list[str] = []
+        for msg in sorted(self._messages.values(), key=lambda m: m.index):
+            if stat != 4 and msg.stat != stat:
+                continue
+            lines.append(f"+CMGL: {msg.index},{msg.stat},,{msg.tpdu_len}")
+            lines.append(msg.pdu)
+            msg.stat = STAT_REC_READ
+        self._reply(lines)
+
+    def _handle_cmgr(self, line: str) -> None:
+        try:
+            index = int(line.split("=", 1)[1].strip())
+        except (IndexError, ValueError):
+            return self._error(cms=304)
+        msg = self._messages.get(index)
+        if msg is None:
+            return self._error(cms=321)  # invalid memory index
+        pdu = msg.pdu
+        if self.truncate_reads > 0:
+            self.truncate_reads -= 1
+            pdu = pdu[:-4] or pdu
+        self._reply([f"+CMGR: {msg.stat},,{msg.tpdu_len}", pdu])
+        msg.stat = STAT_REC_READ
+
+    def _handle_cmgd(self, line: str) -> None:
+        try:
+            args = line.split("=", 1)[1].split(",")
+            index = int(args[0])
+            flag = int(args[1]) if len(args) > 1 else 0
+        except (IndexError, ValueError):
+            return self._error(cms=304)
+
+        if flag == 4:  # delete everything, regardless of index
+            self._messages.clear()
+            return self._reply()
+        if flag == 1:  # all read messages
+            for key in [k for k, m in self._messages.items() if m.stat == STAT_REC_READ]:
+                del self._messages[key]
+            return self._reply()
+        if index not in self._messages:
+            return self._error(cms=321)
+        del self._messages[index]
+        self._reply()
+
+    def _handle_cmgs(self, line: str) -> None:
+        if self._cmgf != 0:
+            return self._error(cms=305)  # only PDU mode is implemented
+        try:
+            length = int(line.split("=", 1)[1].strip())
+        except (IndexError, ValueError):
+            return self._error(cms=304)
+        self._pending_send = length
+        self._send_buffer = ""
+        self._write(f"{CRLF}> ")
+
+    def _finish_send(self, body: str) -> None:
+        expected = self._pending_send
+        self._pending_send = None
+        self._send_buffer = ""
+        pdu = re.sub(r"\s", "", body)
+
+        if self.fail_next_send:
+            self.fail_next_send = False
+            return self._error(cms=41)  # temporary failure
+
+        try:
+            decoded = codec.decode_pdu(pdu)
+            actual = len(bytes.fromhex(pdu)) - 1
+        except Exception:
+            return self._error(cms=304)
+
+        if expected is not None and actual != expected:
+            log.warning("mock: AT+CMGS length %d but PDU carries %d", expected, actual)
+            return self._error(cms=304)
+
+        self.sent.append(decoded)
+        mr = self._next_mr
+        self._next_mr = (self._next_mr + 1) % 256
+        self._reply([f"+CMGS: {mr}"])
+
+    def _handle_ping(self, line: str) -> None:
+        match = re.search(r'"([^"]+)"', line)
+        host = match.group(1) if match else "unknown"
+        self.pings.append(host)
+        self._reply([f'+CIPPING: 1,"{host}",32,118,64'])
+
+
+# --------------------------------------------------------------------------
+# standalone runner: expose the mock on a pty for manual poking
+# --------------------------------------------------------------------------
+
+
+async def _run_console() -> None:
+    from .at.transport import FdTransport, create_pty_pair
+
+    pair = create_pty_pair()
+    mock = MockAir780E(transport=FdTransport(pair.master_fd, "mock"))
+    await mock.start()
+
+    print(f"mock Air780E listening on: {pair.slave_path}")
+    print("commands:  sms <sender> <text>   |  fill <n>  |  signal <0-31>  |  quit")
+    print("try it with:  python -m air780e_agent.probe " + pair.slave_path)
+
+    loop = asyncio.get_running_loop()
+    reader = asyncio.StreamReader()
+    await loop.connect_read_pipe(
+        lambda: asyncio.StreamReaderProtocol(reader), __import__("sys").stdin
+    )
+
+    while True:
+        line = (await reader.readline()).decode().strip()
+        if not line:
+            continue
+        verb, _, rest = line.partition(" ")
+        if verb in ("quit", "exit"):
+            break
+        if verb == "sms":
+            sender, _, text = rest.partition(" ")
+            ok = mock.deliver(sender or "10086", text or "test")
+            print("delivered" if ok else "DROPPED — storage full")
+        elif verb == "fill":
+            mock.fill_storage(int(rest or 1))
+            print(f"stored: {mock.stored_count}/{mock.capacity}")
+        elif verb == "signal":
+            mock.rssi = int(rest)
+            print(f"rssi = {mock.rssi}")
+        else:
+            print(f"unknown command: {verb}")
+
+    await mock.stop()
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    try:
+        asyncio.run(_run_console())
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

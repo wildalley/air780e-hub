@@ -1,0 +1,32 @@
+# --- Python ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+
+# --- Node / frontend -------------------------------------------------------
+node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+
+# The built SPA, copied here to run the server straight from a checkout.
+# The Docker image builds its own copy (server/Dockerfile), so this is a
+# local artefact, not source.
+server/src/hub_server/www/
+
+# --- Secrets and local state ----------------------------------------------
+# Bring-up scratch directory: the agent token, the SQLite databases (which
+# hold the push webhook and every received message), session cookies, logs,
+# and an agent config with the server token in it.  None of it belongs here.
+.local/
+.tmp/
+
+# Real agent configs live outside the repo (/etc/air780e-agent/), but keep a
+# stray copy from ever being committed.
+agent.toml
+config.toml
+
+# Claude Code's per-machine settings — records local paths and commands.
+# The whole directory: the tool also writes transient .tmp.* files here.
+.claude/
