@@ -221,24 +221,31 @@ sudo systemctl mask ModemManager
 SUBSYSTEM=="usb", ATTR{idVendor}=="19d1", ATTR{idProduct}=="0001", ENV{ID_MM_DEVICE_IGNORE}="1"
 ```
 
-### 3.3 ⚠️ 两个模块的设备名固定 —— 必须按 USB 端口路径
+### 3.3 两个模块的设备名固定 —— agent 按 IMEI/ICCID 自己找
 
-`ttyACM*` 编号跟插入顺序走,重启或重插就变。常规做法是按序列号绑 `by-id`,**但注意上面 dmesg 里 `SerialNumber=000000000001` 是通用值 —— 两个同型号模块极可能序列号完全相同**,`by-id` 会直接撞车。
+`ttyACM*` 编号跟插入顺序走,重启或重插就变。常规做法是按序列号绑 `by-id`,**但上面 dmesg 里 `SerialNumber=000000000001` 是通用值 —— 两个同型号模块序列号完全相同**(本机实测已确认),`by-id` 会直接撞车。
 
-因此必须**按 USB 物理端口路径绑定**,并把模块插死在固定的两个口上:
-
-```bash
-udevadm info -a /dev/ttyACM3 | grep KERNELS   # 拿到类似 1-2 / 1-3
-```
-
-规则形如(到货后按实际值补全):
+退而求其次是按 USB 物理端口路径绑:
 
 ```
-SUBSYSTEM=="tty", KERNELS=="1-2", ATTRS{bInterfaceNumber}=="02", SYMLINK+="air780e-a"
-SUBSYSTEM=="tty", KERNELS=="1-3", ATTRS{bInterfaceNumber}=="02", SYMLINK+="air780e-b"
+SUBSYSTEM=="tty", KERNELS=="1-3", ATTRS{bInterfaceNumber}=="02", SYMLINK+="air780e-a"
 ```
 
-> `bInterfaceNumber` 用于从 3 个 ACM 口里挑出 AT 口,具体值**待验证**。
+**实测值**:本机模块在 USB 端口 `1-3`,三个 ACM 口的接口号是 `02` / `04` / `06`,其中 `02` 和 `06` 都应答 AT,`+CMTI` 确认走 `02`。
+
+但这条路的根本问题是:**它拿"插在哪个孔"当身份**。换个 USB 口就要改规则,而且 udev 永远解决不了"哪个模块是哪个" —— IMEI 在 AT 层,不在 USB 描述符里,udev 根本读不到。
+
+所以 agent 改成**自己找**(取代原决策 D8):启动和每次重连时枚举 `/dev/ttyACM*`,逐个问 `ATI` / `AT+CGSN` / `AT+ICCID`,认领身份匹配的那个口。
+
+```toml
+[[devices]]
+name = "a"
+imei = "863304089655700"      # 按模块认;或 iccid 按卡认
+```
+
+于是:换 USB 口不用改配置,`ttyACM` 重新编号无所谓,USB 复位后模块换个号回来会被自动重新认上。不应答的两个 ACM 口自然被排除,顺带也就不需要猜哪个是 AT 口了。
+
+udev 规则**仍然支持**(配置里写 `port` 就跳过发现),但只在你确实想要固定符号链接时才需要。`ID_MM_DEVICE_IGNORE` 那两条建议留着,防 ModemManager 抢口。
 
 ### 3.4 供电
 

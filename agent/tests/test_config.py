@@ -72,9 +72,42 @@ port = "/dev/two"
         AgentConfig.parse(raw)
 
 
-def test_device_needs_a_port():
-    with pytest.raises(ConfigError, match="name and port"):
-        AgentConfig.parse(b'[[devices]]\nname = "a"\n')
+def test_device_needs_a_name():
+    with pytest.raises(ConfigError, match="needs a name"):
+        AgentConfig.parse(b'[[devices]]\nport = "/dev/one"\n')
+
+
+def test_a_lone_device_needs_no_identity():
+    """One module and nothing to go on is unambiguous — there is only one
+    thing it could be, so discovery is allowed to take it."""
+    config = AgentConfig.parse(b'[[devices]]\nname = "a"\n')
+    assert config.devices[0].port == ""
+    assert config.devices[0].is_pinned is False
+
+
+def test_two_devices_must_each_be_identifiable():
+    raw = b"""
+[[devices]]
+name = "a"
+imei = "863304089655700"
+
+[[devices]]
+name = "b"
+"""
+    with pytest.raises(ConfigError, match="port, imei or iccid"):
+        AgentConfig.parse(raw)
+
+
+def test_identity_fields_are_read():
+    raw = b"""
+[[devices]]
+name = "a"
+imei = "863304089655700"
+iccid = "8964052040035110800F"
+"""
+    device = AgentConfig.parse(raw).devices[0]
+    assert device.imei == "863304089655700"
+    assert device.iccid == "8964052040035110800F"
 
 
 def test_server_url_without_token_rejected():

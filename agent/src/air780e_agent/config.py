@@ -25,11 +25,19 @@ class ConfigError(Exception):
 @dataclass
 class DeviceConfig:
     name: str
-    port: str
+    # Empty means "find me": the agent probes the candidate ports and claims
+    # the one whose imei/iccid matches.  Set it to pin a udev symlink instead.
+    port: str = ""
+    imei: str = ""
+    iccid: str = ""
     storage: str = "SM"
     label: str = ""
     baudrate: int = 115200
     delete_after_read: bool = True
+
+    @property
+    def is_pinned(self) -> bool:
+        return bool(self.port)
 
 
 @dataclass
@@ -63,6 +71,10 @@ class AgentConfig:
     scheduler_tick: float = 30.0
     # Wait between keep-alive retries (multiplied by the attempt number).
     scheduler_retry_delay: float = 60.0
+    # Where to look for modules whose [[devices]] block gives no explicit
+    # port.  Every match is probed; the ones that do not speak AT drop out.
+    port_glob: str = "/dev/ttyACM*"
+    probe_timeout: float = 3.0
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "AgentConfig":
@@ -91,6 +103,8 @@ class AgentConfig:
             max_queued_events=int(agent.get("max_queued_events", 100_000)),
             scheduler_tick=float(agent.get("scheduler_tick", 30.0)),
             scheduler_retry_delay=float(agent.get("scheduler_retry_delay", 60.0)),
+            port_glob=str(agent.get("port_glob", "/dev/ttyACM*")),
+            probe_timeout=float(agent.get("probe_timeout", 3.0)),
         )
 
         server = data.get("server", {})
@@ -106,16 +120,31 @@ class AgentConfig:
 
         seen: set[str] = set()
         for entry in devices:
-            if "name" not in entry or "port" not in entry:
-                raise ConfigError("each [[devices]] needs both name and port")
+            if "name" not in entry:
+                raise ConfigError("each [[devices]] needs a name")
             name = str(entry["name"])
             if name in seen:
                 raise ConfigError(f"duplicate device name {name!r}")
             seen.add(name)
+
+            port = str(entry.get("port", "")).strip()
+            imei = str(entry.get("imei", "")).strip()
+            iccid = str(entry.get("iccid", "")).strip()
+            # One module with nothing to go on is unambiguous — there is only
+            # one thing it could be.  Two are not, and picking by enumeration
+            # order would silently swap the cards after a replug.
+            if not (port or imei or iccid) and len(devices) > 1:
+                raise ConfigError(
+                    f"device {name!r} needs port, imei or iccid — with more "
+                    "than one module the agent cannot tell them apart"
+                )
+
             config.devices.append(
                 DeviceConfig(
                     name=name,
-                    port=str(entry["port"]),
+                    port=port,
+                    imei=imei,
+                    iccid=iccid,
                     storage=str(entry.get("storage", "SM")),
                     label=str(entry.get("label", "")),
                     baudrate=int(entry.get("baudrate", 115200)),
@@ -143,18 +172,25 @@ status_interval = 60.0
 url = "wss://sms.example.com/ws"
 token = "change-me"
 
-# One block per module.  Bind these paths with udev rules by USB port path —
-# two identical modules usually report the same serial number, so by-id will
-# collide.  See docs/at-reference.md section 3.3.
+# One block per module.  The agent finds each one by asking the modules who
+# they are (ATI / AT+CGSN / AT+ICCID) and claiming the port whose identity
+# matches — so it does not matter which USB socket a module is in, or how
+# /dev/ttyACM* happens to be numbered after a reboot.
+#
+# Find the values with:  python -m air780e_agent.probe --scan
+#
+#   imei   identifies the module   — survives swapping the SIM card
+#   iccid  identifies the card     — survives swapping the module
+#   port   pins a path outright    — for a udev symlink; skips discovery
+#
+# Give both imei and iccid to require "this card, in this module".
 [[devices]]
 name = "a"
 label = "移动卡"
-port = "/dev/air780e-a"
-storage = "SM"
+imei = "863304089655700"
 
 [[devices]]
 name = "b"
 label = "联通卡"
-port = "/dev/air780e-b"
-storage = "SM"
+imei = "863304089655701"
 """

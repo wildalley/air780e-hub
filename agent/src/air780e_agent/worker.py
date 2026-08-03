@@ -11,15 +11,18 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
-from typing import Any, Callable, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Protocol
 
 from .at import ATClient, ATError, SerialTransport, Transport
 from .config import DeviceConfig
 from .modem import Air780E, Signal
 from .pdu import DecodedSms
 from .store import LocalStore
+
+if TYPE_CHECKING:  # imported for typing only — discovery imports config, not us
+    from .discovery import PortRegistry
 
 log = logging.getLogger(__name__)
 
@@ -90,6 +93,7 @@ class DeviceWorker:
         status_interval: float = 60.0,
         reconnect_max_delay: float = 60.0,
         transport_factory: TransportFactory = _default_transport,
+        registry: "PortRegistry | None" = None,
     ) -> None:
         self.config = config
         self.store = store
@@ -97,6 +101,11 @@ class DeviceWorker:
         self.status_interval = status_interval
         self.reconnect_max_delay = reconnect_max_delay
         self._transport_factory = transport_factory
+        # Absent for a pinned port; required to find an unpinned module.
+        self._registry = registry
+        # The port actually in use, which for a discovered module is only
+        # known once it has answered.
+        self._port = config.port
 
         self.state = DeviceState()
         self._client: ATClient | None = None
@@ -118,7 +127,7 @@ class DeviceWorker:
         return {
             "name": self.name,
             "label": self.config.label,
-            "port": self.config.port,
+            "port": self._port or self.config.port,
             **self.state.describe(),
         }
 
@@ -151,8 +160,21 @@ class DeviceWorker:
         await self._teardown()
 
     async def _connect(self) -> None:
-        log.info("[%s] opening %s", self.name, self.config.port)
-        transport = self._transport_factory(self.config)
+        # Resolving the port here rather than at startup is what makes a
+        # module survive being moved to another socket, or coming back from a
+        # USB reset under a different ttyACM number: every reconnect attempt
+        # goes looking again.
+        if self.config.is_pinned:
+            self._port = self.config.port
+        elif self._registry is not None:
+            self._port = await self._registry.acquire(self.config)
+        else:
+            raise RuntimeError(
+                f"device {self.name!r} has no port and no way to discover one"
+            )
+
+        log.info("[%s] opening %s", self.name, self._port)
+        transport = self._transport_factory(replace(self.config, port=self._port))
         client = ATClient(transport, name=self.name)
         await client.open()
         self._client = client
@@ -207,6 +229,12 @@ class DeviceWorker:
                 await client.close()
             except Exception:
                 pass
+        # Give the port back before retrying: after a USB reset the module
+        # usually reappears under a different name, and holding the old claim
+        # would keep this worker (and any other) from taking the new one.
+        if self._registry is not None and not self.config.is_pinned and self._port:
+            self._registry.release(self._port)
+            self._port = ""
 
     def _go_offline(self, reason: str) -> None:
         was_online = self.state.online

@@ -10,6 +10,7 @@ import pytest
 from air780e_agent.app import AgentApp
 from air780e_agent.at import PipeTransport
 from air780e_agent.config import AgentConfig, DeviceConfig
+from air780e_agent.discovery import PortRegistry, ProbeResult
 from air780e_agent.mock import MockAir780E
 from air780e_agent.store import LocalStore
 
@@ -102,6 +103,78 @@ async def test_both_devices_come_up(agent):
     # Each module must be identified separately — this is what SimAdmin's
     # single-modem model could not express.
     assert described["a"]["iccid"] != described["b"]["iccid"]
+
+
+async def test_workers_come_up_on_discovered_ports(tmp_path, monkeypatch):
+    """No ports in the config: each worker has to find its own module, and
+    the one it reports must be the one it actually opened."""
+    config = AgentConfig.parse(b"""
+[agent]
+id = "discovering-agent"
+status_interval = 0.05
+
+[[devices]]
+name = "a"
+imei = "867567048825490"
+
+[[devices]]
+name = "b"
+imei = "867567048825491"
+""")
+    config.db_path = tmp_path / "agent.db"
+
+    mocks: dict[str, MockAir780E] = {}
+    transports: dict[str, PipeTransport] = {}
+    # Deliberately crossed: the module with device a's IMEI sits on the port
+    # that would have been b's under any positional scheme.
+    for port, index in (("/dev/ttyACM0", 1), ("/dev/ttyACM1", 0)):
+        agent_side, modem_side = PipeTransport.create_pair()
+        mock = MockAir780E(
+            transport=modem_side,
+            iccid=f"8986062218001234567{index}",
+            imei=f"86756704882549{index}",
+        )
+        await mock.start()
+        mocks[port] = mock
+        transports[port] = agent_side
+
+    async def prober(port: str, *, timeout: float):
+        mock = mocks.get(port)
+        return None if mock is None else ProbeResult(
+            port=port, model=mock.model, imei=mock.imei, iccid=mock.iccid
+        )
+
+    # Never look at the real /dev — the suite must pass on a machine with no
+    # modules plugged in.
+    monkeypatch.setattr(
+        "air780e_agent.discovery.globmodule.glob",
+        lambda pattern: ["/dev/ttyACM0", "/dev/ttyACM1"],
+    )
+
+    app = AgentApp(
+        config,
+        transport_factory=lambda device: transports[device.port],
+        registry=PortRegistry(prober=prober),
+    )
+    runner = asyncio.create_task(app.run())
+    try:
+        async with asyncio.timeout(3.0):
+            while not all(w.online for w in app.workers.values()):
+                await asyncio.sleep(0.01)
+
+        described = {d["name"]: d for d in app.describe_devices()}
+        # a's module (imei ...90) was put on ttyACM1 and b's on ttyACM0, so
+        # anything that went by position would have these the other way round.
+        assert described["a"]["port"] == "/dev/ttyACM1"
+        assert described["b"]["port"] == "/dev/ttyACM0"
+        assert described["a"]["imei"] == "867567048825490"
+        assert described["b"]["imei"] == "867567048825491"
+    finally:
+        await app.stop()
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        for mock in mocks.values():
+            await mock.stop()
 
 
 async def test_startup_emits_status_for_each_device(agent):

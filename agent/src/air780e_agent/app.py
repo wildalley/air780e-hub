@@ -13,6 +13,7 @@ from typing import Any
 
 from . import __version__
 from .config import AgentConfig
+from .discovery import PortRegistry
 from .link import ServerLink
 from .scheduler import KeepAliveScheduler
 from .store import LocalStore
@@ -28,10 +29,19 @@ class AgentApp:
         *,
         transport_factory: TransportFactory = _default_transport,
         store: LocalStore | None = None,
+        registry: PortRegistry | None = None,
     ) -> None:
         self.config = config
         self.store = store or LocalStore(config.db_path)
         self.workers: dict[str, DeviceWorker] = {}
+
+        # Shared, so two workers never probe at the same moment or claim the
+        # same port.  Only needed by devices that did not pin one.
+        self.registry = registry or PortRegistry(
+            port_glob=config.port_glob,
+            probe_timeout=config.probe_timeout,
+            sole_device=len(config.devices) == 1,
+        )
 
         for device in config.devices:
             self.workers[device.name] = DeviceWorker(
@@ -41,6 +51,7 @@ class AgentApp:
                 status_interval=config.status_interval,
                 reconnect_max_delay=config.reconnect_max_delay,
                 transport_factory=transport_factory,
+                registry=self.registry,
             )
 
         self.link = ServerLink(

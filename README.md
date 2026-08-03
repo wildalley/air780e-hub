@@ -113,6 +113,7 @@
 
 ### 设备与状态
 - [x] 多模块并行,每模块独立 worker
+- [x] **按 IMEI / ICCID 自动认领串口** —— 换 USB 口、`ttyACM` 重新编号都不用改配置
 - [x] 信号(`AT+CSQ` / `AT+CESQ` RSRP/RSRQ)、运营商、注册状态、小区信息
 - [x] 信号历史曲线
 - [x] SIM 信息:ICCID、卡状态、短信中心号

@@ -1,9 +1,19 @@
-# Fix the device names for two Air780E modules.
+# Optional: fixed device names for Air780E modules.
 #
-# WHY BY PORT PATH AND NOT BY SERIAL: two identical modules usually report the
-# same USB serial number (`000000000001`), so /dev/serial/by-id collides and
-# you get one symlink for two devices.  Binding to the physical USB port is
-# unambiguous — at the cost of having to keep each module in its own port.
+# NOT REQUIRED any more.  The agent finds each module by asking it for its
+# IMEI/ICCID and claiming the matching port, so it survives being moved to
+# another socket and ttyACM renumbering on its own — configure `imei` in the
+# [[devices]] block and leave `port` empty.  See docs/at-reference.md 3.3.
+#
+# Use this file only if you want a stable symlink for other tools, or prefer
+# pinning modules to physical sockets.  Then set `port = "/dev/air780e-a"`.
+#
+# WHY BY PORT PATH AND NOT BY SERIAL: two identical modules report the same
+# USB serial number (`000000000001` — confirmed on real hardware), so
+# /dev/serial/by-id collides and you get one symlink for two devices.  Binding
+# to the physical USB port is unambiguous — at the cost of having to keep each
+# module in its own port, which is exactly what the agent's own discovery
+# avoids.
 #
 # TO FILL THIS IN, after plugging both modules in:
 #
@@ -11,28 +21,30 @@
 #        python -m air780e_agent.probe --scan
 #
 #   2. Get the USB port path and interface number of each AT port:
-#        udevadm info -a /dev/ttyACM3 | grep -m3 KERNELS
-#        udevadm info -a /dev/ttyACM3 | grep -m1 bInterfaceNumber
+#        udevadm info -a /dev/ttyACM0 | grep -m3 KERNELS
+#        udevadm info -a /dev/ttyACM0 | grep -m1 bInterfaceNumber
 #
-#   3. Replace the KERNELS and ATTRS values below, then:
+#   3. Replace the KERNELS values below, then:
 #        sudo udevadm control --reload-rules && sudo udevadm trigger
 #        ls -l /dev/air780e-*
 #
-# Verify the VID/PID against your own `dmesg` output first — 19d1:0001 is what
-# an EigenComm EC618 reported in the field, but firmware revisions differ.
+# Measured on an AirM2M_780EPV_V1011: VID:PID 19d1:0001, USB port path "1-3",
+# three ACM interfaces numbered 02 / 04 / 06 — 02 and 06 both answer AT, and
+# +CMTI arrives on 02.
 
 # Keep ModemManager away from these ports.  It probes every ttyACM it sees and
 # will fight the agent for the port (symptom: garbled responses, random
 # timeouts).  `systemctl mask ModemManager` is the blunter alternative.
+# KEEP THESE TWO even if you use the agent's discovery instead of the symlinks.
 SUBSYSTEM=="usb", ATTR{idVendor}=="19d1", ATTR{idProduct}=="0001", ENV{ID_MM_DEVICE_IGNORE}="1"
 SUBSYSTEM=="tty", ATTRS{idVendor}=="19d1", ATTRS{idProduct}=="0001", ENV{ID_MM_PORT_IGNORE}="1"
 
-# Module A — replace KERNELS with the real USB port path (e.g. "1-2").
+# Module A — replace KERNELS with the real USB port path (e.g. "1-3").
 SUBSYSTEM=="tty", ATTRS{idVendor}=="19d1", ATTRS{idProduct}=="0001", \
-  KERNELS=="REPLACE-ME-A", ATTRS{bInterfaceNumber}=="06", \
+  KERNELS=="REPLACE-ME-A", ATTRS{bInterfaceNumber}=="02", \
   SYMLINK+="air780e-a", GROUP="uucp", MODE="0660"
 
-# Module B — replace KERNELS with the other USB port path (e.g. "1-3").
+# Module B — replace KERNELS with the other USB port path.
 SUBSYSTEM=="tty", ATTRS{idVendor}=="19d1", ATTRS{idProduct}=="0001", \
-  KERNELS=="REPLACE-ME-B", ATTRS{bInterfaceNumber}=="06", \
+  KERNELS=="REPLACE-ME-B", ATTRS{bInterfaceNumber}=="02", \
   SYMLINK+="air780e-b", GROUP="uucp", MODE="0660"

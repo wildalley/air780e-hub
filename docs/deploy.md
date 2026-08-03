@@ -131,7 +131,7 @@ cd /opt/air780e-agent/agent
 sudo uv venv .venv && sudo uv pip install --python .venv .
 ```
 
-### 2. 串口权限与 udev
+### 2. 串口权限
 
 Arch 的 tty 属 `uucp` 组(不是 Debian 的 `dialout`):
 
@@ -140,14 +140,21 @@ sudo usermod -aG uucp $USER    # 之后注销重登
 ls -l /dev/ttyACM*             # 确认实际属组
 ```
 
-把 [`deploy/udev/99-air780e.rules`](../deploy/udev/99-air780e.rules) 复制到 `/etc/udev/rules.d/`,**按里面的注释填好实际的 USB 端口路径**,然后:
+**设备名不需要固定。** agent 启动和每次重连时会枚举 `/dev/ttyACM*`,逐个问
+`ATI` / `AT+CGSN` / `AT+ICCID`,认领配置里 `imei`(或 `iccid`)对得上的那个口
+—— 换 USB 口、`ttyACM` 重新编号、USB 复位后换号回来,都不用改配置。
+
+先拿到每个模块的 IMEI:
 
 ```bash
-sudo udevadm control --reload-rules && sudo udevadm trigger
-ls -l /dev/air780e-*
+python -m air780e_agent.probe --scan     # 哪些口应答 AT
+python -m air780e_agent.probe /dev/ttyACM0   # 打印 IMEI / ICCID
 ```
 
-这一步为什么必须按端口路径而不是序列号绑:见 [`at-reference.md` §3.3](at-reference.md)。
+想要固定的符号链接(比如别的工具也要用这个口),仍然可以用
+[`deploy/udev/99-air780e.rules`](../deploy/udev/99-air780e.rules) 按 USB 端口
+路径绑,然后在配置里写 `port = "/dev/air780e-a"` —— 写了 `port` 就跳过发现。
+规则里 `ID_MM_DEVICE_IGNORE` 那两条建议无论如何都留着(见下一节)。
 
 ### 3. ModemManager
 
