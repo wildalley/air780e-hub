@@ -294,7 +294,17 @@ class DeviceWorker:
         self._emit_status(force=force)
 
     def _emit_status(self, *, force: bool = False) -> None:
-        payload = {"device": self.name, "ts": _now(), **self.state.describe()}
+        # The port belongs in here, not only in `hello`: with discovery it is
+        # not known until the module has answered, which can be *after* the
+        # link comes up — and it changes on its own whenever the module is
+        # moved or renumbered.  Without it the server keeps showing whichever
+        # path was true when the agent last said hello.
+        payload = {
+            "device": self.name,
+            "ts": _now(),
+            "port": self._port or self.config.port,
+            **self.state.describe(),
+        }
         if not force and not self._status_worth_sending(payload):
             return
         self._last_status_payload = payload
@@ -309,7 +319,7 @@ class DeviceWorker:
         if loop_time - self._last_status_sent >= STATUS_HEARTBEAT:
             return True
 
-        for key in ("online", "registered", "operator", "storage_used"):
+        for key in ("online", "registered", "operator", "storage_used", "port"):
             if previous.get(key) != payload.get(key):
                 return True
 

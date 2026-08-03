@@ -452,6 +452,27 @@ class Database:
         )
         return int(cursor.lastrowid)
 
+    def conversations(self, *, limit: int = 200) -> list[dict[str, Any]]:
+        """Threads: one row per (card, correspondent), newest activity first.
+
+        The bare ``m.body`` / ``m.direction`` / ``m.id`` columns alongside
+        ``MAX(m.ts)`` are SQLite's documented min/max behaviour — they come
+        from the row that produced the maximum, which is exactly the preview
+        we want.  This is not portable SQL; on another engine it needs a
+        window function.
+        """
+        return self.query(
+            "SELECT m.sim_id, m.peer, m.device, "
+            "       m.id AS last_id, m.body AS last_body, "
+            "       m.direction AS last_direction, m.status AS last_status, "
+            "       MAX(m.ts) AS last_ts, COUNT(*) AS message_count, "
+            "       s.label AS sim_label, s.iccid AS sim_iccid "
+            "FROM messages m LEFT JOIN sims s ON s.id = m.sim_id "
+            "GROUP BY m.sim_id, m.peer "
+            "ORDER BY last_ts DESC LIMIT ?",
+            (limit,),
+        )
+
     def messages(
         self,
         *,

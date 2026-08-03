@@ -280,6 +280,18 @@ def build_router(state: AppState) -> APIRouter:
             "total": state.db.count_messages(),
         }
 
+    @router.get("/conversations", dependencies=guard)
+    def list_conversations(
+        limit: int = Query(200, ge=1, le=1000),
+    ) -> list[dict[str, Any]]:
+        """One row per (card, correspondent), newest first.
+
+        The UI is a messaging app, so the list it opens with is threads, not
+        rows.  Grouping here rather than in the browser keeps it correct once
+        the history is longer than one page.
+        """
+        return state.db.conversations(limit=limit)
+
     @router.post("/messages/send", dependencies=guard)
     async def send_message(body: SendSmsBody) -> dict[str, Any]:
         agent_id = state.gateway.agent_for_device(body.device)

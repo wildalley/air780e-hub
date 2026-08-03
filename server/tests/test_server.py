@@ -251,6 +251,50 @@ def test_messages_from_two_cards_are_kept_apart(admin):
     assert [m["body"] for m in filtered] == ["from card a"]
 
 
+def test_conversations_group_by_card_and_correspondent(admin):
+    """The messages UI opens on threads, so the grouping has to be right even
+    when the same number is reached through both cards."""
+    with _connect(admin) as ws:
+        _greet(ws)
+        for seq, (device, iccid, peer, body, ts) in enumerate([
+            ("a", "89860622180012345670", "10086", "第一条", "2026-08-02T10:00:00+08:00"),
+            ("a", "89860622180012345670", "10086", "第二条", "2026-08-02T11:00:00+08:00"),
+            ("a", "89860622180012345670", "955555", "别的号", "2026-08-02T09:00:00+08:00"),
+            ("b", "89860622180012345671", "10086", "另一张卡", "2026-08-02T12:00:00+08:00"),
+        ], start=1):
+            ws.send_json({
+                "type": "sms_in", "seq": seq, "device": device, "iccid": iccid,
+                "peer": peer, "body": body, "ts": ts,
+            })
+            ws.receive_json()
+
+    threads = admin.get("/api/conversations").json()
+    assert len(threads) == 3, "same peer on two cards is two threads"
+
+    # Newest activity first, and the preview is the newest message in each.
+    assert [t["peer"] for t in threads] == ["10086", "10086", "955555"]
+    assert threads[0]["last_body"] == "另一张卡"
+    assert threads[0]["sim_iccid"] == "89860622180012345671"
+    assert threads[1]["last_body"] == "第二条", "preview must be the latest, not the first"
+    assert threads[1]["message_count"] == 2
+    assert threads[2]["message_count"] == 1
+
+
+def test_a_thread_can_be_read_back_in_full(admin):
+    with _connect(admin) as ws:
+        _greet(ws)
+        ws.send_json({
+            "type": "sms_in", "seq": 1, "device": "a",
+            "iccid": "89860622180012345670", "peer": "10086",
+            "body": "验证码 123456", "ts": "2026-08-02T18:00:00+08:00",
+        })
+        ws.receive_json()
+
+    sim_id = admin.get("/api/conversations").json()[0]["sim_id"]
+    items = admin.get(f"/api/messages?peer=10086&sim_id={sim_id}").json()["items"]
+    assert [m["body"] for m in items] == ["验证码 123456"]
+
+
 def test_status_is_recorded_for_the_history_graph(admin):
     with _connect(admin) as ws:
         _greet(ws)

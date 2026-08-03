@@ -107,6 +107,21 @@ export interface Message {
   sim_iccid?: string
 }
 
+/** One thread: everything exchanged with one number through one card. */
+export interface Conversation {
+  sim_id: number | null
+  peer: string
+  device: string
+  last_id: number
+  last_body: string
+  last_direction: 'in' | 'out'
+  last_status: string
+  last_ts: string
+  message_count: number
+  sim_label?: string
+  sim_iccid?: string
+}
+
 export interface StatusPoint {
   ts: string
   online: number
@@ -282,6 +297,7 @@ export const api = {
       })
       return get<{ items: Message[]; total: number }>(`/api/messages?${query}`)
     },
+    conversations: () => get<Conversation[]>('/api/conversations'),
     send: (device: string, number: string, body: string) =>
       post<{ refs: number[] }>('/api/messages/send', { device, number, body }),
   },

@@ -2,7 +2,7 @@
 
 多卡短信中枢 —— 基于 Air780E 模块的短信转发、保号自动化与 Web 管理系统。
 
-> **当前状态:M0–M5 完成(AT 驱动层、agent、server + 协议 + Docker、Web 前端、推送引擎、保号调度器;252 个测试通过)。** 硬件(2× Air780E)在途。
+> **当前状态:M0–M6 完成,274 个测试通过。** 两个 Air780E 已接入,真实收发与推送打通(端到端约 2 秒),server 已部署上线。
 > 计划见 [`docs/PLAN.md`](docs/PLAN.md),协议见 [`docs/protocol.md`](docs/protocol.md),
 > 部署见 [`docs/deploy.md`](docs/deploy.md),AT 与硬件笔记见 [`docs/at-reference.md`](docs/at-reference.md)。
 
@@ -93,7 +93,7 @@
 - [x] 主动发送(Web / API)
 - [x] 全量入库,自动清空模块存储防溢出
 - [x] 按卡、按号码、按关键词检索
-- [x] 会话视图
+- [x] 会话视图(手机短信那样的气泡对话,可就地回复)
 
 ### 推送
 - [x] 多渠道:Bark / Telegram / 飞书 / 企业微信 / 钉钉 / 自定义 POST / GET / 邮件

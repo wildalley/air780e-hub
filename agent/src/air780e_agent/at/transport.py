@@ -59,7 +59,13 @@ class SerialTransport:
 
         self._loop = asyncio.get_running_loop()
         try:
-            self._serial = serial.Serial(
+            # pyserial's open is synchronous, and opening a ttyACM that is
+            # mid-enumeration can take seconds.  Run it off the loop: during
+            # discovery this is called for every candidate port in turn, and
+            # blocking here stalls everything else in the agent — including
+            # the server link's keepalive, which then drops the connection.
+            self._serial = await asyncio.to_thread(
+                serial.Serial,
                 self.port,
                 baudrate=self.baudrate,
                 timeout=0,

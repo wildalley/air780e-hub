@@ -106,6 +106,18 @@ async def test_both_devices_come_up(agent):
     assert described["a"]["iccid"] != described["b"]["iccid"]
 
 
+async def test_status_carries_the_port_it_actually_opened(agent):
+    """`hello` can go out before discovery has resolved a port — the link and
+    the workers come up in parallel — so the status frame has to carry it, or
+    the server keeps displaying a stale path for ever."""
+    await agent.wait_online()
+    events = await agent.wait_for_events("status", 1)
+
+    ports = {e.payload["device"]: e.payload.get("port") for e in events}
+    assert ports.get("a") == "/dev/fake-a"
+    assert all(p for p in ports.values()), "a blank port would erase the server's"
+
+
 async def test_an_unplugged_module_goes_offline_promptly(agent):
     """Pulling the USB cable must be noticed now, not at the next status poll.
 
