@@ -8,7 +8,34 @@
 
 ### 1. 起容器
 
-1Panel → **容器 → 编排 → 创建编排**,粘贴 [`deploy/docker-compose.yml`](../deploy/docker-compose.yml)。
+compose 里用的是 `build:` 而不是现成镜像 —— 前端要在镜像里编译,所以**服务器上必须有整个仓库**,只把 `docker-compose.yml` 贴进 1Panel 的「创建编排」会因为找不到构建上下文而失败。
+
+先把仓库弄到服务器上。仓库是私有的,克隆需要凭证,三选一:
+
+```bash
+# a) gh(最省事,交互式登录一次)
+gh auth login && gh repo clone wildalley/air780e-hub /opt/air780e-hub
+
+# b) 细粒度 PAT(只给这个仓库的 Contents: Read 权限)
+git clone https://<PAT>@github.com/wildalley/air780e-hub.git /opt/air780e-hub
+
+# c) 部署密钥(服务器上生成,公钥贴到仓库 Settings → Deploy keys,只读)
+ssh-keygen -t ed25519 -f ~/.ssh/air780e -N ""
+git clone git@github.com:wildalley/air780e-hub.git /opt/air780e-hub
+```
+
+然后构建启动:
+
+```bash
+cd /opt/air780e-hub
+docker compose -f deploy/docker-compose.yml up -d --build
+```
+
+`build.context` 是相对 compose 文件所在目录的 `..`,也就是仓库根 —— 这样 `server/` 和 `frontend/` 都在上下文里。
+
+想用 1Panel 的编排界面管理,就把 `deploy/docker-compose.yml` 复制成编排目录下的 `docker-compose.yml`,并把 `context` 改成仓库的绝对路径。
+
+**升级**就是 `git pull` 再重跑上面那条 `up -d --build`;数据在具名 volume 里,不受影响。
 
 关于端口绑定有个坑:1Panel 的 OpenResty 一般跑在自己的容器里,所以**不能**把端口绑成 `127.0.0.1:8080` —— 那样 OpenResty 容器访问不到。compose 里用的是 `8080:8080`(发布到宿主机),**同时务必在防火墙上只放行 443,不要放行 8080**。
 
