@@ -37,7 +37,9 @@ docker compose -f deploy/docker-compose.yml up -d --build
 
 **升级**就是 `git pull` 再重跑上面那条 `up -d --build`;数据在具名 volume 里,不受影响。
 
-关于端口绑定有个坑:1Panel 的 OpenResty 一般跑在自己的容器里,所以**不能**把端口绑成 `127.0.0.1:8080` —— 那样 OpenResty 容器访问不到。compose 里用的是 `8080:8080`(发布到宿主机),**同时务必在防火墙上只放行 443,不要放行 8080**。
+关于端口绑定有个坑:1Panel 的 OpenResty 一般跑在自己的容器里,所以**不能**把端口绑成 `127.0.0.1:8090` —— 那样 OpenResty 容器访问不到。compose 里用的是 `8090:8080`(发布到宿主机),**同时务必在防火墙上只放行 443,不要放行 8090**。
+
+宿主机侧用 8090 是因为 8080 常被占(1Panel 自己、别的容器)。**容器内部仍然是 8080**,那是 `HUB_PORT` 的默认值,除了这一行映射之外没有任何地方需要知道。要换成别的号,只改 compose 里 `ports` 的**左边**那个数字,右边不要动。
 
 ### 2. 拿 agent token
 
@@ -54,7 +56,7 @@ docker exec air780e-hub hub-server token
 1Panel → **网站 → 创建网站 → 反向代理**:
 
 - 主域名:`sms.example.com`
-- 代理地址:`http://<宿主机IP>:8080`
+- 代理地址:`http://<宿主机IP>:8090`
 
 然后申请证书、开启 HTTPS、开启强制跳转。
 
@@ -68,7 +70,7 @@ docker exec air780e-hub hub-server token
 
 ```nginx
 location /ws {
-    proxy_pass http://<宿主机IP>:8080/ws;
+    proxy_pass http://<宿主机IP>:8090/ws;
 
     # 这三行是关键
     proxy_http_version 1.1;
@@ -232,8 +234,8 @@ agent 没连上,或者串口没打开。看 `journalctl -u air780e-agent`。
 反代没传 `X-Forwarded-Proto`,服务器以为是 HTTP,Cookie 没带 `Secure`,而浏览器在 HTTPS 页面下的处理不一致。补上那行。
 
 **短信收不到但模块在线**
-先看后台日志页有没有 `storage x/50` 的告警。再用 `probe` 直连看模块存储:
+先看后台日志页有没有存储将满的告警 —— 实测这块模块 `SM` 和 `ME` **都只有 10 条**,存满了网络会静默丢新短信。再用 `probe` 直连看模块存储:
 
 ```bash
-python -m air780e_agent.probe /dev/air780e-a
+python -m air780e_agent.probe /dev/ttyACM0
 ```

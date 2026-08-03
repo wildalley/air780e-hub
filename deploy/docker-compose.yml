@@ -18,8 +18,12 @@ services:
       # 1Panel's OpenResty usually runs in its own container, so binding to
       # 127.0.0.1 would be unreachable from it.  Publishing on the host and
       # keeping the port closed at the firewall is the combination that works.
-      # Only 443 should be open to the internet; 8080 stays LAN-only.
-      - "8080:8080"
+      # Only 443 should be open to the internet; 8090 stays LAN-only.
+      #
+      # Host side is 8090 because 8080 is commonly already taken (1Panel
+      # itself, other containers).  The container side stays 8080 — that is
+      # HUB_PORT's default and nothing outside this line needs to know.
+      - "8090:8080"
 
     volumes:
       # SQLite database, agent token and settings.  Back this up.
