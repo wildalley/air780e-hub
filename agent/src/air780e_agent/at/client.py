@@ -135,13 +135,23 @@ class ATClient:
         self._buffer = bytearray()
         self._urc_capture: tuple[_Registration, ATUrc] | None = None
         self._closed = False
+        # Set when the port dies under us.  Something has to be awaitable for
+        # that, or a worker sits in its status loop talking to a port that
+        # disappeared and never reconnects.
+        self._lost: asyncio.Event = asyncio.Event()
+        self._lost_reason: Exception | None = None
 
         transport.set_reader(self._feed)
+        set_close = getattr(transport, "set_close_handler", None)
+        if set_close is not None:
+            set_close(self._on_transport_closed)
 
     # -- lifecycle ---------------------------------------------------------
 
     async def open(self) -> None:
         self._closed = False
+        self._lost.clear()
+        self._lost_reason = None
         await self.transport.open()
 
     async def close(self) -> None:
@@ -150,6 +160,31 @@ class ATClient:
         if pending is not None and not pending.future.done():
             pending.future.set_exception(TransportClosed(f"{self.name} closed"))
         await self.transport.close()
+
+    # -- loss of the port --------------------------------------------------
+
+    def _on_transport_closed(self, exc: Exception | None) -> None:
+        """The transport is gone.  Fail fast rather than wait for timeouts."""
+        if self._lost.is_set():
+            return
+        self._lost_reason = exc or TransportClosed(f"{self.name} closed")
+        self._closed = True
+        self._lost.set()
+        log.warning("[%s] port lost: %s", self.name, self._lost_reason)
+        pending = self._pending
+        if pending is not None and not pending.future.done():
+            # Without this the in-flight command waits out its full timeout
+            # against a port that will never answer.
+            pending.future.set_exception(self._lost_reason)
+
+    @property
+    def is_lost(self) -> bool:
+        return self._lost.is_set()
+
+    async def wait_lost(self) -> Exception:
+        """Block until the port dies; returns why."""
+        await self._lost.wait()
+        return self._lost_reason or TransportClosed(f"{self.name} closed")
 
     # -- URC registration --------------------------------------------------
 

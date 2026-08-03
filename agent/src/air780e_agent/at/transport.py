@@ -17,10 +17,15 @@ from typing import Callable, Protocol
 from .errors import TransportClosed
 
 ReaderCallback = Callable[[bytes], None]
+# Called once when the transport dies under us — an unplugged module, a USB
+# reset.  Nothing else notices on its own: an fd that has gone away simply
+# stops producing bytes, and a reader callback has no caller to raise to.
+CloseCallback = Callable[[Exception | None], None]
 
 
 class Transport(Protocol):
     def set_reader(self, callback: ReaderCallback) -> None: ...
+    def set_close_handler(self, callback: CloseCallback) -> None: ...
     async def open(self) -> None: ...
     async def close(self) -> None: ...
     def write(self, data: bytes) -> None: ...
@@ -40,10 +45,14 @@ class SerialTransport:
         self.baudrate = baudrate
         self._serial = None
         self._reader: ReaderCallback | None = None
+        self._on_close: CloseCallback | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
 
     def set_reader(self, callback: ReaderCallback) -> None:
         self._reader = callback
+
+    def set_close_handler(self, callback: CloseCallback) -> None:
+        self._on_close = callback
 
     async def open(self) -> None:
         import serial  # imported lazily so tests need no hardware stack
@@ -70,13 +79,27 @@ class SerialTransport:
         try:
             data = self._serial.read(4096)
         except Exception as exc:
+            # Raising here would only reach the event loop's exception handler,
+            # which logs it and carries on — leaving the owner of this
+            # transport waiting on a port that is never going to answer again.
+            # Hand the failure to whoever registered for it instead.
             self._detach()
+            self._notify_closed(
+                TransportClosed(f"read failed on {self.port}: {exc}")
+            )
+            return
+        if data:
             if self._reader is not None:
-                # Surfacing this as empty data lets the client notice the close.
-                self._reader(b"")
-            raise TransportClosed(f"read failed on {self.port}: {exc}") from exc
-        if data and self._reader is not None:
-            self._reader(data)
+                self._reader(data)
+        elif self._serial is not None:
+            # Readable but empty: on a tty that means the other end is gone.
+            self._detach()
+            self._notify_closed(TransportClosed(f"{self.port} disconnected"))
+
+    def _notify_closed(self, exc: Exception | None) -> None:
+        handler, self._on_close = self._on_close, None  # fire at most once
+        if handler is not None:
+            handler(exc)
 
     def _detach(self) -> None:
         if self._loop is not None and self._serial is not None:
@@ -118,6 +141,7 @@ class PipeTransport:
         self.name = name
         self._peer: PipeTransport | None = None
         self._reader: ReaderCallback | None = None
+        self._on_close: CloseCallback | None = None
         self._open = False
 
     @classmethod
@@ -129,11 +153,21 @@ class PipeTransport:
     def set_reader(self, callback: ReaderCallback) -> None:
         self._reader = callback
 
+    def set_close_handler(self, callback: CloseCallback) -> None:
+        self._on_close = callback
+
     async def open(self) -> None:
         self._open = True
 
     async def close(self) -> None:
         self._open = False
+
+    def disconnect(self) -> None:
+        """Simulate the module going away — what an unplug looks like."""
+        self._open = False
+        handler, self._on_close = self._on_close, None
+        if handler is not None:
+            handler(TransportClosed(f"{self.name} disconnected"))
 
     def write(self, data: bytes) -> None:
         if not self._open:
@@ -161,11 +195,15 @@ class FdTransport:
         self.fd = fd
         self.name = name
         self._reader: ReaderCallback | None = None
+        self._on_close: CloseCallback | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._open = False
 
     def set_reader(self, callback: ReaderCallback) -> None:
         self._reader = callback
+
+    def set_close_handler(self, callback: CloseCallback) -> None:
+        self._on_close = callback
 
     async def open(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -178,12 +216,18 @@ class FdTransport:
             data = os.read(self.fd, 4096)
         except BlockingIOError:
             return
-        except OSError:
+        except OSError as exc:
             # The peer went away; a pty master reports EIO once the slave closes.
             self._detach()
+            self._notify_closed(TransportClosed(f"{self.name} disconnected: {exc}"))
             return
         if data and self._reader is not None:
             self._reader(data)
+
+    def _notify_closed(self, exc: Exception | None) -> None:
+        handler, self._on_close = self._on_close, None
+        if handler is not None:
+            handler(exc)
 
     def _detach(self) -> None:
         if self._loop is not None and self._open:

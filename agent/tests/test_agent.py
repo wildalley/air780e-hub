@@ -33,6 +33,7 @@ port = "/dev/fake-b"
 class AgentRig:
     app: AgentApp
     mocks: dict[str, MockAir780E]
+    transports: dict[str, PipeTransport] = field(default_factory=dict)
     runner: asyncio.Task | None = None
 
     async def wait_online(self, timeout: float = 3.0) -> None:
@@ -77,7 +78,7 @@ async def agent(tmp_path):
         return transports[device.name]
 
     app = AgentApp(config, transport_factory=factory)
-    rig = AgentRig(app=app, mocks=mocks)
+    rig = AgentRig(app=app, mocks=mocks, transports=transports)
     rig.runner = asyncio.create_task(app.run())
     try:
         yield rig
@@ -103,6 +104,45 @@ async def test_both_devices_come_up(agent):
     # Each module must be identified separately — this is what SimAdmin's
     # single-modem model could not express.
     assert described["a"]["iccid"] != described["b"]["iccid"]
+
+
+async def test_an_unplugged_module_goes_offline_promptly(agent):
+    """Pulling the USB cable must be noticed now, not at the next status poll.
+
+    Found on real hardware: the read error surfaced inside the event loop's
+    reader callback, where nothing was listening, and the status commands
+    swallow AT errors — so the worker reported a healthy module for as long as
+    it was left running, and never went back to look for it.
+    """
+    await agent.wait_online()
+    assert agent.app.workers["a"].online is True
+
+    agent.transports["a"].disconnect()
+
+    async with asyncio.timeout(2.0):
+        while agent.app.workers["a"].online:
+            await asyncio.sleep(0.01)
+
+    assert agent.app.workers["b"].online is True, "one module must not take out the other"
+    described = {d["name"]: d for d in agent.app.describe_devices()}
+    assert described["a"]["online"] is False
+
+
+async def test_losing_the_port_frees_it_for_rediscovery(agent):
+    """The claim has to be given back, or the module cannot be picked up
+    again when it comes back under a different ttyACM number."""
+    await agent.wait_online()
+    worker = agent.app.workers["a"]
+    worker._registry = agent.app.registry
+    worker.config.port = ""  # pretend it was discovered rather than pinned
+    worker._port = "/dev/ttyACM0"
+    agent.app.registry._claimed["/dev/ttyACM0"] = "a"
+
+    agent.transports["a"].disconnect()
+
+    async with asyncio.timeout(2.0):
+        while agent.app.registry.claimed_by("/dev/ttyACM0") is not None:
+            await asyncio.sleep(0.01)
 
 
 async def test_workers_come_up_on_discovered_ports(tmp_path, monkeypatch):

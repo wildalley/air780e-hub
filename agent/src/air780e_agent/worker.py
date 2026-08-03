@@ -214,9 +214,38 @@ class DeviceWorker:
         await self._sample_status(force=True)
 
     async def _serve(self) -> None:
-        while not self._stopped:
-            await asyncio.sleep(self.status_interval)
-            await self._sample_status()
+        """Sample status until the port dies.
+
+        Waiting on the port's own death rather than only polling matters: the
+        status commands swallow AT errors (a single timed-out +CSQ is not
+        worth dropping the link over), so without this a module that was
+        unplugged would leave the worker reporting stale "online" for ever.
+        """
+        client = self._client
+        lost = (
+            asyncio.create_task(client.wait_lost(), name=f"lost-{self.name}")
+            if client is not None
+            else None
+        )
+        try:
+            while not self._stopped:
+                if lost is not None and lost.done():
+                    raise await lost
+                await self._sleep_unless_lost(lost, self.status_interval)
+                if lost is not None and lost.done():
+                    raise await lost
+                await self._sample_status()
+        finally:
+            if lost is not None and not lost.done():
+                lost.cancel()
+
+    async def _sleep_unless_lost(
+        self, lost: asyncio.Task | None, seconds: float
+    ) -> None:
+        if lost is None:
+            await asyncio.sleep(seconds)
+            return
+        await asyncio.wait({lost}, timeout=seconds)
 
     async def _teardown(self) -> None:
         self._ready.clear()
