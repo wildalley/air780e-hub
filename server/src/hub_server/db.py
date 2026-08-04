@@ -5,7 +5,7 @@ FastAPI runs ``def`` endpoints in a threadpool, and the WebSocket gateway's
 writes are sub-millisecond, so an async driver would add moving parts without
 buying throughput at this scale.
 
-Schema note (PLAN.md section 5): messages, tasks and rules all hang off
+Schema invariant: messages, tasks and rules all hang off
 ``sims``, not off devices.  Swapping a card into the other module must not
 orphan its history — that is the concrete lesson from SimAdmin's
 single-modem model.

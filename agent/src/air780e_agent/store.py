@@ -6,7 +6,7 @@ is sub-millisecond, and the complexity of an async driver buys nothing.  If
 that ever stops being true the call sites are already narrow enough to move
 behind a thread executor.
 
-The agent is the source of truth (PLAN.md D4).  Two things must survive a
+The agent is the source of truth.  Two things must survive a
 restart or a network outage:
 
 * the outbound event queue, so nothing received is ever lost

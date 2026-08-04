@@ -15,6 +15,9 @@ frontend/tsconfig.tsbuildinfo
 # local artefact, not source.
 server/src/hub_server/www/
 
+# Local planning notes are intentionally not part of the public repository.
+docs/PLAN.md
+
 # --- Secrets and local state ----------------------------------------------
 # Bring-up scratch directory: the agent token, the SQLite databases (which
 # hold the push webhook and every received message), session cookies, logs,

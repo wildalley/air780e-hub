@@ -64,8 +64,8 @@ class AgentApp:
             max_delay=config.reconnect_max_delay,
         )
 
-        # Keep-alive runs from the local clock and the local task table, so an
-        # outage delays the receipt, never the message (PLAN.md D3).
+        # Keep-alive runs from the local clock and task table, so an outage
+        # delays the receipt, never the task itself.
         self.scheduler = KeepAliveScheduler(
             self.store,
             self.workers,

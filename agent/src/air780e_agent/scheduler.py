@@ -1,6 +1,6 @@
 """Keep-alive scheduler.
 
-Runs on the agent, not the server (PLAN.md D3).  A missed keep-alive cannot be
+Runs on the agent, not the server.  A missed keep-alive cannot be
 made up for after the fact — a card that goes quiet long enough is simply
 cancelled — so execution must not depend on the link being up.  The server
 edits tasks and receives receipts; the clock that matters is this one.

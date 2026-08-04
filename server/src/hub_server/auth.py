@@ -2,8 +2,7 @@
 
 Deliberately minimal: one password, server-side sessions, no user table and
 no password-free mode.  This system holds every SMS verification code that
-reaches those SIMs, so the one thing not on offer is turning the lock off
-(SimAdmin exposes such a switch; PLAN.md section 10 rules it out here).
+reaches those SIMs, so password-free operation is deliberately not offered.
 """
 
 from __future__ import annotations

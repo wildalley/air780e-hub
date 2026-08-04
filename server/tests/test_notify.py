@@ -532,7 +532,7 @@ async def test_card_name_prefers_the_label(db, settings):
 
 
 # --------------------------------------------------------------------------
-# security baseline (PLAN.md section 10)
+# security baseline: SMS bodies never enter audit logs
 # --------------------------------------------------------------------------
 
 

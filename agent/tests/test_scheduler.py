@@ -1,7 +1,7 @@
 """Keep-alive scheduler.
 
-The acceptance criterion from PLAN.md M5 is that the agent keeps its schedule
-with the server unreachable, and that receipts catch up afterwards — so these
+The core contract is that the agent keeps its schedule with the server
+unreachable and queues receipts until connectivity returns, so these
 tests never build a link.  A fake worker stands in for the modem; the clock is
 injected, because a test that waits 25 days is not a test.
 """
@@ -352,7 +352,7 @@ async def test_raw_at_without_a_command_is_skipped(store):
 
 
 # --------------------------------------------------------------------------
-# receipts survive an outage (PLAN.md M5 acceptance)
+# receipts survive an outage
 # --------------------------------------------------------------------------
 
 

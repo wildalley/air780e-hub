@@ -34,10 +34,9 @@ class Settings:
     agent_token: str = ""
 
     session_ttl_hours: int = 24 * 14
-    # Default SMS retention, in days: messages older than this are deleted
-    # (PLAN.md section 10).  0 disables.  This is only the fallback default —
-    # the operator can override it on the Notify page, where it is stored in
-    # the settings table and takes precedence (see AppState.message_retention_days).
+    # Default SMS retention, in days; 0 disables deletion.  The operator can
+    # override it on the Notify page, where the settings table stores the
+    # effective value (see AppState.message_retention_days).
     message_retention_days: int = 90
     status_retention_days: int = 30
 

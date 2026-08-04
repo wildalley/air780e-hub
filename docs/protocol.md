@@ -1,6 +1,6 @@
 # agent ↔ server 协议
 
-JSON over WebSocket。**连接方向始终是 agent 主动拨出**(见 PLAN.md 决策 D2)。
+JSON over WebSocket。**连接方向始终是 agent 主动拨出**,Server 不向 Agent 发起入站连接。
 
 本文示例中的域名、Token、设备标识、号码和消息正文均为虚构值。
 
@@ -153,7 +153,7 @@ JSON over WebSocket。**连接方向始终是 agent 主动拨出**(见 PLAN.md �
  "message": "storage 48/50, draining"}
 ```
 
-短信正文**不出现在日志里**(安全基线,PLAN.md §10)。
+短信正文**不出现在日志里**,只记录诊断所需的最少元数据。
 
 ---
 

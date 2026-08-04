@@ -1,7 +1,7 @@
 """Outbound link to the server.
 
-The agent dials out (PLAN.md D2), so nothing here listens on a port and no
-inbound firewall rule is ever needed.  The link is *optional*: if it never
+The agent always dials out, so nothing here listens on a port and no inbound
+firewall rule is needed.  The link is *optional*: if it never
 comes up, messages are still received, stored and keep-alive tasks still run
 — they just queue until there is somewhere to send them.
 """

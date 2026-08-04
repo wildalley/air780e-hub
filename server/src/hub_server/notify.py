@@ -16,8 +16,8 @@ Three things here are less obvious than they look:
 * **Nothing here may log the SMS body.**  This engine handles every
   verification code the user receives; ``notify_logs.detail`` is rendered in
   the web UI and must carry only status codes and the provider's own error
-  text (PLAN.md section 10).  Request URLs are scrubbed too — a Telegram bot
-  token lives in the URL path.
+  text.  Request URLs are scrubbed too — a Telegram bot token lives in the
+  URL path.
 """
 
 from __future__ import annotations
@@ -473,7 +473,7 @@ class Notifier:
         )
 
     async def on_task_result(self, task_id: int, frame: dict[str, Any]) -> None:
-        """Gateway hook for keep-alive receipts (PLAN.md M5)."""
+        """Gateway hook for keep-alive task receipts."""
         task = self.db.one(
             "SELECT t.*, s.label AS sim_label FROM tasks t "
             "LEFT JOIN sims s ON s.id = t.sim_id WHERE t.id = ?",

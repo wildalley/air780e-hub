@@ -167,7 +167,6 @@ npm run build
 - [通知渠道与规则](docs/notify.md)
 - [Agent / Server 协议](docs/protocol.md)
 - [AT 指令与硬件说明](docs/at-reference.md)
-- [设计与里程碑](docs/PLAN.md)
 
 ## 参考与致谢
 

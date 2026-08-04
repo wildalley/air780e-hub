@@ -359,7 +359,7 @@ class DeviceWorker:
                 "pdu": sms.raw,
             },
         )
-        # Deliberately no message body in the log (PLAN.md section 10).
+        # Deliberately no message body in logs: verification codes are sensitive.
         log.info("[%s] sms from %s (%d chars)", self.name, sms.address, len(sms.text))
 
     # -- commands ----------------------------------------------------------
