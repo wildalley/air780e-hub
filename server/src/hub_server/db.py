@@ -552,6 +552,77 @@ class Database:
         ).rowcount
         return removed
 
+    # -- backup and restore ------------------------------------------------
+    # Tables a genuine hub backup must contain.  A sanity gate so an arbitrary
+    # .sqlite — or a truncated upload — is rejected before it ever overwrites
+    # the live data.
+    _REQUIRED_TABLES = frozenset(
+        {"agents", "sims", "devices", "messages", "settings"}
+    )
+
+    def backup_to(self, dest: str | Path) -> None:
+        """Write a consistent snapshot of the whole database to *dest*.
+
+        Uses SQLite's online-backup API, so the copy is coherent — pending WAL
+        frames included — even while the gateway is writing, without holding a
+        write lock for the length of the copy.
+        """
+        target = sqlite3.connect(dest)
+        try:
+            with self._lock:
+                self._db.backup(target)
+        finally:
+            target.close()
+
+    @staticmethod
+    def validate_backup(path: str | Path) -> None:
+        """Raise ValueError unless *path* is a readable hub SQLite database.
+
+        Runs an integrity check and confirms the core tables are present, so a
+        corrupt or unrelated file is caught before ``restore_from`` copies it
+        over live data.  Opened read-only — validation never mutates the upload.
+        """
+        try:
+            conn = sqlite3.connect(f"file:{Path(path)}?mode=ro", uri=True)
+        except sqlite3.Error as exc:  # pragma: no cover - connect rarely fails
+            raise ValueError(f"无法打开备份文件: {exc}") from exc
+        try:
+            row = conn.execute("PRAGMA integrity_check").fetchone()
+            if not row or row[0] != "ok":
+                raise ValueError("备份文件未通过完整性校验,可能已损坏")
+            names = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+        except sqlite3.DatabaseError as exc:
+            raise ValueError(f"文件不是有效的 SQLite 数据库: {exc}") from exc
+        finally:
+            conn.close()
+        missing = self._REQUIRED_TABLES - names
+        if missing:
+            raise ValueError(
+                "这不是有效的 Hub 备份(缺少表: "
+                + ", ".join(sorted(missing))
+                + ")"
+            )
+
+    def restore_from(self, src: str | Path) -> None:
+        """Replace this database's contents with those of the file at *src*.
+
+        The upload is copied *into* the live connection with the backup API
+        rather than swapped on disk, so every open cursor and the WAL stay
+        valid and no process restart is needed.  Caller must have run
+        ``validate_backup`` first.
+        """
+        source = sqlite3.connect(src)
+        try:
+            with self._lock:
+                source.backup(self._db)
+        finally:
+            source.close()
+
     # -- settings ----------------------------------------------------------
 
     def get_setting(self, key: str, default: Any = None) -> Any:

@@ -46,6 +46,32 @@ const patch = <T,>(path: string, body: unknown) =>
   request<T>(path, { method: 'PATCH', body: JSON.stringify(body) })
 const del = <T,>(path: string) => request<T>(path, { method: 'DELETE' })
 
+/** Fetch a file with the session cookie and hand it to the browser to save. */
+async function downloadFile(path: string, fallbackName: string): Promise<void> {
+  const response = await fetch(path, { credentials: 'same-origin' })
+  if (!response.ok) {
+    let detail = response.statusText
+    try {
+      const body = await response.json()
+      if (typeof body?.detail === 'string') detail = body.detail
+    } catch {
+      /* not JSON; the status text will have to do */
+    }
+    throw new ApiError(response.status, detail)
+  }
+  const blob = await response.blob()
+  const disposition = response.headers.get('Content-Disposition') ?? ''
+  const match = /filename="?([^"]+)"?/.exec(disposition)
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = match?.[1] ?? fallbackName
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  URL.revokeObjectURL(url)
+}
+
 // -- shapes ------------------------------------------------------------------
 
 export interface AuthStatus {
@@ -339,5 +365,14 @@ export const api = {
   system: {
     agentToken: () => get<{ token: string }>('/api/system/agent-token'),
     purge: () => post<Record<string, number>>('/api/system/purge'),
+    /** Download a full SQLite snapshot; browser saves it under the server's name. */
+    backup: () => downloadFile('/api/system/backup', 'hub-backup.db'),
+    /** Overwrite the live database with an uploaded backup file. */
+    restore: (file: File) =>
+      request<{ ok: boolean }>('/api/system/restore', {
+        method: 'POST',
+        body: file,
+        headers: { 'Content-Type': 'application/octet-stream' },
+      }),
   },
 }

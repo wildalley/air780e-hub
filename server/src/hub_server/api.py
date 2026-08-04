@@ -10,11 +10,15 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
 from .alerts import SETTING_ENABLED
 from .auth import SESSION_COOKIE, AuthError
@@ -508,7 +512,63 @@ def build_router(state: AppState) -> APIRouter:
             status_days=state.settings.status_retention_days,
         )
 
+    @router.get("/system/backup", dependencies=guard)
+    def backup() -> FileResponse:
+        """Download a consistent snapshot of the whole database.
+
+        A snapshot is written to a temp file (SQLite's online-backup API, so
+        it is coherent even mid-write) and streamed back; the temp file is
+        deleted once the response has been sent.
+        """
+        fd, tmp = tempfile.mkstemp(prefix="hub-backup-", suffix=".db")
+        os.close(fd)
+        try:
+            state.db.backup_to(tmp)
+        except Exception:
+            os.unlink(tmp)
+            raise
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        return FileResponse(
+            tmp,
+            media_type="application/octet-stream",
+            filename=f"hub-backup-{stamp}.db",
+            background=BackgroundTask(_safe_unlink, tmp),
+        )
+
+    @router.post("/system/restore", dependencies=guard)
+    async def restore(request: Request) -> dict[str, Any]:
+        """Restore the database from an uploaded backup.
+
+        The body is the raw backup file (``application/octet-stream``).  It is
+        streamed to a temp file, validated as a genuine hub database, then
+        copied over the live data — no restart required.  A malformed or
+        unrelated file is rejected before anything is overwritten.
+        """
+        fd, tmp = tempfile.mkstemp(prefix="hub-restore-", suffix=".db")
+        try:
+            size = 0
+            with os.fdopen(fd, "wb") as out:
+                async for chunk in request.stream():
+                    size += len(chunk)
+                    out.write(chunk)
+            if size == 0:
+                raise HTTPException(status_code=400, detail="未收到备份文件")
+            try:
+                state.db.validate_backup(tmp)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            state.db.restore_from(tmp)
+        finally:
+            _safe_unlink(tmp)
+        return {"ok": True}
+
     # -- helpers -----------------------------------------------------------
+
+    def _safe_unlink(path: str) -> None:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
     async def _call(agent_id: str, frame: dict[str, Any]) -> dict[str, Any]:
         try:
