@@ -19,6 +19,7 @@ import SmsIcon from '@mui/icons-material/ForumOutlined'
 import DevicesIcon from '@mui/icons-material/RouterOutlined'
 import SimIcon from '@mui/icons-material/SimCardOutlined'
 import TaskIcon from '@mui/icons-material/EventRepeatOutlined'
+import ConsoleIcon from '@mui/icons-material/TerminalOutlined'
 import NotifyIcon from '@mui/icons-material/NotificationsActiveOutlined'
 import LogsIcon from '@mui/icons-material/ReceiptLongOutlined'
 import SettingsIcon from '@mui/icons-material/SettingsOutlined'
@@ -36,6 +37,7 @@ const NAV = [
   { to: '/devices', label: '设备', icon: <DevicesIcon /> },
   { to: '/sims', label: 'SIM 卡', icon: <SimIcon /> },
   { to: '/tasks', label: '保号任务', icon: <TaskIcon /> },
+  { to: '/console', label: 'AT 调试', icon: <ConsoleIcon /> },
   { to: '/notify', label: '通知', icon: <NotifyIcon /> },
   { to: '/logs', label: '日志', icon: <LogsIcon /> },
   { to: '/settings', label: '设置', icon: <SettingsIcon /> },

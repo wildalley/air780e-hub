@@ -12,6 +12,7 @@ import { MessagesPage } from './pages/Messages'
 import { DevicesPage } from './pages/Devices'
 import { SimsPage } from './pages/Sims'
 import { TasksPage } from './pages/Tasks'
+import { ConsolePage } from './pages/Console'
 import { NotifyPage } from './pages/Notify'
 import { LogsPage } from './pages/Logs'
 import { SettingsPage } from './pages/Settings'
@@ -91,6 +92,7 @@ export default function App() {
             <Route path="/devices" element={<DevicesPage />} />
             <Route path="/sims" element={<SimsPage />} />
             <Route path="/tasks" element={<TasksPage />} />
+            <Route path="/console" element={<ConsolePage />} />
             <Route path="/notify" element={<NotifyPage />} />
             <Route path="/logs" element={<LogsPage />} />
             <Route path="/settings" element={<SettingsPage onPasswordChanged={logout} />} />
