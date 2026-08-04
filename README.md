@@ -2,7 +2,7 @@
 
 多卡短信中枢 —— 基于 Air780E 模块的短信转发、保号自动化与 Web 管理系统。
 
-> **当前状态:M0–M6 完成,274 个测试通过。** 两个 Air780E 已接入,真实收发与推送打通(端到端约 2 秒),server 已部署上线。
+> **当前状态:M0–M7 完成,274 个测试通过。** 两个 Air780E 已接入,真实收发与推送打通(端到端约 2 秒),server 已部署上线。
 > 计划见 [`docs/PLAN.md`](docs/PLAN.md),协议见 [`docs/protocol.md`](docs/protocol.md),
 > 部署见 [`docs/deploy.md`](docs/deploy.md),AT 与硬件笔记见 [`docs/at-reference.md`](docs/at-reference.md)。
 
@@ -117,14 +117,30 @@
 - [x] 信号(`AT+CSQ` / `AT+CESQ` RSRP/RSRQ)、运营商、注册状态、小区信息
 - [x] 信号历史曲线
 - [x] SIM 信息:ICCID、卡状态、短信中心号
-- [ ] 模块在线/掉线告警
-- [ ] Web 端 AT 命令行(调试用)
+- [x] 模块在线/掉线告警
+- [x] Web 端 AT 命令行(调试用)
 
 ### 系统
 - [x] 管理员密码认证 + session
 - [x] 断网缓冲与补传
-- [ ] 短信保留期 TTL 自动清理
-- [ ] 数据备份/恢复
+- [x] 短信保留期 TTL 自动清理
+- [x] 数据备份/恢复
+
+## 前端
+
+`frontend/` 是 React + Vite + MUI 6 的单页应用,开发时由 Vite 代理 API 到后端,生产构建产物放在
+`server/src/hub_server/www`(`npm run build` 后拷入),由 server 在根路径托管,客户端路由由 catch-all 兜底。
+
+设计上做了整层的系统化定制,而不是默认 MUI 风格:
+
+- **设计 token 集中在 `frontend/src/tokens.ts`** —— 深浅两套独立选定(非简单反转)的色板,两套都过了 CVD 无障碍校验(系列色 ΔE ≥ 8);状态色永远配图标 + 文字,不只靠颜色传达
+- **数字一律 `tabular-nums`**(信号、短信数、存储),让列对齐
+- **排版**:标题负字距 + 紧凑行高(Apple 式),正文接近 0 字距
+- **动效克制且可感知**:卡片入场有阶梯式上浮,按钮/图标有按下反馈(`:active` 缩放);全部尊重 `prefers-reduced-motion`,开启后收敛为瞬态
+- **全局键盘焦点环**(`:focus-visible`)、半透明毛玻璃顶栏、分组侧边导航、统一 `PageHeader`
+- 图表用 Recharts,多模块信号曲线共用一条 dBm 轴,颜色按模块固定位置取,不随过滤重排
+
+改样式前先读 `tokens.ts` 的注释 —— 里面对每个色值的选定理由和校验结果都有交代。
 
 ## 目录结构
 

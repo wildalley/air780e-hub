@@ -11,10 +11,10 @@ import {
   TableHead,
   TableRow,
   TextField,
-  Typography,
 } from '@mui/material'
 import { api, ApiError, type Sim } from '../api'
 import { Loading, formatTs, useToast } from '../components/common'
+import { PageHeader } from '../components/PageHeader'
 
 /**
  * SIM cards, not modules.
@@ -58,7 +58,7 @@ export function SimsPage() {
 
   return (
     <Stack spacing={3}>
-      <Typography variant="h1">SIM 卡</Typography>
+      <PageHeader title="SIM 卡" subtitle="历史挂在卡上,换模块也不丢" />
 
       {sims.length === 0 ? (
         <Alert severity="info">还没有识别到 SIM 卡。模块上报 ICCID 后会自动出现在这里。</Alert>

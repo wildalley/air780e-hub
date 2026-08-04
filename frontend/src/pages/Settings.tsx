@@ -13,6 +13,7 @@ import {
 import VisibilityIcon from '@mui/icons-material/VisibilityOutlined'
 import { api, ApiError } from '../api'
 import { useToast } from '../components/common'
+import { PageHeader } from '../components/PageHeader'
 
 export function SettingsPage({ onPasswordChanged }: { onPasswordChanged: () => void }) {
   const toast = useToast()
@@ -42,7 +43,7 @@ export function SettingsPage({ onPasswordChanged }: { onPasswordChanged: () => v
 
   return (
     <Stack spacing={3}>
-      <Typography variant="h1">设置</Typography>
+      <PageHeader title="设置" subtitle="密码、Agent token 与数据清理" />
 
       <Card>
         <CardHeader title={<Typography variant="h3">修改管理员密码</Typography>} />

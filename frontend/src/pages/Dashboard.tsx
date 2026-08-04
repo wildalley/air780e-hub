@@ -15,12 +15,17 @@ import {
   TableRow,
   Typography,
 } from '@mui/material'
+import RouterIcon from '@mui/icons-material/RouterOutlined'
+import TodayIcon from '@mui/icons-material/MarkEmailUnreadOutlined'
+import AllSmsIcon from '@mui/icons-material/MailOutline'
+import TaskIcon from '@mui/icons-material/EventRepeatOutlined'
 import { api, type Overview, type StatusPoint } from '../api'
 import { StatTile } from '../components/StatTile'
 import { StorageMeter } from '../components/StorageMeter'
 import { SignalChart, type SignalSeries } from '../components/SignalChart'
-import { Loading, OnlineChip, formatTs, relativeTs } from '../components/common'
-import { STATUS, seriesColor } from '../tokens'
+import { Loading, OnlineChip, entranceStyle, formatTs, relativeTs } from '../components/common'
+import { PageHeader } from '../components/PageHeader'
+import { STATUS, VIZ, seriesColor } from '../tokens'
 import { useTheme } from '@mui/material/styles'
 import type { Mode } from '../tokens'
 
@@ -29,6 +34,7 @@ const REFRESH_MS = 15_000
 export function DashboardPage() {
   const theme = useTheme()
   const mode = theme.palette.mode as Mode
+  const viz = VIZ[mode]
   const [overview, setOverview] = useState<Overview | null>(null)
   const [history, setHistory] = useState<Record<string, StatusPoint[]>>({})
   const [hours, setHours] = useState(24)
@@ -71,25 +77,26 @@ export function DashboardPage() {
 
   return (
     <Stack spacing={3}>
-      <Typography variant="h1">仪表盘</Typography>
+      <PageHeader title="仪表盘" subtitle="模块、短信与存储,一目了然" />
 
       <Grid container spacing={2}>
-        <Grid item xs={6} md={3}>
+        <Grid item xs={6} md={3} sx={entranceStyle(0)}>
           <StatTile
             label="模块在线"
             value={`${counters.devices_online} / ${counters.devices_total}`}
             accent={allOnline ? STATUS.good : STATUS.critical}
             note={allOnline ? '全部在线' : '有模块离线'}
+            icon={<RouterIcon />}
             compact={false}
           />
         </Grid>
-        <Grid item xs={6} md={3}>
-          <StatTile label="今日短信" value={counters.messages_today} />
+        <Grid item xs={6} md={3} sx={entranceStyle(60)}>
+          <StatTile label="今日短信" value={counters.messages_today} icon={<TodayIcon />} />
         </Grid>
-        <Grid item xs={6} md={3}>
-          <StatTile label="短信总数" value={counters.messages_total} />
+        <Grid item xs={6} md={3} sx={entranceStyle(120)}>
+          <StatTile label="短信总数" value={counters.messages_total} icon={<AllSmsIcon />} />
         </Grid>
-        <Grid item xs={6} md={3}>
+        <Grid item xs={6} md={3} sx={entranceStyle(180)}>
           <StatTile
             label="启用的保号任务"
             value={counters.tasks_enabled}
@@ -100,16 +107,28 @@ export function DashboardPage() {
                 </Box>
               ) : undefined
             }
+            icon={<TaskIcon />}
           />
         </Grid>
       </Grid>
 
-      <SignalChart series={series} hours={hours} onHoursChange={setHours} />
+      <Box sx={entranceStyle(220)}>
+        <SignalChart series={series} hours={hours} onHoursChange={setHours} />
+      </Box>
 
       <Grid container spacing={2}>
         {devices.map((device, index) => (
-          <Grid item xs={12} md={6} key={device.id}>
-            <Card>
+          <Grid item xs={12} md={6} key={device.id} sx={entranceStyle(260 + index * 60)}>
+            <Card
+              sx={{
+                height: '100%',
+                transition: `box-shadow 200ms ${theme.transitions.easing.easeInOut}, transform 200ms ${theme.transitions.easing.easeInOut}`,
+                '&:hover': {
+                  boxShadow: viz.shadowHover,
+                  transform: 'translateY(-1px)',
+                },
+              }}
+            >
               <CardHeader
                 title={
                   <Stack direction="row" spacing={1} alignItems="center">
@@ -166,53 +185,55 @@ export function DashboardPage() {
         ))}
       </Grid>
 
-      <Card>
-        <CardHeader
-          title={<Typography variant="h3">最近短信</Typography>}
-          action={
-            <Button component={RouterLink} to="/messages" size="small">
-              查看全部
-            </Button>
-          }
-        />
-        <CardContent sx={{ pt: 0 }}>
-          {recent.length === 0 ? (
-            <Typography variant="body2" color="text.secondary" sx={{ py: 3 }}>
-              还没有短信
-            </Typography>
-          ) : (
-            <Table size="small">
-              <TableHead>
-                <TableRow>
-                  <TableCell>时间</TableCell>
-                  <TableCell>卡</TableCell>
-                  <TableCell>对方</TableCell>
-                  <TableCell>内容</TableCell>
-                </TableRow>
-              </TableHead>
-              <TableBody>
-                {recent.map((message) => (
-                  <TableRow key={message.id}>
-                    <TableCell sx={{ whiteSpace: 'nowrap' }}>{formatTs(message.ts)}</TableCell>
-                    <TableCell>{message.sim_label || message.device}</TableCell>
-                    <TableCell>{message.peer}</TableCell>
-                    <TableCell
-                      sx={{
-                        maxWidth: 420,
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
-                        whiteSpace: 'nowrap',
-                      }}
-                    >
-                      {message.body}
-                    </TableCell>
+      <Box sx={entranceStyle(400)}>
+        <Card>
+          <CardHeader
+            title={<Typography variant="h3">最近短信</Typography>}
+            action={
+              <Button component={RouterLink} to="/messages" size="small">
+                查看全部
+              </Button>
+            }
+          />
+          <CardContent sx={{ pt: 0 }}>
+            {recent.length === 0 ? (
+              <Typography variant="body2" color="text.secondary" sx={{ py: 3 }}>
+                还没有短信
+              </Typography>
+            ) : (
+              <Table size="small">
+                <TableHead>
+                  <TableRow>
+                    <TableCell>时间</TableCell>
+                    <TableCell>卡</TableCell>
+                    <TableCell>对方</TableCell>
+                    <TableCell>内容</TableCell>
                   </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          )}
-        </CardContent>
-      </Card>
+                </TableHead>
+                <TableBody>
+                  {recent.map((message) => (
+                    <TableRow key={message.id}>
+                      <TableCell sx={{ whiteSpace: 'nowrap' }}>{formatTs(message.ts)}</TableCell>
+                      <TableCell>{message.sim_label || message.device}</TableCell>
+                      <TableCell>{message.peer}</TableCell>
+                      <TableCell
+                        sx={{
+                          maxWidth: 420,
+                          overflow: 'hidden',
+                          textOverflow: 'ellipsis',
+                          whiteSpace: 'nowrap',
+                        }}
+                      >
+                        {message.body}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            )}
+          </CardContent>
+        </Card>
+      </Box>
     </Stack>
   )
 }

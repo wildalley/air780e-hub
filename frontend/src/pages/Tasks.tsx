@@ -32,6 +32,7 @@ import EditIcon from '@mui/icons-material/EditOutlined'
 import DeleteIcon from '@mui/icons-material/DeleteOutline'
 import { api, ApiError, type Device, type Task, type TaskInput, type TaskLog } from '../api'
 import { Loading, formatTs, useToast } from '../components/common'
+import { PageHeader } from '../components/PageHeader'
 import { STATUS } from '../tokens'
 
 /** Every field the plan promised would be editable, with its default. */
@@ -119,21 +120,22 @@ export function TasksPage() {
 
   return (
     <Stack spacing={3}>
-      <Stack direction="row" alignItems="center" spacing={2}>
-        <Typography variant="h1" sx={{ flexGrow: 1 }}>
-          保号任务
-        </Typography>
-        <Button
-          variant="contained"
-          startIcon={<AddIcon />}
-          onClick={() =>
-            setEditing({ id: null, input: { ...BLANK, device: devices[0]?.name ?? '' } })
-          }
-          disabled={devices.length === 0}
-        >
-          新建任务
-        </Button>
-      </Stack>
+      <PageHeader
+        title="保号任务"
+        subtitle="定期动作由本地 agent 执行,不依赖服务器在线"
+        actions={
+          <Button
+            variant="contained"
+            startIcon={<AddIcon />}
+            onClick={() =>
+              setEditing({ id: null, input: { ...BLANK, device: devices[0]?.name ?? '' } })
+            }
+            disabled={devices.length === 0}
+          >
+            新建任务
+          </Button>
+        }
+      />
 
       <Alert severity="info">
         任务在 <strong>本地 agent 上执行</strong>,不依赖服务器在线 —— 定时任务错过就补不回来,不能赌那条链路当时是通的。

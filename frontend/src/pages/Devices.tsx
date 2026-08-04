@@ -16,6 +16,7 @@ import RefreshIcon from '@mui/icons-material/RefreshOutlined'
 import TerminalIcon from '@mui/icons-material/TerminalOutlined'
 import { api, ApiError, type Device } from '../api'
 import { Loading, OnlineChip, formatTs, useToast } from '../components/common'
+import { PageHeader } from '../components/PageHeader'
 import { StorageMeter } from '../components/StorageMeter'
 
 export function DevicesPage() {
@@ -46,7 +47,7 @@ export function DevicesPage() {
 
   return (
     <Stack spacing={3}>
-      <Typography variant="h1">设备</Typography>
+      <PageHeader title="设备" subtitle="各模块的实时状态与工程参数" />
 
       {devices.length === 0 && (
         <Alert severity="info">

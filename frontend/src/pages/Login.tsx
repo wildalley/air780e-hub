@@ -9,7 +9,10 @@ import {
   Stack,
   TextField,
   Typography,
+  alpha,
 } from '@mui/material'
+import { useTheme } from '@mui/material/styles'
+import HubIcon from '@mui/icons-material/HubOutlined'
 import LightIcon from '@mui/icons-material/LightModeOutlined'
 import DarkIcon from '@mui/icons-material/DarkModeOutlined'
 import { api, ApiError } from '../api'
@@ -23,6 +26,7 @@ interface Props {
 }
 
 export function LoginPage({ needsSetup, onAuthenticated, mode, onToggleMode }: Props) {
+  const theme = useTheme()
   const [password, setPassword] = useState('')
   const [confirm, setConfirm] = useState('')
   const [error, setError] = useState<string | null>(null)
@@ -52,26 +56,72 @@ export function LoginPage({ needsSetup, onAuthenticated, mode, onToggleMode }: P
   return (
     <Box
       sx={{
-        minHeight: '100vh',
+        minHeight: '100dvh',
         display: 'grid',
         placeItems: 'center',
         p: 2,
         bgcolor: 'background.default',
+        position: 'relative',
+        overflow: 'hidden',
       }}
     >
+      {/* A whisper of the accent, not a gradient statement — keeps the
+          security surface calm while giving the plane a little depth. */}
+      <Box
+        aria-hidden
+        sx={{
+          position: 'absolute',
+          inset: 0,
+          pointerEvents: 'none',
+          background: `radial-gradient(70% 45% at 50% 0%, ${alpha(theme.palette.primary.main, theme.palette.mode === 'dark' ? 0.10 : 0.07)}, transparent 70%)`,
+        }}
+      />
       <IconButton
         onClick={onToggleMode}
-        sx={{ position: 'fixed', top: 16, right: 16 }}
+        sx={{ position: 'fixed', top: 16, right: 16, zIndex: 1 }}
         aria-label="切换主题"
       >
         {mode === 'dark' ? <LightIcon /> : <DarkIcon />}
       </IconButton>
 
-      <Card sx={{ width: '100%', maxWidth: 380 }}>
-        <CardContent sx={{ p: 3 }}>
-          <Typography variant="h1" gutterBottom>
-            air780e-hub
-          </Typography>
+      <Card
+        sx={{
+          width: '100%',
+          maxWidth: 400,
+          position: 'relative',
+          boxShadow: (t) => t.palette.mode === 'dark'
+            ? '0 24px 64px -24px rgba(0,0,0,0.7)'
+            : '0 24px 64px -32px rgba(11,11,11,0.3)',
+        }}
+      >
+        <CardContent sx={{ p: { xs: 3, sm: 4 } }}>
+          <Stack direction="row" spacing={1.75} alignItems="center" sx={{ mb: 3 }}>
+            <Box
+              aria-hidden
+              sx={{
+                width: 42,
+                height: 42,
+                borderRadius: 2.5,
+                display: 'grid',
+                placeItems: 'center',
+                bgcolor: 'primary.main',
+                color: 'primary.contrastText',
+              }}
+            >
+              <HubIcon sx={{ fontSize: 22 }} />
+            </Box>
+            <Box sx={{ lineHeight: 1.15 }}>
+              <Typography
+                variant="h1"
+                sx={{ fontSize: '1.25rem', letterSpacing: '-0.02em', lineHeight: 1.2 }}
+              >
+                air780e hub
+              </Typography>
+              <Typography variant="caption" color="text.secondary">
+                SMS 自托管网关
+              </Typography>
+            </Box>
+          </Stack>
           <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
             {needsSetup ? '首次使用,请设置管理员密码' : '请输入管理员密码'}
           </Typography>

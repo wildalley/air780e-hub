@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
-import { CssBaseline, ThemeProvider } from '@mui/material'
+import { CssBaseline, GlobalStyles, ThemeProvider } from '@mui/material'
 import { api, ApiError } from './api'
 import { buildTheme } from './theme'
-import type { Mode } from './tokens'
+import { VIZ, type Mode } from './tokens'
 import { Layout } from './components/Layout'
 import { Loading } from './components/common'
 import { LoginPage } from './pages/Login'
@@ -33,6 +33,7 @@ export default function App() {
   )
 
   const theme = useMemo(() => buildTheme(mode), [mode])
+  const viz = useMemo(() => VIZ[mode], [mode])
 
   const toggleMode = useCallback(() => {
     setMode((current) => {
@@ -108,6 +109,44 @@ export default function App() {
   return (
     <ThemeProvider theme={theme}>
       <CssBaseline />
+      <GlobalStyles
+        styles={{
+          body: {
+            WebkitFontSmoothing: 'antialiased',
+            MozOsxFontSmoothing: 'grayscale',
+            textRendering: 'optimizeLegibility',
+          },
+          // Shared entrance used by dashboard tiles — `entranceStyle()` in common.
+          '@keyframes hub-rise': {
+            from: { opacity: 0, transform: 'translateY(14px)' },
+            to: { opacity: 1, transform: 'none' },
+          },
+          '::selection': { backgroundColor: viz.selection, color: viz.selectionText },
+          // Keyboard-only focus must be visible on every interactive element
+          // (the a11y floor, not a polish pass).
+          'a:focus-visible, button:focus-visible, [role="button"]:focus-visible, [role="tab"]:focus-visible, [role="switch"]:focus-visible, [role="checkbox"]:focus-visible, [role="radio"]:focus-visible':
+            { outline: `2px solid ${viz.focus}`, outlineOffset: 2, borderRadius: 6 },
+          // Subtle, quiet scrollbars that respect the palette.
+          '*': { scrollbarWidth: 'thin', scrollbarColor: `${viz.axis} transparent` },
+          '*::-webkit-scrollbar': { width: 10, height: 10 },
+          '*::-webkit-scrollbar-thumb': {
+            backgroundColor: viz.axis,
+            borderRadius: 999,
+            border: '2px solid transparent',
+            backgroundClip: 'padding-box',
+          },
+          '*::-webkit-scrollbar-thumb:hover': { backgroundColor: viz.muted },
+          // Motion collapses to instant for reduced-motion users (Apple §14).
+          '@media (prefers-reduced-motion: reduce)': {
+            '*, *::before, *::after': {
+              animationDuration: '0.001ms !important',
+              animationIterationCount: '1 !important',
+              transitionDuration: '0.001ms !important',
+              scrollBehavior: 'auto !important',
+            },
+          },
+        }}
+      />
       {content}
     </ThemeProvider>
   )

@@ -50,6 +50,15 @@ export interface VizTokens {
   gridline: string
   axis: string
   border: string
+  /** Translucent fill for floating chrome (app bar) over the plane. */
+  chrome: string
+  /** Focus ring + text selection colours — the accent, tuned per surface. */
+  focus: string
+  selection: string
+  selectionText: string
+  /** Soft resting shadow and the elevated hover shadow for cards. */
+  shadowCard: string
+  shadowHover: string
   series: string[]
 }
 
@@ -63,6 +72,12 @@ export const VIZ: Record<Mode, VizTokens> = {
     gridline: '#e1e0d9',
     axis: '#c3c2b7',
     border: 'rgba(11,11,11,0.10)',
+    chrome: 'rgba(249,249,247,0.72)',
+    focus: '#2a78d6',
+    selection: 'rgba(42,120,214,0.16)',
+    selectionText: '#0b0b0b',
+    shadowCard: '0 1px 2px rgba(11,11,11,0.03), 0 8px 24px -12px rgba(11,11,11,0.14)',
+    shadowHover: '0 2px 4px rgba(11,11,11,0.04), 0 16px 40px -16px rgba(11,11,11,0.22)',
     series: SERIES.light,
   },
   dark: {
@@ -74,6 +89,12 @@ export const VIZ: Record<Mode, VizTokens> = {
     gridline: '#2c2c2a',
     axis: '#383835',
     border: 'rgba(255,255,255,0.10)',
+    chrome: 'rgba(13,13,13,0.72)',
+    focus: '#5b9bf0',
+    selection: 'rgba(57,135,229,0.30)',
+    selectionText: '#ffffff',
+    shadowCard: '0 1px 2px rgba(0,0,0,0.4), 0 8px 24px -12px rgba(0,0,0,0.6)',
+    shadowHover: '0 2px 4px rgba(0,0,0,0.5), 0 16px 40px -16px rgba(0,0,0,0.75)',
     series: SERIES.dark,
   },
 }

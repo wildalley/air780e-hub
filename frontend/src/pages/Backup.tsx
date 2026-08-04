@@ -18,6 +18,7 @@ import DownloadIcon from '@mui/icons-material/CloudDownloadOutlined'
 import UploadIcon from '@mui/icons-material/UploadFileOutlined'
 import { api, ApiError } from '../api'
 import { useToast } from '../components/common'
+import { PageHeader } from '../components/PageHeader'
 
 export function BackupPage() {
   const toast = useToast()
@@ -56,7 +57,7 @@ export function BackupPage() {
 
   return (
     <Stack spacing={3}>
-      <Typography variant="h1">备份 / 恢复</Typography>
+      <PageHeader title="备份 / 恢复" subtitle="整个数据库的一致快照,可离线保存" />
 
       <Card>
         <CardHeader

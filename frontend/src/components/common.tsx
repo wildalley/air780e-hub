@@ -1,4 +1,5 @@
-import { Alert, Box, Chip, CircularProgress, Snackbar } from '@mui/material'
+import { Alert, Box, Chip, CircularProgress, Snackbar, useMediaQuery } from '@mui/material'
+import type { CSSObject } from '@mui/material/styles'
 import CheckIcon from '@mui/icons-material/CheckCircleOutline'
 import OfflineIcon from '@mui/icons-material/CloudOffOutlined'
 import { useCallback, useState } from 'react'
@@ -10,6 +11,24 @@ import { STATUS } from '../tokens'
  * Status is never colour alone — every chip carries an icon and a word, which
  * is what keeps it readable under CVD and in forced-colors mode.
  */
+
+export function useReducedMotion() {
+  return useMediaQuery('(prefers-reduced-motion: reduce)')
+}
+
+/**
+ * Mount entrance: a short rise + fade, gated behind
+ * `prefers-reduced-motion: no-preference`. Delays let a grid stagger in.
+ * Sprinkled on a handful of dashboard surfaces, never on data that refreshes.
+ */
+export function entranceStyle(delay = 0): CSSObject {
+  return {
+    '@media (prefers-reduced-motion: no-preference)': {
+      animation: 'hub-rise 540ms cubic-bezier(0.16, 1, 0.3, 1) both',
+      animationDelay: `${delay}ms`,
+    },
+  }
+}
 
 export function OnlineChip({ online }: { online: boolean }) {
   return (

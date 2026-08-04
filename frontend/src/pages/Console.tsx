@@ -21,6 +21,7 @@ import SendIcon from '@mui/icons-material/SendOutlined'
 import ClearIcon from '@mui/icons-material/DeleteSweepOutlined'
 import { api, ApiError, type Device } from '../api'
 import { Loading } from '../components/common'
+import { PageHeader } from '../components/PageHeader'
 import { STATUS, VIZ } from '../tokens'
 
 /**
@@ -219,38 +220,41 @@ export function ConsolePage() {
 
   return (
     <Stack spacing={3} sx={{ height: '100%' }}>
-      <Stack direction="row" alignItems="center" spacing={2} flexWrap="wrap">
-        <Typography variant="h1" sx={{ flexGrow: 1 }}>
-          AT 调试
-        </Typography>
-        <TextField
-          select
-          size="small"
-          label="模块"
-          value={device}
-          onChange={(e) => setDevice(e.target.value)}
-          sx={{ minWidth: 200 }}
-          disabled={devices.length === 0}
-        >
-          {devices.map((d) => (
-            <MenuItem key={d.name} value={d.name}>
-              {d.sim_label || d.label || d.name}
-              {d.online ? '' : '(离线)'}
-            </MenuItem>
-          ))}
-        </TextField>
-        <Tooltip title="清空控制台">
-          <span>
-            <IconButton
-              onClick={() => setEntries([])}
-              disabled={entries.length === 0}
-              aria-label="清空控制台"
+      <PageHeader
+        title="AT 调试"
+        subtitle="直连模块,下发原始 AT 指令看回显"
+        actions={
+          <>
+            <TextField
+              select
+              size="small"
+              label="模块"
+              value={device}
+              onChange={(e) => setDevice(e.target.value)}
+              sx={{ minWidth: 200 }}
+              disabled={devices.length === 0}
             >
-              <ClearIcon />
-            </IconButton>
-          </span>
-        </Tooltip>
-      </Stack>
+              {devices.map((d) => (
+                <MenuItem key={d.name} value={d.name}>
+                  {d.sim_label || d.label || d.name}
+                  {d.online ? '' : '(离线)'}
+                </MenuItem>
+              ))}
+            </TextField>
+            <Tooltip title="清空控制台">
+              <span>
+                <IconButton
+                  onClick={() => setEntries([])}
+                  disabled={entries.length === 0}
+                  aria-label="清空控制台"
+                >
+                  <ClearIcon />
+                </IconButton>
+              </span>
+            </Tooltip>
+          </>
+        }
+      />
 
       {devices.length === 0 ? (
         <Alert severity="info" variant="outlined">

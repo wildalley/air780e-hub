@@ -31,6 +31,7 @@ import ErrorIcon from '@mui/icons-material/ErrorOutline'
 import RefreshIcon from '@mui/icons-material/RefreshOutlined'
 import { api, ApiError, type Conversation, type Device, type Message } from '../api'
 import { Loading, useToast } from '../components/common'
+import { PageHeader } from '../components/PageHeader'
 import { STATUS } from '../tokens'
 
 /**
@@ -99,24 +100,27 @@ export function MessagesPage() {
 
   return (
     <Stack spacing={3} sx={{ height: '100%' }}>
-      <Stack direction="row" alignItems="center" spacing={2}>
-        <Typography variant="h1" sx={{ flexGrow: 1 }}>
-          短信
-        </Typography>
-        <Tooltip title="刷新">
-          <IconButton onClick={() => void loadThreads()} size="small">
-            <RefreshIcon />
-          </IconButton>
-        </Tooltip>
-        <Button
-          variant="contained"
-          startIcon={<EditIcon />}
-          onClick={() => setComposeOpen(true)}
-          disabled={devices.length === 0}
-        >
-          新会话
-        </Button>
-      </Stack>
+      <PageHeader
+        title="短信"
+        subtitle="会话视图,回复在对话里完成"
+        actions={
+          <>
+            <Tooltip title="刷新">
+              <IconButton onClick={() => void loadThreads()} size="small">
+                <RefreshIcon />
+              </IconButton>
+            </Tooltip>
+            <Button
+              variant="contained"
+              startIcon={<EditIcon />}
+              onClick={() => setComposeOpen(true)}
+              disabled={devices.length === 0}
+            >
+              新会话
+            </Button>
+          </>
+        }
+      />
 
       <Card
         sx={{

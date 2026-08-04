@@ -39,6 +39,7 @@ import {
   type Sim,
 } from '../api'
 import { Loading, useToast } from '../components/common'
+import { PageHeader } from '../components/PageHeader'
 import { STATUS } from '../tokens'
 
 interface FieldSpec {
@@ -187,7 +188,7 @@ export function NotifyPage() {
 
   return (
     <Stack spacing={3}>
-      <Typography variant="h1">通知</Typography>
+      <PageHeader title="通知" subtitle="把短信路由到 Bark、Telegram、飞书等渠道" />
 
       <Alert severity="info">
         推送由 <strong>服务器</strong> 发出,走机房网络 —— 不消耗 SIM 卡流量,所以纯保号卡也能用。

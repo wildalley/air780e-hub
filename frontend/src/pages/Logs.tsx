@@ -14,6 +14,7 @@ import {
 } from '@mui/material'
 import { api, type AgentLog, type NotifyLog } from '../api'
 import { Loading, formatTs } from '../components/common'
+import { PageHeader } from '../components/PageHeader'
 import { STATUS } from '../tokens'
 
 const LEVEL_COLOR: Record<string, string> = {
@@ -42,7 +43,7 @@ export function LogsPage() {
 
   return (
     <Stack spacing={3}>
-      <Typography variant="h1">日志</Typography>
+      <PageHeader title="日志" subtitle="设备上报与推送记录,自动刷新" />
 
       <Card>
         <Tabs value={tab} onChange={(_, next) => setTab(next)} sx={{ px: 2 }}>
