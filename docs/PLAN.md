@@ -1,6 +1,6 @@
 # 实施计划
 
-> 状态:M0–M7 完成,274 个测试通过。两个模块已接入并实测收发,server 已部署上线。
+> 状态:M0–M7 完成,278 个测试通过。多模块收发、断网补传和通知链路均已完成验证。
 > 本文档是活文档 —— 决策变更、硬件实测结果都回填到这里。
 
 ---
@@ -50,17 +50,17 @@
 | server | **Python + FastAPI + SQLite** | 与 agent 同语言,一套技能维护;SQLite 让 Docker 只需一个 volume |
 | 前端 | **React + Vite + MUI** | 与 SimAdmin 同栈,UI 模式可直接对照借鉴 |
 | 传输 | **WebSocket + 预共享 token** | 出站、双向、实时;比轮询简单 |
-| 部署 | server: Docker Compose(1Panel 导入);agent: systemd | |
-| 包管理 | **uv** | 本机已有 |
+| 部署 | server: Docker Compose;agent: systemd | 反向代理与 Linux 发行版无关 |
+| 包管理 | **uv** | Python 环境与锁文件统一 |
 
-### 部署形态:1Panel
+### 部署形态
 
-服务器跑 1Panel,已有域名。因此:
+Server 使用 Docker Compose,由外部可信反向代理负责 TLS:
 
-- **容器不自己做 TLS**,只监听内部端口(默认 `8080`),证书与 HTTPS 由 1Panel 的 OpenResty 反代处理
-- 反代需**显式开启 WebSocket 升级**(`Upgrade` / `Connection` 头透传),否则 agent 连不上
-- agent 侧连 `wss://<域名>/ws`,TLS 在反代终止
-- 数据用具名 volume 挂 `/data`(SQLite + 配置),方便 1Panel 备份
+- 容器只提供 HTTP,生产环境通过 HTTPS / WSS 对外服务;
+- 反向代理必须传递 WebSocket 升级头;
+- Agent 连接 `wss://<域名>/ws`;
+- 数据使用具名 volume 挂载 `/data`,便于一致备份。
 
 **备选**:若日后 agent 要挪到软路由/NAS,Go 编译单静态二进制更省事。届时 agent 可单独用 Go 重写 —— 协议是 JSON over WS,换语言不影响 server。
 
@@ -69,7 +69,7 @@
 ## 4. 架构
 
 ```
-agent (Arch, 本地)                      server (Docker, 公网)
+agent (Linux, device side)              server (Docker, network side)
 ┌────────────────────────┐              ┌──────────────────────────┐
 │ SerialWorker ×N        │              │ WS Gateway               │
 │  ├ AT 编解码 / URC 解析 │              │  ├ 认证 (token)          │
@@ -160,7 +160,7 @@ raw_at       { cmd_id, device_id, command }   # Web AT 调试台
 
 每个阶段结束都应是**可运行、可验证**的状态。M0–M5 **不需要硬件**。
 
-### M0 — 假模块 + AT 驱动层 ✅ *(完成)*
+### M0 — 假模块 + AT 驱动层 *(完成)*
 
 已实现:
 
@@ -180,7 +180,7 @@ raw_at       { cmd_id, device_id, command }   # Web AT 调试台
 1. **`+CEREG:` 既是 URC 又是 `AT+CEREG?` 的响应** —— 注册了 URC 处理器后,查询响应被误路由,导致注册状态永远读不到。修法:命令在途时,以该命令自身的响应前缀优先
 2. **URC 前缀互相遮蔽** —— `+CMT` 会吞掉 `+CMTI`,且结果取决于注册顺序。修法:前缀匹配要求后接 `:` / 空格 / 逗号边界
 
-### M1 — agent 骨架 ✅ *(完成)*
+### M1 — agent 骨架 *(完成)*
 
 - `config.py` —— TOML 配置,server 段留空即为纯本地模式
 - `store.py` —— 本地 SQLite:事件队列(`AUTOINCREMENT` 保证 seq 不复用)、短信历史、任务表
@@ -191,7 +191,7 @@ raw_at       { cmd_id, device_id, command }   # Web AT 调试台
 
 **验收结果:109 个测试通过。** 关键覆盖:两模块并行且 ICCID 分离、长短信只入队一次、事件重启不丢、状态采样去噪(相同样本不重复上报)、**短信正文不进日志**。
 
-### M2 — server 骨架 + 协议 + Docker ✅ *(完成)*
+### M2 — server 骨架 + 协议 + Docker *(完成)*
 
 - `docs/protocol.md` —— 协议定稿(幂等、累积 ack、全量 sync_tasks、关闭码)
 - `db.py` —— 全量 schema,**一切挂 `sim_id`**;`ingested(agent_id, seq)` 保证重放不重复
@@ -208,7 +208,7 @@ raw_at       { cmd_id, device_id, command }   # Web AT 调试台
 3. **会话 Cookie 的 `Secure` 标记不能写死。** 原本按配置项设,结果局域网直连(无 TLS)时浏览器根本不回传 Cookie,永远登不进去。改成按请求实际 scheme 判断 —— 这也是反代必须传 `X-Forwarded-Proto` 的原因
 4. **scrypt 参数正好卡在 OpenSSL 默认 32MiB 上限**,必须显式给 `maxmem`
 
-### M3 — Web 界面 v1 ✅ *(完成)*
+### M3 — Web 界面 v1 *(完成)*
 - 登录认证 + session
 - 短信列表 / 会话视图 / 检索
 - 主动发送
@@ -220,7 +220,7 @@ raw_at       { cmd_id, device_id, command }   # Web AT 调试台
 6. **MUI 的 `DataGrid` 在 SSR/SSG 场景下需要动态 import**,否则 `npm run build` 会报 `ReferenceError: window is not defined`。解决方案:所有 DataGrid 相关组件用 `React.lazy(() => import(...))` + `Suspense` 包裹
 7. **前端构建时 `tsc` 会检查 `dist/` 下的旧产物**,如果之前构建产生了类型错误,第二次构建会直接因旧文件的类型错误而失败。`tsconfig.json` 加了 `"skipLibCheck": true` 并建议构建前 `rm -rf dist`
 
-### M4 — 推送引擎 ✅ *(完成)*
+### M4 — 推送引擎 *(完成)*
 - 渠道:Bark / Telegram / 飞书 / 企业微信 / 钉钉 / 自定义 POST / GET / SMTP
 - 规则引擎:按卡 + 关键词/正则 → 渠道
 - 模板变量、失败重试、转发日志
@@ -234,7 +234,7 @@ raw_at       { cmd_id, device_id, command }   # Web AT 调试台
 10. **`notify_logs` 的 `detail` 字段绝不能写短信正文**。PLAN §10 同意,回归测试锁住
 11. **闸门:多规则命中同一渠道要只推一次**(取优先级最高规则的模板),否则一个「全部短信→Bark」加「关键词 验证码→Bark」会变成两条推送
 
-### M5 — 保号调度器 ✅ *(完成)*
+### M5 — 保号调度器 *(完成)*
 
 - `schedule.py` —— cron(5 段,自实现)与 interval(天)两种调度,jitter 带 floor 防止负抖动把时间推到过去
 - `scheduler.py` —— 本地 tick 循环、动作 `send_sms` / `ping` / `raw_at`、线性重试、随机后缀、回执
@@ -251,7 +251,7 @@ raw_at       { cmd_id, device_id, command }   # Web AT 调试台
 13. **连接时那次下发不能等 `cmd_result`。** 回执要由同一个收帧循环读取,而循环正卡在等待里 —— 直到命令超时才解开。改成不带 `cmd_id` 的单向帧
 14. **任务编辑的 HTTP 请求也不该等 agent 回执。** 一个连着但没响应的 agent 会把 Web 请求拖满 30 秒命令超时。任务的真相在 server 库里,下发是尽力而为 —— 丢了下次连接会再对齐,全量替换让重复下发无副作用
 
-### M6 — 硬件接入 ✅ *(完成)*
+### M6 — 硬件接入 *(完成)*
 
 两个模块(`AirM2M_780EPV_V1011_LTE_AT`)实测通过:
 
@@ -263,7 +263,7 @@ raw_at       { cmd_id, device_id, command }   # Web AT 调试台
 - 存储上限 `SM`/`ME` 都是 **10 条**,比预想紧一倍以上
 - agent 装成 systemd 服务,配置在 `/etc/air780e-agent/config.toml`(600)
 
-**验收结果:两个模块同时在线,ICCID 分离,真实收发通。** 一条真实短信从模块到飞书推达用时 **2 秒**;`+CEREG: 0,5` 说明两张卡都在漫游(NZ Skinny / UK giffgaff)。
+**验收结果:多模块同时在线,ICCID 分离,真实收发和通知链路均通过。**
 
 开发中发现的问题:
 
@@ -272,7 +272,7 @@ raw_at       { cmd_id, device_id, command }   # Web AT 调试台
 17. **`serial.Serial()` 是同步阻塞调用,却跑在事件循环里。** 探测一个不应答的口时会卡住整个 agent,连 WebSocket 心跳都发不出去,链路被服务端以 ping 超时踢掉。改成 `asyncio.to_thread`
 18. **`hello` 可能早于端口发现。** 链路和 worker 是并行起来的,`hello` 带出去的端口可能是空的,server 于是一直显示上一次的旧路径。改成状态帧也带 `port`
 
-### M7 — 完善 ✅ *(完成)*
+### M7 — 完善 *(完成)*
 - [x] 仪表盘 + 信号历史曲线
 - [x] 短信界面改成会话式(手机短信那样)
 - [x] 会话未读角标、验证码复制、全文搜索与 CSV 导出
@@ -296,8 +296,8 @@ raw_at       { cmd_id, device_id, command }   # Web AT 调试台
 | ModemManager 抢串口 | 响应错乱、偶发超时 | mask 或 udev `ID_MM_DEVICE_IGNORE` |
 | SIM 存储溢出丢短信 | **丢数据** | 收到即读即删(D7)+ 启动补读 |
 | USB 供电不足致模块重启 | 掉线 | 后置口或有源 hub |
-| 保号规则因运营商而异 | 保号失败 | 任务动作做成可组合(短信+ping),到货实测两张卡 |
-| 主机关机期间不转发 | 延迟 | 靠 SIM 存储 + 开机补读兜底;若 Arch 非常开需重新评估 |
+| 保号规则因运营商而异 | 保号失败 | 任务动作做成可组合(短信+ping),使用测试卡实测 |
+| Agent 主机关机期间不转发 | 延迟 | 靠 SIM 存储 + 开机补读兜底;生产环境建议常开 |
 | 长短信合并边界情况 | 内容截断 | M0 单测覆盖;参考 chenxuuu 的 30 秒超时策略 |
 | **验证码短信泄露** | **严重** | 见 §10 |
 
@@ -307,10 +307,10 @@ raw_at       { cmd_id, device_id, command }   # Web AT 调试台
 
 **已确认:**
 
-1. ✅ **服务器 = 1Panel**,Docker 部署,反代 + 证书交给面板
-2. ✅ **已有域名**,agent 走 `wss://<域名>/ws`
-3. ✅ **要完善的后台** —— 含仪表盘、信号曲线,即 M7 全做。先出主要功能页面
-4. ✅ **保号方式 = 发短信**,周期 / 内容 / 目标号码全部可在 Web 界面自定义修改,并提供默认值
+1. [x] **Server = Docker Compose**,TLS 和证书交给可信反向代理
+2. [x] Agent 通过 `wss://<域名>/ws` 主动连接
+3. [x] 管理后台包含仪表盘、信号曲线和完整管理功能
+4. [x] **保号方式 = 发短信**,周期 / 内容 / 目标号码全部可在 Web 界面自定义修改,并提供默认值
 
 **待定(不阻塞开发,到货后填):**
 

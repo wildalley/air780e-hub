@@ -162,7 +162,7 @@ EXAMPLE_CONFIG = """\
 # air780e-agent configuration
 
 [agent]
-id = "home-arch"
+id = "site-a"
 db = "/var/lib/air780e-agent/agent.db"
 status_interval = 60.0
 
@@ -185,12 +185,12 @@ token = "change-me"
 #
 # Give both imei and iccid to require "this card, in this module".
 [[devices]]
-name = "a"
-label = "移动卡"
-imei = "863304089655700"
+name = "modem-a"
+label = "SIM A"
+imei = "000000000000001"
 
 [[devices]]
-name = "b"
-label = "联通卡"
-imei = "863304089655701"
+name = "modem-b"
+label = "SIM B"
+imei = "000000000000002"
 """

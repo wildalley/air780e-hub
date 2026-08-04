@@ -132,4 +132,4 @@ def test_example_config_is_valid():
     from air780e_agent.config import EXAMPLE_CONFIG
 
     config = AgentConfig.parse(EXAMPLE_CONFIG.encode())
-    assert [d.name for d in config.devices] == ["a", "b"]
+    assert [d.name for d in config.devices] == ["modem-a", "modem-b"]

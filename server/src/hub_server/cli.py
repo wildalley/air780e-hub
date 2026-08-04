@@ -28,7 +28,7 @@ def _serve(args: argparse.Namespace) -> int:
         app,
         host=settings.host,
         port=settings.port,
-        # 1Panel's OpenResty sits in front; trust its forwarding headers.
+        # Trust forwarding headers only when deployment enables proxy mode.
         proxy_headers=settings.behind_proxy,
         forwarded_allow_ips="*" if settings.behind_proxy else None,
         log_level="debug" if args.verbose else "info",

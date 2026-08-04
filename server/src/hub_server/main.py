@@ -1,8 +1,7 @@
 """FastAPI application.
 
-Serves three things from one process and one port: the REST API, the agent
-WebSocket, and the built frontend.  One port is what makes the 1Panel
-deployment a single reverse-proxy entry rather than a routing exercise.
+Serves the REST API, Agent WebSocket, and built frontend from one process and
+one port so deployment needs only one reverse-proxy upstream.
 """
 
 from __future__ import annotations

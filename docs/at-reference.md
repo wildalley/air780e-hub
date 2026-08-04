@@ -4,7 +4,7 @@ Air780E(EC618)通过 USB 接入 Linux 的实测信息与 AT 指令参考。
 
 指令表提取自合宙官方手册:https://docs.openluat.com/air780e/at/app/at_command
 
-> ⚠️ 本文档中标注「**待验证**」的项目,硬件到货后需实测确认。
+> 本文档中标注「**待验证**」的项目需要结合具体固件和运营商复测。
 
 ---
 
@@ -35,7 +35,7 @@ echo 'ATI' | socat - /dev/ttyACM5
 
 **前提:模块跑的必须是 AT 固件。** 合宙板子出厂可能是 LuatOS 固件,那样 USB 出来的是下载/日志口,不吃标准 AT。用 LuaTools 可在两种固件间互刷。到货第一步就是 `dmesg` + `ATI` 确认。
 
-### 1.1 本机实测(2026-08-03,第一个模块)
+### 1.1 参考枚举结果
 
 VID:PID 与序列号与上面的参考完全一致:
 
@@ -56,20 +56,15 @@ VID:PID 与序列号与上面的参考完全一致:
 
 三个 ACM 口的**控制接口号是 02 / 04 / 06**,udev 规则里的 `ATTRS{bInterfaceNumber}` 只能取这三个之一(哪个是 AT 口仍待实测)。
 
-**⚠️ 坑:没有 `/dev/ttyACM*` 不一定是模块的问题。** 本机第一次插上后八个接口一个都没绑驱动,看起来像"模块没被识别",实际是 Arch 升过内核没重启:
+**排查提示：没有 `/dev/ttyACM*` 不一定是模块故障。** 如果系统刚升级内核但尚未重启，运行中内核可能找不到对应的 `cdc_acm` 模块：
 
-```
-$ uname -r                    # 运行中
-7.1.4-arch1-1
-$ ls /lib/modules/            # 装着的
-7.1.5-arch1-2
-$ modprobe -n -v cdc_acm
-modprobe: FATAL: Module cdc_acm not found in directory /lib/modules/7.1.4-arch1-1
+```bash
+uname -r
+ls /lib/modules/
+modprobe -n -v cdc_acm
 ```
 
-内核升级把旧模块树删了,运行中的内核**再也加载不了任何模块**,`cdc_acm` 自然绑不上。重启即恢复。判断方法:`uname -r` 和 `ls /lib/modules/` 对不上就是这个。
-
-**另:本机没装 ModemManager**(`systemctl is-enabled ModemManager` → `not-found`),抢串口那条风险不存在,udev 里的 `ID_MM_*` 规则留着当保险即可。
+如果 `uname -r` 与 `/lib/modules/` 中已安装的版本不一致，先重启进入新内核。还应检查 ModemManager 是否占用串口；即使当前未安装，也建议保留 udev 中的 `ID_MM_DEVICE_IGNORE` 规则。
 
 ---
 
@@ -141,7 +136,7 @@ modprobe: FATAL: Module cdc_acm not found in directory /lib/modules/7.1.4-arch1-
 
 > 手册中**未出现 `AT+CIMI`**,但**实测支持**(2026-08-03,V1011 固件):返回裸 IMSI 字符串,无 `+CIMI:` 前缀。`AT+CGSN` 同样返回裸 IMEI。是手册没列全,不是不支持。
 >
-> 反过来,**`AT+CNUM` 实测返回 `ERROR`** —— 本机号码读不到(多数卡本来也没往 SIM 里写)。界面上的号码只能靠人工填,不能指望从模块读。
+> 反过来,部分 SIM 的 **`AT+CNUM` 会返回 `ERROR`** —— 号码通常没有写入 SIM,界面上的号码需要人工填写。
 
 SimAdmin 仪表盘上的信号、运营商、小区信息基本都能覆盖。拿不到的是**频段锁定、小区锁定**这类操作 —— 那些需要 QMI,EC618 不支持,属于硬件限制而非实现问题。
 
@@ -193,11 +188,11 @@ Air780E 的 AT 固件内置了完整的网络客户端,这意味着**必要时�
 
 ---
 
-## 3. Arch Linux 侧配置
+## 3. Linux 侧配置
 
-### 3.1 串口权限:是 `uucp` 不是 `dialout`
+### 3.1 串口权限
 
-Arch 的 tty 设备属 `uucp` 组(多数项目 README 写的 `dialout` 是 Debian 习惯):
+Arch Linux 通常使用 `uucp` 组,Debian / Ubuntu 通常使用 `dialout`;以设备实际属组为准:
 
 ```bash
 sudo usermod -aG uucp $USER   # 之后需注销重登
@@ -231,7 +226,7 @@ SUBSYSTEM=="usb", ATTR{idVendor}=="19d1", ATTR{idProduct}=="0001", ENV{ID_MM_DEV
 SUBSYSTEM=="tty", KERNELS=="1-3", ATTRS{bInterfaceNumber}=="02", SYMLINK+="air780e-a"
 ```
 
-**实测值**:本机模块在 USB 端口 `1-3`,三个 ACM 口的接口号是 `02` / `04` / `06`,其中 `02` 和 `06` 都应答 AT,`+CMTI` 确认走 `02`。
+一个模块可能有多个 CDC-ACM 接口，其中不止一个会响应部分 AT 指令；应通过完整探测和短信 URC 验证实际使用的接口。
 
 但这条路的根本问题是:**它拿"插在哪个孔"当身份**。换个 USB 口就要改规则,而且 udev 永远解决不了"哪个模块是哪个" —— IMEI 在 AT 层,不在 USB 描述符里,udev 根本读不到。
 
@@ -239,8 +234,8 @@ SUBSYSTEM=="tty", KERNELS=="1-3", ATTRS{bInterfaceNumber}=="02", SYMLINK+="air78
 
 ```toml
 [[devices]]
-name = "a"
-imei = "863304089655700"      # 按模块认;或 iccid 按卡认
+name = "modem-a"
+imei = "000000000000001"      # 示例值;实际部署填模块 IMEI
 ```
 
 于是:换 USB 口不用改配置,`ttyACM` 重新编号无所谓,USB 复位后模块换个号回来会被自动重新认上。不应答的两个 ACM 口自然被排除,顺带也就不需要猜哪个是 AT 口了。

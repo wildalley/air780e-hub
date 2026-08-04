@@ -144,7 +144,7 @@ def build_router(state: AppState) -> APIRouter:
         # Mark the cookie Secure only when the request actually arrived over
         # HTTPS.  Hard-coding it would lock out a plain-HTTP LAN deployment,
         # since the browser would then refuse to send the cookie back at all.
-        # Behind the 1Panel proxy, X-Forwarded-Proto makes this https.
+        # A trusted reverse proxy supplies X-Forwarded-Proto.
         response.set_cookie(
             SESSION_COOKIE,
             token,

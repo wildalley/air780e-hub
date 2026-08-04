@@ -1,241 +1,283 @@
-# 部署
+# 部署指南
 
-两侧分开部署:**服务器**跑 Docker(1Panel),**本地 Arch** 跑 agent(systemd)。
+air780e-hub 分为两个独立进程：
 
----
+- **Server**：部署在可被 Agent 和浏览器访问的主机上，推荐使用 Docker Compose。
+- **Agent**：部署在连接 Air780E USB 模块的 Linux 主机上，推荐使用 systemd。
 
-## 一、服务器端(1Panel + Docker)
+本文所有域名、Token、IMEI 和 ICCID 都是占位符。不要把真实配置、数据库、日志或凭据保存到仓库中。
 
-### 1. 起容器
+## 1. 部署 Server
 
-compose 里用的是 `build:` 而不是现成镜像 —— 前端要在镜像里编译,所以**服务器上必须有整个仓库**,只把 `docker-compose.yml` 贴进 1Panel 的「创建编排」会因为找不到构建上下文而失败。
+### 1.1 前置条件
 
-先把仓库弄到服务器上。仓库是私有的,克隆需要凭证,三选一:
+- Docker Engine 24+
+- Docker Compose v2
+- 支持 HTTPS 和 WebSocket 的反向代理
+- 可备份的持久化存储
 
-```bash
-# a) gh(最省事,交互式登录一次)
-gh auth login && gh repo clone wildalley/air780e-hub /opt/air780e-hub
-
-# b) 细粒度 PAT(只给这个仓库的 Contents: Read 权限)
-git clone https://<PAT>@github.com/wildalley/air780e-hub.git /opt/air780e-hub
-
-# c) 部署密钥(服务器上生成,公钥贴到仓库 Settings → Deploy keys,只读)
-ssh-keygen -t ed25519 -f ~/.ssh/air780e -N ""
-git clone git@github.com:wildalley/air780e-hub.git /opt/air780e-hub
-```
-
-然后构建启动:
+### 1.2 构建并启动
 
 ```bash
+git clone https://github.com/wildalley/air780e-hub.git /opt/air780e-hub
 cd /opt/air780e-hub
 docker compose -f deploy/docker-compose.yml up -d --build
 ```
 
-`build.context` 是相对 compose 文件所在目录的 `..`,也就是仓库根 —— 这样 `server/` 和 `frontend/` 都在上下文里。
+默认监听：
 
-想用 1Panel 的编排界面管理,就把 `deploy/docker-compose.yml` 复制成编排目录下的 `docker-compose.yml`,并把 `context` 改成仓库的绝对路径。
+```text
+127.0.0.1:8090 -> container:8080
+```
 
-**升级**就是 `git pull` 再重跑上面那条 `up -d --build`;数据在具名 volume 里,不受影响。
+可通过环境变量调整宿主机监听地址和端口：
 
-关于端口绑定有个坑:1Panel 的 OpenResty 一般跑在自己的容器里,所以**不能**把端口绑成 `127.0.0.1:8090` —— 那样 OpenResty 容器访问不到。compose 里用的是 `8090:8080`(发布到宿主机),**同时务必在防火墙上只放行 443,不要放行 8090**。
+```bash
+HUB_BIND_ADDRESS=127.0.0.1 HUB_HOST_PORT=8090 \
+  docker compose -f deploy/docker-compose.yml up -d --build
+```
 
-宿主机侧用 8090 是因为 8080 常被占(1Panel 自己、别的容器)。**容器内部仍然是 8080**,那是 `HUB_PORT` 的默认值,除了这一行映射之外没有任何地方需要知道。要换成别的号,只改 compose 里 `ports` 的**左边**那个数字,右边不要动。
+只有当反向代理运行在无法访问宿主机回环地址的独立容器中，才应设置 `HUB_BIND_ADDRESS=0.0.0.0`。这种情况下必须使用防火墙或私有容器网络阻止公网直接访问明文 HTTP 端口。
 
-### 2. 拿 agent token
+### 1.3 数据与凭据
 
-首次启动会自动生成一个,读出来:
+Server 把 SQLite 数据库、Agent Token 和运行时设置保存在 `hub-data` volume 的 `/data` 中。
+
+读取自动生成的 Agent Token：
 
 ```bash
 docker exec air780e-hub hub-server token
 ```
 
-也可以在 compose 里用 `HUB_AGENT_TOKEN` 自己指定。登录后台后在「系统 → agent token」也能看到。
+该 Token 等同于 Agent 接入凭据：
 
-### 3. 配反向代理
+- 不要写入 README、Issue、截图或命令历史共享记录；
+- 不要放进 Git 版本控制；
+- 泄露后应立即轮换并更新所有 Agent；
+- 备份 `hub-data` 时按敏感数据处理。
 
-1Panel → **网站 → 创建网站 → 反向代理**:
+首次访问 Web 管理端时，系统会要求设置管理员密码。系统不提供免密模式。
 
-- 主域名:`sms.example.com`
-- 代理地址:`http://<宿主机IP>:8090`
+### 1.4 反向代理
 
-然后申请证书、开启 HTTPS、开启强制跳转。
-
-### ⚠️ 4. 必须打开 WebSocket 支持
-
-**这是唯一一个不配就一定连不上的地方。** agent 走 `wss://<域名>/ws`,如果反代不透传升级头,握手会被降级成普通 HTTP,agent 一直重连失败。
-
-1Panel 较新版本在反向代理配置里有 **WebSocket 支持** 开关,打开即可。
-
-如果没有那个开关,就在网站的 **配置文件** 里手工加(1Panel → 网站 → 你的站点 → 配置文件):
+生产环境必须使用 HTTPS。以下 Nginx 示例同时代理普通 HTTP 和 WebSocket：
 
 ```nginx
-location /ws {
-    proxy_pass http://<宿主机IP>:8090/ws;
+server {
+    listen 443 ssl http2;
+    server_name sms.example.com;
 
-    # 这三行是关键
-    proxy_http_version 1.1;
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection "upgrade";
+    # ssl_certificate /path/to/fullchain.pem;
+    # ssl_certificate_key /path/to/private-key.pem;
 
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
+    location /ws {
+        proxy_pass http://127.0.0.1:8090/ws;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
 
-    # 长连接不能被闲置超时掐断。心跳是 30 秒一次,这里留足余量。
-    proxy_read_timeout 3600s;
-    proxy_send_timeout 3600s;
+    location / {
+        proxy_pass http://127.0.0.1:8090;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
 }
 ```
 
-`X-Forwarded-Proto` 也别漏 —— 服务器靠它判断请求是不是 HTTPS,进而决定会话 Cookie 要不要带 `Secure` 标记。
+`X-Forwarded-Proto` 用于判断是否设置 Secure Cookie；遗漏后可能出现登录后立即退出。Agent 使用 `wss://sms.example.com/ws`，因此 `/ws` 必须正确传递升级头。
 
-**自检:**
+健康检查：
 
 ```bash
-# 期望返回 101 Switching Protocols
+curl --fail https://sms.example.com/healthz
+```
+
+WebSocket 握手检查（把占位符替换为本机安全保存的 Token，不要把真实值提交到文件）：
+
+```bash
 curl -i -N \
-  -H "Connection: Upgrade" -H "Upgrade: websocket" \
-  -H "Sec-WebSocket-Version: 13" -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
-  -H "Authorization: Bearer <你的token>" \
+  -H "Connection: Upgrade" \
+  -H "Upgrade: websocket" \
+  -H "Sec-WebSocket-Version: 13" \
+  -H "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" \
+  -H "Authorization: Bearer <AGENT_TOKEN>" \
   https://sms.example.com/ws
 ```
 
-返回 `101` 就对了。返回 `200`/`404`/`502` 说明升级头没透传。
+期望状态为 `101 Switching Protocols`。
 
-### 5. 设置管理员密码
+### 1.5 升级与备份
 
-浏览器打开 `https://sms.example.com`,首次访问会要求设置管理员密码。
-
-**本项目不提供免密模式** —— 这套系统经手你全部的短信验证码(PLAN.md §10)。
-
-忘记密码时,SSH 到服务器:
+升级：
 
 ```bash
-docker exec -it air780e-hub hub-server auth reset-password
-docker exec -it air780e-hub hub-server auth clear   # 清空,下次访问重新设置
+cd /opt/air780e-hub
+git pull --ff-only
+docker compose -f deploy/docker-compose.yml up -d --build
 ```
 
-### 6. 备份
+升级不会删除 `hub-data`。仍应定期执行以下任一备份：
 
-数据全在 `hub-data` 这个 volume 的 `/data` 里(SQLite + agent token + 设置)。1Panel 的备份功能直接勾这个 volume 即可。
+- 在 Web 管理端下载 SQLite 快照；
+- 对 `hub-data` volume 做一致性备份；
+- 停止容器后复制 volume 内容。
 
----
+备份包含短信正文、号码、会话和推送凭据，必须加密并限制访问。
 
-## 二、本地端(Arch + systemd)
+## 2. 部署 Agent
 
-### 1. 装 agent
+### 2.1 安装
+
+以下示例把 Agent 安装到 `/opt/air780e-agent`：
 
 ```bash
 sudo mkdir -p /opt/air780e-agent
-sudo cp -r agent /opt/air780e-agent/
-cd /opt/air780e-agent/agent
-sudo uv venv .venv && sudo uv pip install --python .venv .
+sudo cp -r agent/. /opt/air780e-agent/
+cd /opt/air780e-agent
+sudo uv venv .venv
+sudo uv pip install --python .venv .
 ```
 
-### 2. 串口权限
+也可以在仓库的 `agent/` 目录中直接使用 `uv run` 运行。
 
-Arch 的 tty 属 `uucp` 组(不是 Debian 的 `dialout`):
+### 2.2 串口权限
+
+Air780E 通常枚举为多个 `/dev/ttyACM*`。常见串口组：
+
+- Arch Linux：`uucp`
+- Debian / Ubuntu：`dialout`
+
+确认实际属组：
 
 ```bash
-sudo usermod -aG uucp $USER    # 之后注销重登
-ls -l /dev/ttyACM*             # 确认实际属组
+ls -l /dev/ttyACM*
 ```
 
-**设备名不需要固定。** agent 启动和每次重连时会枚举 `/dev/ttyACM*`,逐个问
-`ATI` / `AT+CGSN` / `AT+ICCID`,认领配置里 `imei`(或 `iccid`)对得上的那个口
-—— 换 USB 口、`ttyACM` 重新编号、USB 复位后换号回来,都不用改配置。
+将运行 Agent 的服务账户加入对应组。若安装了 ModemManager，应停止其占用这些串口，或应用 [`deploy/udev/99-air780e.rules`](../deploy/udev/99-air780e.rules) 中的忽略规则。
 
-先拿到每个模块的 IMEI:
+### 2.3 识别模块
+
+Agent 可以按 IMEI 或 ICCID 自动发现模块，无需依赖不稳定的 `ttyACM` 编号：
 
 ```bash
-python -m air780e_agent.probe --scan     # 哪些口应答 AT
-python -m air780e_agent.probe /dev/ttyACM0   # 打印 IMEI / ICCID
+/opt/air780e-agent/.venv/bin/python -m air780e_agent.probe --scan
+/opt/air780e-agent/.venv/bin/python -m air780e_agent.probe /dev/ttyACM0
 ```
 
-想要固定的符号链接(比如别的工具也要用这个口),仍然可以用
-[`deploy/udev/99-air780e.rules`](../deploy/udev/99-air780e.rules) 按 USB 端口
-路径绑,然后在配置里写 `port = "/dev/air780e-a"` —— 写了 `port` 就跳过发现。
-规则里 `ID_MM_DEVICE_IGNORE` 那两条建议无论如何都留着(见下一节)。
+如果需要固定符号链接，可安装 udev 示例并在配置中显式设置 `port`。
 
-### 3. ModemManager
+### 2.4 配置
 
-如果系统装了它,会抢串口:
-
-```bash
-sudo systemctl mask ModemManager
-```
-
-或者靠上面那份 udev 规则里的 `ID_MM_DEVICE_IGNORE`。
-
-### 4. 配置
+生成示例：
 
 ```bash
 sudo mkdir -p /etc/air780e-agent
-air780e-agent --print-example-config | sudo tee /etc/air780e-agent/config.toml
-sudo chmod 600 /etc/air780e-agent/config.toml   # 里面有 token
-sudo nano /etc/air780e-agent/config.toml
+/opt/air780e-agent/.venv/bin/air780e-agent --print-example-config \
+  | sudo tee /etc/air780e-agent/config.toml >/dev/null
+sudo chmod 600 /etc/air780e-agent/config.toml
+sudoedit /etc/air780e-agent/config.toml
 ```
 
-填 `server.url = "wss://sms.example.com/ws"` 和第 2 步拿到的 `server.token`。
+至少需要修改：
 
-校验(不碰硬件):
+```toml
+[agent]
+id = "site-a"
 
-```bash
-air780e-agent --check --config /etc/air780e-agent/config.toml
+[server]
+url = "wss://sms.example.com/ws"
+token = "<AGENT_TOKEN>"
+
+[[devices]]
+name = "modem-a"
+label = "SIM A"
+imei = "<MODEM_IMEI>"
 ```
 
-### 5. 起服务
+也可以用 `iccid = "<SIM_ICCID>"` 按卡认领。真实配置只能保存在版本库外，并保持 `0600` 权限。
+
+校验配置但不访问硬件：
 
 ```bash
-sudo useradd --system --groups uucp --no-create-home air780e
+/opt/air780e-agent/.venv/bin/air780e-agent \
+  --check --config /etc/air780e-agent/config.toml
+```
+
+### 2.5 systemd
+
+创建服务账户、复制示例服务并按发行版检查串口组。下面使用 Arch Linux 的 `uucp`；Debian / Ubuntu 应改为 `dialout`：
+
+```bash
+sudo useradd --system --no-create-home --groups uucp air780e
 sudo cp deploy/systemd/air780e-agent.service /etc/systemd/system/
+sudo systemctl edit air780e-agent
+```
+
+确认 unit 中的 `Group`、`SupplementaryGroups` 和安装路径后启动：
+
+```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now air780e-agent
 journalctl -u air780e-agent -f
 ```
 
----
+## 3. 验收
 
-## 三、验证整条链路
+按以下顺序验证：
 
-1. `journalctl -u air780e-agent -f` 应该看到 `link established`
-2. 后台仪表盘上两个模块显示在线
-3. 给其中一张卡发条短信,后台短信列表应该秒出
-4. 后台点发送,手机应该收到
+1. `https://sms.example.com/healthz` 返回成功；
+2. Agent 日志出现 `link established`；
+3. Web 仪表盘显示模块在线，IMEI / ICCID 与本机设备一致；
+4. 向 SIM 发送测试短信，Web 会话中出现该消息；
+5. 从 Web 回复，目标手机收到短信；
+6. 配置测试通知渠道和规则，确认脱敏日志记录成功状态；
+7. 暂时断开 Agent 网络，注入消息后恢复，确认事件完整补传。
 
-断网测试(证明 D4 的本地缓冲有效):
+测试短信应使用专用号码和无敏感内容，不要把真实验证码用于截图、Issue 或公开日志。
+
+## 4. 常见问题
+
+### Agent 无法连接 Server
+
+- 检查 `server.url` 是否使用 `wss://`；
+- 检查证书链和 DNS；
+- 检查反向代理是否传递 WebSocket 升级头；
+- 检查 Token 是否一致；
+- 使用 `curl https://sms.example.com/healthz` 验证普通 HTTP 链路。
+
+### WebSocket 返回 HTTP 200 / 404 / 502
+
+反向代理没有把 `/ws` 当作 WebSocket，或上游地址错误。检查 `Upgrade`、`Connection` 和 `proxy_http_version 1.1`。
+
+### 模块一直离线
+
+- 检查 Agent 日志；
+- 检查串口属组和服务账户权限；
+- 确认 ModemManager 未占用端口；
+- 使用 `probe --scan` 验证 AT 口；
+- 检查配置中的 IMEI / ICCID 是否与模块一致。
+
+### 登录后立即退出
+
+确认反向代理传递 `X-Forwarded-Proto: https`，并且浏览器只通过 HTTPS 访问。
+
+### 忘记管理员密码
 
 ```bash
-# 拔掉服务器的网 / 停掉容器
-docker stop air780e-hub
-# 期间给卡发几条短信
-docker start air780e-hub
-# 后台应该一条不少地补上
+docker exec -it air780e-hub hub-server auth reset-password
 ```
 
----
-
-## 常见问题
-
-**agent 日志刷 `cannot reach server`**
-反代或域名不通。先用 `curl https://sms.example.com/healthz` 确认。
-
-**agent 日志刷 `server rejected the connection (HTTP 200)`**
-WebSocket 升级头没透传 —— 回到上面第 4 步。HTTP 200 是典型症状:反代把它当普通请求处理了。
-
-**agent 日志刷 `authentication failed`**
-token 不对。`docker exec air780e-hub hub-server token` 重新取。注意 agent 会退避到 60 秒重试,不会疯狂打服务器。
-
-**后台能登录但设备一直离线**
-agent 没连上,或者串口没打开。看 `journalctl -u air780e-agent`。
-
-**登录后马上被登出**
-反代没传 `X-Forwarded-Proto`,服务器以为是 HTTP,Cookie 没带 `Secure`,而浏览器在 HTTPS 页面下的处理不一致。补上那行。
-
-**短信收不到但模块在线**
-先看后台日志页有没有存储将满的告警 —— 实测这块模块 `SM` 和 `ME` **都只有 10 条**,存满了网络会静默丢新短信。再用 `probe` 直连看模块存储:
+如需清空认证状态并在下次访问重新初始化：
 
 ```bash
-python -m air780e_agent.probe /dev/ttyACM0
+docker exec -it air780e-hub hub-server auth clear
 ```

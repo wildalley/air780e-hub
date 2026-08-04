@@ -30,3 +30,18 @@ config.toml
 # Claude Code's per-machine settings — records local paths and commands.
 # The whole directory: the tool also writes transient .tmp.* files here.
 .claude/
+
+# Common secret/state spill files outside the normal directories.
+.env
+.env.*
+!.env.example
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.log
+*.pem
+*.key
+cookies.txt
+*.csv

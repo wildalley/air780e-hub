@@ -1,7 +1,7 @@
-"""Server settings, from the environment.
+"""Server settings loaded from environment variables.
 
-Environment variables rather than a config file: the server runs in Docker
-behind 1Panel, and env vars are what a panel can set without a shell.
+Environment-based configuration keeps runtime secrets outside the image and
+works consistently with Docker, systemd, and container management panels.
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ class Settings:
     offline_alert_grace: float = 120.0
 
     timezone: str = "Asia/Shanghai"
-    # Trust X-Forwarded-For — true behind the 1Panel reverse proxy.
+    # Trust X-Forwarded-* headers when running behind a trusted reverse proxy.
     behind_proxy: bool = True
 
     @property

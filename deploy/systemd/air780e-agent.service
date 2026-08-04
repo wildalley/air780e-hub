@@ -1,6 +1,6 @@
 [Unit]
 Description=air780e-hub local agent (owns the Air780E serial ports)
-Documentation=https://github.com/yourname/air780e-hub
+Documentation=https://github.com/wildalley/air780e-hub
 After=network-online.target
 Wants=network-online.target
 
@@ -10,8 +10,8 @@ ExecStart=/opt/air780e-agent/.venv/bin/air780e-agent --config /etc/air780e-agent
 Restart=always
 RestartSec=5
 
-# Serial devices belong to the uucp group on Arch (dialout on Debian).
-# Check with: ls -l /dev/ttyACM*
+# Serial devices commonly belong to uucp (Arch) or dialout (Debian/Ubuntu).
+# Confirm the group with: ls -l /dev/ttyACM*
 User=air780e
 Group=uucp
 SupplementaryGroups=uucp

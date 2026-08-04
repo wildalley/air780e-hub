@@ -2,6 +2,8 @@
 
 JSON over WebSocket。**连接方向始终是 agent 主动拨出**(见 PLAN.md 决策 D2)。
 
+本文示例中的域名、Token、设备标识、号码和消息正文均为虚构值。
+
 - 端点:`wss://<域名>/ws`
 - 认证:连接时带 `Authorization: Bearer <token>` 头
 - 编码:每帧一个 JSON 对象,UTF-8
@@ -34,19 +36,19 @@ JSON over WebSocket。**连接方向始终是 agent 主动拨出**(见 PLAN.md �
 ```json
 {
   "type": "hello",
-  "agent_id": "home-arch",
+  "agent_id": "site-a",
   "version": "0.1.0",
   "last_seq": 1420,
   "devices": [
     {
-      "name": "a",
-      "port": "/dev/air780e-a",
+      "name": "modem-a",
+      "port": "/dev/ttyACM0",
       "online": true,
-      "imei": "867567048825499",
-      "iccid": "89860622180012345678",
+      "imei": "000000000000001",
+      "iccid": "89000000000000000001",
       "model": "AirM2M_780E_V1171_LTE_AT",
-      "operator": "CHINA MOBILE",
-      "smsc": "+8613800210500"
+      "operator": "EXAMPLE",
+      "smsc": "+10000000000"
     }
   ]
 }
@@ -58,11 +60,11 @@ JSON over WebSocket。**连接方向始终是 agent 主动拨出**(见 PLAN.md �
 {
   "type": "sms_in",
   "seq": 1421,
-  "device": "a",
-  "iccid": "89860622180012345678",
+  "device": "modem-a",
+  "iccid": "89000000000000000001",
   "peer": "10086",
-  "body": "验证码 123456",
-  "ts": "2026-08-02T17:56:18+08:00",
+  "body": "测试消息 123456",
+  "ts": "2026-01-02T09:30:00+08:00",
   "segments": 1,
   "pdu": "0891683108200105F0..."
 }
