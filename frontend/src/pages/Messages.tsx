@@ -1,11 +1,5 @@
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type ReactNode,
-} from 'react'
+import { useEffect, useMemo, useRef, useState, useCallback, type ReactNode } from 'react'
+import useSWR from 'swr'
 import {
   Alert,
   Avatar,
@@ -110,26 +104,23 @@ export function MessagesPage() {
   const theme = useTheme()
   const narrow = useMediaQuery(theme.breakpoints.down('md'))
 
-  const [threads, setThreads] = useState<Conversation[] | null>(null)
   const [selected, setSelected] = useState<Conversation | null>(null)
   const [search, setSearch] = useState('')
   const [searchOpen, setSearchOpen] = useState(false)
   const [devices, setDevices] = useState<Device[]>([])
   const [composeOpen, setComposeOpen] = useState(false)
 
-  const loadThreads = useCallback(async () => {
-    const rows = await api.messages.conversations()
-    setThreads(rows)
-    return rows
-  }, [])
-  const refreshThreadsAfterRead = useCallback(() => {
-    void loadThreads()
-  }, [loadThreads])
-
+  const { data: threads, mutate: loadThreads } = useSWR(
+    '/api/messages/conversations',
+    () => api.messages.conversations(),
+    { refreshInterval: 10_000 }
+  )
+  const { data: devicesData } = useSWR('/api/devices', () => api.devices.list(), { refreshInterval: 30_000 })
+  
   useEffect(() => {
-    void loadThreads()
-    void api.devices.list().then(setDevices)
-  }, [loadThreads])
+    if (devicesData) setDevices(devicesData)
+  }, [devicesData])
+
 
   // Keep the open thread pointed at the freshest row, so its preview and
   // count stay honest after a reply is sent.
@@ -214,7 +205,7 @@ export function MessagesPage() {
             thread={selected}
             devices={devices}
             onBack={narrow ? () => setSelected(null) : undefined}
-            onRead={refreshThreadsAfterRead}
+            onRead={() => void loadThreads()}
             onSent={async () => {
               toast.show('已发送', 'success')
               await loadThreads()
@@ -241,7 +232,7 @@ export function MessagesPage() {
           setComposeOpen(false)
           toast.show('已发送', 'success')
           const rows = await loadThreads()
-          const thread = rows.find((t) => t.peer === peer)
+          const thread = rows?.find((t) => t.peer === peer)
           if (thread) setSelected(thread)
         }}
         onError={(msg) => toast.show(msg, 'error')}

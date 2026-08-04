@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState, lazy, Suspense } from 'react'
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
 import { CssBaseline, GlobalStyles, ThemeProvider } from '@mui/material'
 import { api, ApiError } from './api'
@@ -7,16 +7,16 @@ import { VIZ, type Mode } from './tokens'
 import { Layout } from './components/Layout'
 import { Loading } from './components/common'
 import { LoginPage } from './pages/Login'
-import { DashboardPage } from './pages/Dashboard'
-import { MessagesPage } from './pages/Messages'
-import { DevicesPage } from './pages/Devices'
-import { SimsPage } from './pages/Sims'
-import { TasksPage } from './pages/Tasks'
-import { ConsolePage } from './pages/Console'
-import { NotifyPage } from './pages/Notify'
-import { LogsPage } from './pages/Logs'
-import { BackupPage } from './pages/Backup'
-import { SettingsPage } from './pages/Settings'
+const DashboardPage = lazy(() => import('./pages/Dashboard').then((m) => ({ default: m.DashboardPage })))
+const MessagesPage = lazy(() => import('./pages/Messages').then((m) => ({ default: m.MessagesPage })))
+const DevicesPage = lazy(() => import('./pages/Devices').then((m) => ({ default: m.DevicesPage })))
+const SimsPage = lazy(() => import('./pages/Sims').then((m) => ({ default: m.SimsPage })))
+const TasksPage = lazy(() => import('./pages/Tasks').then((m) => ({ default: m.TasksPage })))
+const ConsolePage = lazy(() => import('./pages/Console').then((m) => ({ default: m.ConsolePage })))
+const NotifyPage = lazy(() => import('./pages/Notify').then((m) => ({ default: m.NotifyPage })))
+const LogsPage = lazy(() => import('./pages/Logs').then((m) => ({ default: m.LogsPage })))
+const BackupPage = lazy(() => import('./pages/Backup').then((m) => ({ default: m.BackupPage })))
+const SettingsPage = lazy(() => import('./pages/Settings').then((m) => ({ default: m.SettingsPage })))
 
 const THEME_KEY = 'hub.theme'
 
@@ -88,19 +88,21 @@ export default function App() {
     content = (
       <BrowserRouter>
         <Layout mode={mode} onToggleMode={toggleMode} onLogout={logout}>
-          <Routes>
-            <Route path="/" element={<DashboardPage />} />
-            <Route path="/messages" element={<MessagesPage />} />
-            <Route path="/devices" element={<DevicesPage />} />
-            <Route path="/sims" element={<SimsPage />} />
-            <Route path="/tasks" element={<TasksPage />} />
-            <Route path="/console" element={<ConsolePage />} />
-            <Route path="/notify" element={<NotifyPage />} />
-            <Route path="/logs" element={<LogsPage />} />
-            <Route path="/backup" element={<BackupPage />} />
-            <Route path="/settings" element={<SettingsPage onPasswordChanged={logout} />} />
-            <Route path="*" element={<Navigate to="/" replace />} />
-          </Routes>
+          <Suspense fallback={<Loading />}>
+            <Routes>
+              <Route path="/" element={<DashboardPage />} />
+              <Route path="/messages" element={<MessagesPage />} />
+              <Route path="/devices" element={<DevicesPage />} />
+              <Route path="/sims" element={<SimsPage />} />
+              <Route path="/tasks" element={<TasksPage />} />
+              <Route path="/console" element={<ConsolePage />} />
+              <Route path="/notify" element={<NotifyPage />} />
+              <Route path="/logs" element={<LogsPage />} />
+              <Route path="/backup" element={<BackupPage />} />
+              <Route path="/settings" element={<SettingsPage onPasswordChanged={logout} />} />
+              <Route path="*" element={<Navigate to="/" replace />} />
+            </Routes>
+          </Suspense>
         </Layout>
       </BrowserRouter>
     )

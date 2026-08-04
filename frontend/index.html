@@ -7,20 +7,18 @@
     <!-- This UI shows SMS verification codes; keep it out of search engines
          and out of referer headers. -->
     <meta name="robots" content="noindex, nofollow" />
-    <meta name="referrer" content="no-referrer" />
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/icon.svg" />
     <title>air780e-hub</title>
-    <!-- Match the token planes so there is no white flash before the app
-         mounts in dark mode. -->
-    <style>
-      html {
-        background: #f9f9f7;
-      }
-      @media (prefers-color-scheme: dark) {
-        html {
-          background: #0d0d0d;
-        }
-      }
-    </style>
+    <script>
+      (function () {
+        try {
+          var mode = localStorage.getItem('hub.theme');
+          if (!mode) mode = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+          document.documentElement.style.backgroundColor = mode === 'dark' ? '#0d0d0d' : '#f9f9f7';
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

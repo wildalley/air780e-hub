@@ -1,10 +1,32 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import { VitePWA } from 'vite-plugin-pwa'
 
 // The server hosts the built bundle itself, so in dev we just proxy the API
 // and the agent socket through to it.
 export default defineConfig({
-  plugins: [react()],
+  plugins: [
+    react(),
+    VitePWA({
+      registerType: 'autoUpdate',
+      manifest: {
+        name: 'Air780E SMS Hub',
+        short_name: 'SMS Hub',
+        description: 'Air780E 多卡短信中枢',
+        theme_color: '#0d0d0d',
+        background_color: '#0d0d0d',
+        display: 'standalone',
+        icons: [
+          {
+            src: '/icon.svg',
+            sizes: '192x192 512x512',
+            type: 'image/svg+xml',
+            purpose: 'any maskable'
+          }
+        ]
+      }
+    })
+  ],
   server: {
     port: 5173,
     proxy: {
