@@ -397,6 +397,18 @@ class Database:
     def set_devices_offline(self, agent_id: str) -> None:
         self.execute("UPDATE devices SET online = 0 WHERE agent_id = ?", (agent_id,))
 
+    def device_online(self, agent_id: str, name: str) -> bool | None:
+        """Current online flag, or None if the module has never been seen.
+
+        The offline alerter re-reads this when a grace timer fires, so a module
+        that came back during the wait is not paged as down.
+        """
+        row = self.one(
+            "SELECT online FROM devices WHERE agent_id = ? AND name = ?",
+            (agent_id, name),
+        )
+        return None if row is None else bool(row["online"])
+
     def device_id(self, agent_id: str, name: str) -> int | None:
         row = self.one(
             "SELECT id FROM devices WHERE agent_id = ? AND name = ?", (agent_id, name)

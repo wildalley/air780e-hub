@@ -32,6 +32,10 @@ COMMAND_TIMEOUT = 30.0
 
 MessageHook = Callable[[int, dict[str, Any]], Awaitable[None]]
 TaskResultHook = Callable[[int, dict[str, Any]], Awaitable[None]]
+# (agent_id, device, online) — fired on every module up/down state the gateway
+# learns, so the offline alerter can debounce and page.  Synchronous: it only
+# schedules work and returns, never awaits a push on the ingest path.
+DeviceChangeHook = Callable[[str, str, bool], None]
 
 
 class AgentUnavailable(RuntimeError):
@@ -64,6 +68,7 @@ class Gateway:
         *,
         on_message: MessageHook | None = None,
         on_task_result: TaskResultHook | None = None,
+        on_device_change: DeviceChangeHook | None = None,
     ) -> None:
         self.db = db
         self.settings = settings
@@ -71,6 +76,8 @@ class Gateway:
         # off this.  Both hooks must return promptly — the ack waits on them.
         self.on_message = on_message
         self.on_task_result = on_task_result
+        # Called on each module up/down edge; the offline alerter hangs off it.
+        self.on_device_change = on_device_change
         self.connections: dict[str, AgentConnection] = {}
         self._pending: dict[str, asyncio.Future] = {}
 
@@ -152,6 +159,9 @@ class Gateway:
         for device in devices:
             if isinstance(device, dict):
                 self.db.upsert_device(agent_id, device)
+                if "online" in device:
+                    self._note_device(agent_id, device.get("name", ""),
+                                      bool(device.get("online")))
         log.info(
             "agent %s connected (v%s, %d device(s), last_seq=%s)",
             agent_id, version or "?", len(devices), frame.get("last_seq"),
@@ -160,8 +170,21 @@ class Gateway:
     def _unregister(self, agent_id: str) -> None:
         self.connections.pop(agent_id, None)
         self.db.set_agent_connected(agent_id, False)
+        # Capture which modules were up *before* flipping them: the agent's link
+        # dropping takes all of them offline at once, and each such edge is what
+        # arms an offline alert (a whole host going dark is the case that most
+        # wants paging).  Modules already down are skipped — no re-page.
+        going_down = self.db.query(
+            "SELECT name FROM devices WHERE agent_id = ? AND online = 1", (agent_id,)
+        )
         self.db.set_devices_offline(agent_id)
+        for row in going_down:
+            self._note_device(agent_id, row["name"], False)
         log.info("agent %s disconnected", agent_id)
+
+    def _note_device(self, agent_id: str, name: str, online: bool) -> None:
+        if self.on_device_change is not None and name:
+            self.on_device_change(agent_id, name, online)
 
     # -- ingest ------------------------------------------------------------
 
@@ -238,6 +261,10 @@ class Gateway:
         payload["name"] = frame.get("device", "")
         device_id = self.db.upsert_device(agent_id, payload)
         self.db.record_status(device_id, frame)
+        # A status frame need not carry online (some only sample signal); act
+        # only on the ones that state it, so the alerter sees real edges.
+        if "online" in frame:
+            self._note_device(agent_id, frame.get("device", ""), bool(frame.get("online")))
 
     def _apply_log(self, agent_id: str, frame: dict[str, Any]) -> None:
         self.db.execute(

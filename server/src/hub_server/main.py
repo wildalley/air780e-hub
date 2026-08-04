@@ -54,8 +54,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-            # Let pushes already on the wire finish, then close the HTTP client
-            # — AppState.close() is synchronous and cannot await it.
+            # Cancel any armed offline timers, then let pushes already on the
+            # wire finish before the HTTP client closes — AppState.close() is
+            # synchronous and cannot await them.
+            await state.alerter.aclose()
             await state.notifier.drain()
             await state.notifier.aclose()
             state.close()

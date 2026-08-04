@@ -6,6 +6,7 @@ import logging
 from dataclasses import dataclass
 
 from .auth import Auth
+from .alerts import OfflineAlerter
 from .config import Settings
 from .db import Database
 from .gateway import Gateway
@@ -21,6 +22,7 @@ class AppState:
     auth: Auth
     gateway: Gateway
     notifier: Notifier
+    alerter: OfflineAlerter
 
     @classmethod
     def build(cls, settings: Settings) -> "AppState":
@@ -32,14 +34,19 @@ class AppState:
         # The notifier is what makes a stored SMS reach a phone; the gateway
         # hands every newly ingested inbound message straight to it.
         notifier = Notifier(db, settings)
+        # The alerter turns a module dropping off (a status edge, or a whole
+        # agent disconnecting) into a debounced push through the same notifier.
+        alerter = OfflineAlerter(db, notifier, grace=settings.offline_alert_grace)
         gateway = Gateway(
             db,
             settings,
             on_message=notifier.on_message,
             on_task_result=notifier.on_task_result,
+            on_device_change=alerter.note,
         )
         state = cls(
-            settings=settings, db=db, auth=auth, gateway=gateway, notifier=notifier
+            settings=settings, db=db, auth=auth, gateway=gateway,
+            notifier=notifier, alerter=alerter,
         )
         log.info("data dir %s, timezone %s", settings.data_dir, settings.timezone)
         if not auth.is_configured:

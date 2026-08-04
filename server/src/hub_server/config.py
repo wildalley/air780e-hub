@@ -43,6 +43,11 @@ class Settings:
     notify_retries: int = 2
     notify_timeout: float = 10.0
 
+    # How long a module must stay offline before it is paged, in seconds.  Long
+    # enough to ride out a USB re-enumeration or a broadband blip that drops the
+    # agent's link; a module back within the window is never announced.
+    offline_alert_grace: float = 120.0
+
     timezone: str = "Asia/Shanghai"
     # Trust X-Forwarded-For — true behind the 1Panel reverse proxy.
     behind_proxy: bool = True
@@ -71,6 +76,9 @@ class Settings:
             ),
             notify_retries=int(os.environ.get("HUB_NOTIFY_RETRIES", "2")),
             notify_timeout=float(os.environ.get("HUB_NOTIFY_TIMEOUT", "10")),
+            offline_alert_grace=float(
+                os.environ.get("HUB_OFFLINE_ALERT_GRACE", "120")
+            ),
             timezone=os.environ.get("HUB_TZ", "Asia/Shanghai"),
             behind_proxy=_bool("HUB_BEHIND_PROXY", True),
         )
