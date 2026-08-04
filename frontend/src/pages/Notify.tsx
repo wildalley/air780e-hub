@@ -193,6 +193,8 @@ export function NotifyPage() {
         推送由 <strong>服务器</strong> 发出,走机房网络 —— 不消耗 SIM 卡流量,所以纯保号卡也能用。
       </Alert>
 
+      <SettingsCard onError={(m) => toast.show(m, 'error')} onSaved={() => toast.show('设置已保存', 'success')} />
+
       <Card>
         <CardHeader
           title={<Typography variant="h3">推送渠道</Typography>}
@@ -397,6 +399,103 @@ export function NotifyPage() {
       )}
       {toast.element}
     </Stack>
+  )
+}
+
+function SettingsCard({
+  onSaved,
+  onError,
+}: {
+  onSaved: () => void
+  onError: (message: string) => void
+}) {
+  const [settings, setSettings] = useState<NotifySettings | null>(null)
+  // Kept as a string so the field can be temporarily empty while typing.
+  const [retention, setRetention] = useState('')
+  const [offlineAlerts, setOfflineAlerts] = useState(false)
+  const [saving, setSaving] = useState(false)
+
+  useEffect(() => {
+    void api.notifySettings
+      .get()
+      .then((s) => {
+        setSettings(s)
+        setRetention(String(s.message_retention_days))
+        setOfflineAlerts(s.offline_alerts_enabled)
+      })
+      .catch((err) => onError(err instanceof ApiError ? err.message : '加载设置失败'))
+  }, [onError])
+
+  const days = Math.round(Number(retention))
+  const daysValid = retention.trim() !== '' && Number.isFinite(days) && days >= 0 && days <= 3650
+  const dirty =
+    settings !== null &&
+    (days !== settings.message_retention_days || offlineAlerts !== settings.offline_alerts_enabled)
+
+  const save = async () => {
+    if (!daysValid) return
+    setSaving(true)
+    try {
+      const next = await api.notifySettings.update({
+        message_retention_days: days,
+        offline_alerts_enabled: offlineAlerts,
+      })
+      setSettings(next)
+      setRetention(String(next.message_retention_days))
+      setOfflineAlerts(next.offline_alerts_enabled)
+      onSaved()
+    } catch (err) {
+      onError(err instanceof ApiError ? err.message : '保存失败')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader title={<Typography variant="h3">短信与告警</Typography>} />
+      <CardContent sx={{ pt: 0 }}>
+        {settings === null ? (
+          <CircularProgress size={20} />
+        ) : (
+          <Stack spacing={2}>
+            <TextField
+              label="短信保留天数"
+              type="number"
+              value={retention}
+              onChange={(e) => setRetention(e.target.value)}
+              error={!daysValid}
+              helperText={
+                daysValid && days === 0
+                  ? '0 = 永久保留,不自动清理'
+                  : daysValid
+                    ? `超过 ${days} 天的短信会被服务器自动清理`
+                    : '请填 0-3650 之间的天数(0 = 永久保留)'
+              }
+              inputProps={{ min: 0, max: 3650, step: 1 }}
+              sx={{ maxWidth: 260 }}
+            />
+            <Stack direction="row" alignItems="center" spacing={1}>
+              <Switch
+                checked={offlineAlerts}
+                onChange={(e) => setOfflineAlerts(e.target.checked)}
+                inputProps={{ 'aria-label': '模块掉线告警' }}
+              />
+              <Typography variant="body2">模块掉线时推送告警</Typography>
+            </Stack>
+            <div>
+              <Button
+                variant="contained"
+                onClick={() => void save()}
+                disabled={!dirty || !daysValid || saving}
+              >
+                保存
+              </Button>
+            </div>
+          </Stack>
+        )}
+      </CardContent>
+    </Card>
   )
 }
 
