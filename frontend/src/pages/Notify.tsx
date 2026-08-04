@@ -33,6 +33,7 @@ import {
   ApiError,
   type Channel,
   type ChannelInput,
+  type NotifySettings,
   type Rule,
   type RuleInput,
   type Sim,

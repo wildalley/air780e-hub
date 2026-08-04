@@ -16,8 +16,9 @@ from typing import Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 
+from .alerts import SETTING_ENABLED
 from .auth import SESSION_COOKIE, AuthError
-from .db import utcnow
+from .db import SETTING_MESSAGE_RETENTION_DAYS, utcnow
 from .gateway import AgentUnavailable, CommandFailed
 from .state import AppState
 
@@ -71,6 +72,13 @@ class RuleBody(BaseModel):
     template: str = ""
     priority: int = 0
     enabled: bool = True
+
+
+class NotifySettingsBody(BaseModel):
+    # 0 keeps messages forever; the cap is a decade so a fat-fingered value
+    # can never park the purge on a nonsense window.
+    message_retention_days: int = Field(ge=0, le=3650)
+    offline_alerts_enabled: bool
 
 
 class TaskBody(BaseModel):
@@ -404,6 +412,28 @@ def build_router(state: AppState) -> APIRouter:
             (limit,),
         )
 
+    # -- notify settings ---------------------------------------------------
+    # Operator-tunable knobs surfaced on the Notify page: how long SMS are
+    # kept before the housekeeping purge deletes them, and whether a module
+    # dropping off the bus pages anyone.  Both live in the settings table so a
+    # change survives a restart and takes effect without redeploying.
+
+    def _notify_settings() -> dict[str, Any]:
+        return {
+            "message_retention_days": state.message_retention_days,
+            "offline_alerts_enabled": bool(state.db.get_setting(SETTING_ENABLED, True)),
+        }
+
+    @router.get("/notify-settings", dependencies=guard)
+    def get_notify_settings() -> dict[str, Any]:
+        return _notify_settings()
+
+    @router.put("/notify-settings", dependencies=guard)
+    def update_notify_settings(body: NotifySettingsBody) -> dict[str, Any]:
+        state.db.set_setting(SETTING_MESSAGE_RETENTION_DAYS, body.message_retention_days)
+        state.db.set_setting(SETTING_ENABLED, body.offline_alerts_enabled)
+        return _notify_settings()
+
     # -- tasks (scheduler lands in M5) -------------------------------------
 
     @router.get("/tasks", dependencies=guard)
@@ -474,7 +504,7 @@ def build_router(state: AppState) -> APIRouter:
     @router.post("/system/purge", dependencies=guard)
     def purge() -> dict[str, Any]:
         return state.db.purge(
-            message_days=state.settings.message_retention_days,
+            message_days=state.message_retention_days,
             status_days=state.settings.status_retention_days,
         )
 

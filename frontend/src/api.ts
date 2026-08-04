@@ -249,6 +249,12 @@ export interface NotifyLog {
   channel_name?: string
 }
 
+/** Operator-tunable knobs on the Notify page (retention, offline paging). */
+export interface NotifySettings {
+  message_retention_days: number
+  offline_alerts_enabled: boolean
+}
+
 export interface AgentLog {
   id: number
   agent_id: string
@@ -325,6 +331,10 @@ export const api = {
     logs: () => get<TaskLog[]>('/api/task-logs'),
   },
   notifyLogs: () => get<NotifyLog[]>('/api/notify-logs'),
+  notifySettings: {
+    get: () => get<NotifySettings>('/api/notify-settings'),
+    update: (body: NotifySettings) => put<NotifySettings>('/api/notify-settings', body),
+  },
   logs: () => get<AgentLog[]>('/api/logs'),
   system: {
     agentToken: () => get<{ token: string }>('/api/system/agent-token'),

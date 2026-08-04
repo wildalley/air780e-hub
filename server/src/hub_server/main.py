@@ -32,7 +32,7 @@ async def _housekeeping(state: AppState) -> None:
         await asyncio.sleep(PURGE_INTERVAL)
         try:
             removed = state.db.purge(
-                message_days=state.settings.message_retention_days,
+                message_days=state.message_retention_days,
                 status_days=state.settings.status_retention_days,
             )
             state.auth.purge_expired_sessions()

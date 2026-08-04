@@ -34,8 +34,11 @@ class Settings:
     agent_token: str = ""
 
     session_ttl_hours: int = 24 * 14
-    # Messages older than this are deleted (PLAN.md section 10).  0 disables.
-    message_retention_days: int = 180
+    # Default SMS retention, in days: messages older than this are deleted
+    # (PLAN.md section 10).  0 disables.  This is only the fallback default —
+    # the operator can override it on the Notify page, where it is stored in
+    # the settings table and takes precedence (see AppState.message_retention_days).
+    message_retention_days: int = 90
     status_retention_days: int = 30
 
     # Push retries *per channel*, on top of the first attempt.  A phone that
@@ -69,7 +72,7 @@ class Settings:
             agent_token=os.environ.get("HUB_AGENT_TOKEN", "").strip(),
             session_ttl_hours=int(os.environ.get("HUB_SESSION_TTL_HOURS", 24 * 14)),
             message_retention_days=int(
-                os.environ.get("HUB_MESSAGE_RETENTION_DAYS", "180")
+                os.environ.get("HUB_MESSAGE_RETENTION_DAYS", "90")
             ),
             status_retention_days=int(
                 os.environ.get("HUB_STATUS_RETENTION_DAYS", "30")

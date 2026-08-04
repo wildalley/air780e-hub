@@ -23,6 +23,10 @@ from typing import Any, Iterable
 
 log = logging.getLogger(__name__)
 
+# Persisted (settings table) key for the SMS retention window, in days.  The
+# operator edits it on the Notify page; when unset the env default applies.
+SETTING_MESSAGE_RETENTION_DAYS = "message_retention_days"
+
 SCHEMA = """
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;

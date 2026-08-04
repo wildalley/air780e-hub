@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from .auth import Auth
 from .alerts import OfflineAlerter
 from .config import Settings
-from .db import Database
+from .db import Database, SETTING_MESSAGE_RETENTION_DAYS
 from .gateway import Gateway
 from .notify import Notifier
 
@@ -58,3 +58,20 @@ class AppState:
 
     def close(self) -> None:
         self.db.close()
+
+    @property
+    def message_retention_days(self) -> int:
+        """Effective SMS retention window, in days.
+
+        The operator's saved value on the Notify page wins; absent that, the
+        environment default (``Settings.message_retention_days``) applies.  One
+        accessor so housekeeping, the manual purge and the settings API can
+        never disagree on which number is in force.  0 means "keep forever".
+        """
+        stored = self.db.get_setting(
+            SETTING_MESSAGE_RETENTION_DAYS, self.settings.message_retention_days
+        )
+        try:
+            return int(stored)
+        except (TypeError, ValueError):
+            return self.settings.message_retention_days
