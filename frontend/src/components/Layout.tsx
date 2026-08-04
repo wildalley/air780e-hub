@@ -22,6 +22,7 @@ import TaskIcon from '@mui/icons-material/EventRepeatOutlined'
 import ConsoleIcon from '@mui/icons-material/TerminalOutlined'
 import NotifyIcon from '@mui/icons-material/NotificationsActiveOutlined'
 import LogsIcon from '@mui/icons-material/ReceiptLongOutlined'
+import BackupIcon from '@mui/icons-material/BackupOutlined'
 import SettingsIcon from '@mui/icons-material/SettingsOutlined'
 import MenuIcon from '@mui/icons-material/Menu'
 import LightIcon from '@mui/icons-material/LightModeOutlined'
@@ -40,6 +41,7 @@ const NAV = [
   { to: '/console', label: 'AT 调试', icon: <ConsoleIcon /> },
   { to: '/notify', label: '通知', icon: <NotifyIcon /> },
   { to: '/logs', label: '日志', icon: <LogsIcon /> },
+  { to: '/backup', label: '备份恢复', icon: <BackupIcon /> },
   { to: '/settings', label: '设置', icon: <SettingsIcon /> },
 ]
 

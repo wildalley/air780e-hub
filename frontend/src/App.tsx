@@ -15,6 +15,7 @@ import { TasksPage } from './pages/Tasks'
 import { ConsolePage } from './pages/Console'
 import { NotifyPage } from './pages/Notify'
 import { LogsPage } from './pages/Logs'
+import { BackupPage } from './pages/Backup'
 import { SettingsPage } from './pages/Settings'
 
 const THEME_KEY = 'hub.theme'
@@ -95,6 +96,7 @@ export default function App() {
             <Route path="/console" element={<ConsolePage />} />
             <Route path="/notify" element={<NotifyPage />} />
             <Route path="/logs" element={<LogsPage />} />
+            <Route path="/backup" element={<BackupPage />} />
             <Route path="/settings" element={<SettingsPage onPasswordChanged={logout} />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
