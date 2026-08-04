@@ -111,6 +111,7 @@ export default function App() {
       <CssBaseline />
       <GlobalStyles
         styles={{
+          'html, body, #root': { height: '100%' },
           body: {
             WebkitFontSmoothing: 'antialiased',
             MozOsxFontSmoothing: 'grayscale',

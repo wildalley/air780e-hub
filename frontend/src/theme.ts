@@ -59,6 +59,18 @@ export function buildTheme(mode: Mode): Theme {
       MuiChip: {
         styleOverrides: { root: { borderRadius: 999, fontWeight: 500 } },
       },
+      MuiInputBase: {
+        styleOverrides: {
+          input: {
+            '&:-webkit-autofill': {
+              WebkitBoxShadow: `0 0 0 100px ${viz.surface} inset !important`,
+              WebkitTextFillColor: `${viz.textPrimary} !important`,
+              caretColor: viz.textPrimary,
+              borderRadius: 'inherit',
+            },
+          },
+        },
+      },
       MuiTableCell: {
         styleOverrides: {
           root: { borderColor: viz.border },
