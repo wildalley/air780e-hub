@@ -8,6 +8,7 @@ import {
   Table,
   TableBody,
   TableCell,
+  TableContainer,
   TableHead,
   TableRow,
   TextField,
@@ -65,57 +66,81 @@ export function SimsPage() {
       ) : (
         <Card>
           <CardContent sx={{ p: 0, '&:last-child': { pb: 0 } }}>
-            <Table size="small">
-              <TableHead>
-                <TableRow>
-                  <TableCell>备注名</TableCell>
-                  <TableCell>号码</TableCell>
-                  <TableCell>ICCID</TableCell>
-                  <TableCell>运营商</TableCell>
-                  <TableCell align="right">短信数</TableCell>
-                  <TableCell>最后在线</TableCell>
-                  <TableCell align="right" />
-                </TableRow>
-              </TableHead>
-              <TableBody>
-                {sims.map((sim) => {
-                  const draft = drafts[sim.id]
-                  return (
-                    <TableRow key={sim.id}>
-                      <TableCell>
-                        <TextField
-                          size="small"
-                          variant="standard"
-                          value={draft?.label ?? sim.label}
-                          onChange={(e) => edit(sim.id, 'label', e.target.value)}
-                          placeholder="移动主卡"
-                        />
-                      </TableCell>
-                      <TableCell>
-                        <TextField
-                          size="small"
-                          variant="standard"
-                          value={draft?.phone_number ?? sim.phone_number}
-                          onChange={(e) => edit(sim.id, 'phone_number', e.target.value)}
-                          placeholder="13800138000"
-                        />
-                      </TableCell>
-                      <TableCell sx={{ fontVariantNumeric: 'tabular-nums' }}>{sim.iccid}</TableCell>
-                      <TableCell>{sim.operator || '—'}</TableCell>
-                      <TableCell align="right">{sim.message_count ?? 0}</TableCell>
-                      <TableCell sx={{ whiteSpace: 'nowrap' }}>
-                        {formatTs(sim.last_seen_at)}
-                      </TableCell>
-                      <TableCell align="right">
-                        <Button size="small" disabled={!draft} onClick={() => save(sim)}>
-                          保存
-                        </Button>
-                      </TableCell>
-                    </TableRow>
-                  )
-                })}
-              </TableBody>
-            </Table>
+            <TableContainer>
+              <Table size="small" sx={{ minWidth: 640 }}>
+                <TableHead>
+                  <TableRow>
+                    <TableCell>备注名</TableCell>
+                    <TableCell>号码</TableCell>
+                    <TableCell>ICCID</TableCell>
+                    <TableCell sx={{ display: { xs: 'none', sm: 'table-cell' } }}>
+                      运营商
+                    </TableCell>
+                    <TableCell
+                      align="right"
+                      sx={{ display: { xs: 'none', sm: 'table-cell' } }}
+                    >
+                      短信数
+                    </TableCell>
+                    <TableCell sx={{ display: { xs: 'none', sm: 'table-cell' } }}>
+                      最后在线
+                    </TableCell>
+                    <TableCell align="right" />
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {sims.map((sim) => {
+                    const draft = drafts[sim.id]
+                    return (
+                      <TableRow key={sim.id}>
+                        <TableCell>
+                          <TextField
+                            size="small"
+                            variant="standard"
+                            value={draft?.label ?? sim.label}
+                            onChange={(e) => edit(sim.id, 'label', e.target.value)}
+                            placeholder="移动主卡"
+                            sx={{ minWidth: 130 }}
+                          />
+                        </TableCell>
+                        <TableCell>
+                          <TextField
+                            size="small"
+                            variant="standard"
+                            value={draft?.phone_number ?? sim.phone_number}
+                            onChange={(e) => edit(sim.id, 'phone_number', e.target.value)}
+                            placeholder="13800138000"
+                            sx={{ minWidth: 150 }}
+                          />
+                        </TableCell>
+                        <TableCell sx={{ fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}>
+                          {sim.iccid}
+                        </TableCell>
+                        <TableCell sx={{ display: { xs: 'none', sm: 'table-cell' } }}>
+                          {sim.operator || '—'}
+                        </TableCell>
+                        <TableCell
+                          align="right"
+                          sx={{ display: { xs: 'none', sm: 'table-cell' } }}
+                        >
+                          {sim.message_count ?? 0}
+                        </TableCell>
+                        <TableCell
+                          sx={{ whiteSpace: 'nowrap', display: { xs: 'none', sm: 'table-cell' } }}
+                        >
+                          {formatTs(sim.last_seen_at)}
+                        </TableCell>
+                        <TableCell align="right">
+                          <Button size="small" disabled={!draft} onClick={() => save(sim)}>
+                            保存
+                          </Button>
+                        </TableCell>
+                      </TableRow>
+                    )
+                  })}
+                </TableBody>
+              </Table>
+            </TableContainer>
           </CardContent>
         </Card>
       )}

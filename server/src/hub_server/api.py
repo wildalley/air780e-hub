@@ -24,6 +24,7 @@ from .alerts import SETTING_ENABLED
 from .auth import SESSION_COOKIE, AuthError
 from .db import SETTING_MESSAGE_RETENTION_DAYS, utcnow
 from .gateway import AgentUnavailable, CommandFailed
+from .notify import match_rules
 from .state import AppState
 
 log = logging.getLogger(__name__)
@@ -76,6 +77,17 @@ class RuleBody(BaseModel):
     template: str = ""
     priority: int = 0
     enabled: bool = True
+
+
+class ReadBody(BaseModel):
+    sim_id: int | None = None
+    peer: str = Field(min_length=1, max_length=32)
+
+
+class RulePreviewBody(BaseModel):
+    sim_id: int | None = None
+    peer: str = ""
+    body: str = Field(min_length=1, max_length=2000)
 
 
 class NotifySettingsBody(BaseModel):
@@ -314,6 +326,59 @@ def build_router(state: AppState) -> APIRouter:
             "number": body.number, "body": body.body,
         })
 
+    @router.post("/messages/read", dependencies=guard)
+    def mark_read(body: ReadBody) -> dict[str, Any]:
+        """Mark one conversation's incoming messages as read (opening it)."""
+        marked = state.db.mark_read(sim_id=body.sim_id, peer=body.peer)
+        return {"ok": True, "marked": marked}
+
+    @router.get("/messages/unread", dependencies=guard)
+    def unread_total() -> dict[str, Any]:
+        return {"total": state.db.unread_total()}
+
+    @router.get("/messages/export", dependencies=guard)
+    def export_messages(
+        limit: int | None = Query(None, ge=1, le=1_000_000),
+        sim_id: int | None = None,
+        peer: str | None = None,
+        search: str | None = None,
+    ) -> Response:
+        """Stored messages as CSV.  Bodies included — the admin owns them."""
+        import csv
+        import io
+
+        rows = state.db.messages(
+            limit=limit, sim_id=sim_id, peer=peer, search=search
+        )
+        buffer = io.StringIO()
+        # BOM so Excel opens UTF-8 Chinese correctly.
+        buffer.write("\ufeff")
+        writer = csv.writer(buffer)
+        writer.writerow(
+            ["id", "ts", "direction", "sim_id", "sim_label", "peer", "body", "status"]
+        )
+        for message in rows:
+            writer.writerow(
+                [
+                    message["id"],
+                    message["ts"],
+                    message["direction"],
+                    message["sim_id"] or "",
+                    message.get("sim_label") or "",
+                    message["peer"],
+                    message["body"],
+                    message["status"],
+                ]
+            )
+        return Response(
+            buffer.getvalue(),
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": 'attachment; filename="messages.csv"',
+                "Cache-Control": "no-store",
+            },
+        )
+
     @router.post("/at", dependencies=guard)
     async def raw_at(body: RawAtBody) -> dict[str, Any]:
         agent_id = state.gateway.agent_for_device(body.device)
@@ -406,6 +471,70 @@ def build_router(state: AppState) -> APIRouter:
     def delete_rule(rule_id: int) -> dict[str, Any]:
         state.db.execute("DELETE FROM rules WHERE id = ?", (rule_id,))
         return {"ok": True}
+
+    @router.post("/rules/preview", dependencies=guard)
+    def preview_rules(body: RulePreviewBody) -> list[dict[str, Any]]:
+        """Which rules would fire for this message, with the rendered payload.
+
+        The Notify page's debugger: paste a real message and see the exact
+        pushes it would produce — rule name, channel, and rendered text —
+        without touching any provider.
+        """
+        sim = (
+            state.db.one("SELECT * FROM sims WHERE id = ?", (body.sim_id,))
+            if body.sim_id is not None
+            else None
+        )
+        context = state.notifier.context_for(
+            {
+                "peer": body.peer,
+                "body": body.body,
+                "ts": utcnow(),
+                "sim_iccid": sim["iccid"] if sim else "",
+                "sim_label": sim["label"] if sim else "",
+                "phone_number": sim["phone_number"] if sim else "",
+                "device": "",
+            }
+        )
+        result: list[dict[str, Any]] = []
+        for rule, channel in match_rules(
+            state.db, sim_id=body.sim_id, body=body.body
+        ):
+            payload = state.notifier.render_payload(channel, context, rule=rule)
+            result.append(
+                {
+                    "rule_id": rule["id"],
+                    "rule_name": rule["name"] or f"规则 {rule['id']}",
+                    "channel_id": channel["id"],
+                    "channel_name": channel["name"],
+                    "priority": rule["priority"],
+                    "text": payload.text,
+                    "title": payload.title,
+                }
+            )
+        return result
+
+    @router.get("/stats/messages", dependencies=guard)
+    def message_stats(
+        days: int = Query(30, ge=1, le=365),
+    ) -> list[dict[str, Any]]:
+        """Daily per-card message counts for the dashboard trend chart."""
+        since = (datetime.now(timezone.utc) - timedelta(days=days - 1)).date().isoformat()
+        rows = state.db.query(
+            "SELECT date(ts) AS day, sim_id, "
+            "       SUM(CASE WHEN direction = 'in' THEN 1 ELSE 0 END) AS received, "
+            "       SUM(CASE WHEN direction = 'out' THEN 1 ELSE 0 END) AS sent "
+            "FROM messages WHERE date(ts) >= ? "
+            "GROUP BY date(ts), sim_id ORDER BY day",
+            (since,),
+        )
+        sims = {s["id"]: s for s in state.db.query("SELECT * FROM sims")}
+        for row in rows:
+            sim = sims.get(row["sim_id"])
+            row["sim_label"] = sim["label"] or sim["iccid"] if sim else None
+            row["received"] = int(row["received"] or 0)
+            row["sent"] = int(row["sent"] or 0)
+        return rows
 
     @router.get("/notify-logs", dependencies=guard)
     def notify_logs(limit: int = Query(100, ge=1, le=1000)) -> list[dict[str, Any]]:

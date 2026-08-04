@@ -12,7 +12,6 @@ import {
   DialogTitle,
   Divider,
   FormControlLabel,
-  Grid,
   IconButton,
   MenuItem,
   Slider,
@@ -21,6 +20,7 @@ import {
   Table,
   TableBody,
   TableCell,
+  TableContainer,
   TableHead,
   TableRow,
   TextField,
@@ -151,19 +151,26 @@ export function TasksPage() {
               </Typography>
             </Box>
           ) : (
-            <Table size="small">
-              <TableHead>
-                <TableRow>
-                  <TableCell>名称</TableCell>
-                  <TableCell>卡 / 模块</TableCell>
-                  <TableCell>动作</TableCell>
-                  <TableCell>周期</TableCell>
-                  <TableCell>上次执行</TableCell>
-                  <TableCell>下次执行</TableCell>
-                  <TableCell>状态</TableCell>
-                  <TableCell align="right" />
-                </TableRow>
-              </TableHead>
+            <TableContainer>
+              <Table size="small" sx={{ minWidth: 760 }}>
+                <TableHead>
+                  <TableRow>
+                    <TableCell>名称</TableCell>
+                    <TableCell>卡 / 模块</TableCell>
+                    <TableCell>动作</TableCell>
+                    <TableCell sx={{ display: { xs: 'none', sm: 'table-cell' } }}>
+                      周期
+                    </TableCell>
+                    <TableCell sx={{ display: { xs: 'none', sm: 'table-cell' } }}>
+                      上次执行
+                    </TableCell>
+                    <TableCell sx={{ display: { xs: 'none', sm: 'table-cell' } }}>
+                      下次执行
+                    </TableCell>
+                    <TableCell>状态</TableCell>
+                    <TableCell align="right" />
+                  </TableRow>
+                </TableHead>
               <TableBody>
                 {tasks.map((task) => (
                   <TableRow key={task.id} hover>
@@ -176,9 +183,13 @@ export function TasksPage() {
                           ? 'Ping 消耗流量'
                           : task.content}
                     </TableCell>
-                    <TableCell sx={{ whiteSpace: 'nowrap' }}>{describeSchedule(task)}</TableCell>
-                    <TableCell sx={{ whiteSpace: 'nowrap' }}>{formatTs(task.last_run_at)}</TableCell>
-                    <TableCell sx={{ whiteSpace: 'nowrap' }}>
+                    <TableCell sx={{ whiteSpace: 'nowrap', display: { xs: 'none', sm: 'table-cell' } }}>
+                      {describeSchedule(task)}
+                    </TableCell>
+                    <TableCell sx={{ whiteSpace: 'nowrap', display: { xs: 'none', sm: 'table-cell' } }}>
+                      {formatTs(task.last_run_at)}
+                    </TableCell>
+                    <TableCell sx={{ whiteSpace: 'nowrap', display: { xs: 'none', sm: 'table-cell' } }}>
                       {/* The agent owns the clock, jitter included — this is
                           what it reported back, not a guess made here. */}
                       {task.enabled ? formatTs(task.next_run_at) : '—'}
@@ -207,6 +218,7 @@ export function TasksPage() {
                 ))}
               </TableBody>
             </Table>
+            </TableContainer>
           )}
         </CardContent>
       </Card>
@@ -221,30 +233,32 @@ export function TasksPage() {
               还没有执行记录
             </Typography>
           ) : (
-            <Table size="small">
-              <TableHead>
-                <TableRow>
-                  <TableCell>时间</TableCell>
-                  <TableCell>任务</TableCell>
-                  <TableCell>结果</TableCell>
-                  <TableCell>尝试</TableCell>
-                  <TableCell>详情</TableCell>
-                </TableRow>
-              </TableHead>
-              <TableBody>
-                {logs.map((log) => (
-                  <TableRow key={log.id}>
-                    <TableCell sx={{ whiteSpace: 'nowrap' }}>{formatTs(log.ts)}</TableCell>
-                    <TableCell>{log.task_name || log.task_id}</TableCell>
-                    <TableCell sx={{ color: log.status === 'ok' ? STATUS.good : STATUS.critical }}>
-                      {log.status === 'ok' ? '成功' : log.status === 'skipped' ? '跳过' : '失败'}
-                    </TableCell>
-                    <TableCell>{log.attempts}</TableCell>
-                    <TableCell>{log.error || log.detail}</TableCell>
+            <TableContainer>
+              <Table size="small" sx={{ minWidth: 560 }}>
+                <TableHead>
+                  <TableRow>
+                    <TableCell>时间</TableCell>
+                    <TableCell>任务</TableCell>
+                    <TableCell>结果</TableCell>
+                    <TableCell>尝试</TableCell>
+                    <TableCell>详情</TableCell>
                   </TableRow>
-                ))}
-              </TableBody>
-            </Table>
+                </TableHead>
+                <TableBody>
+                  {logs.map((log) => (
+                    <TableRow key={log.id}>
+                      <TableCell sx={{ whiteSpace: 'nowrap' }}>{formatTs(log.ts)}</TableCell>
+                      <TableCell>{log.task_name || log.task_id}</TableCell>
+                      <TableCell sx={{ color: log.status === 'ok' ? STATUS.good : STATUS.critical }}>
+                        {log.status === 'ok' ? '成功' : log.status === 'skipped' ? '跳过' : '失败'}
+                      </TableCell>
+                      <TableCell>{log.attempts}</TableCell>
+                      <TableCell>{log.error || log.detail}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </TableContainer>
           )}
         </CardContent>
       </Card>
@@ -352,41 +366,37 @@ function TaskDialog({
 
           <Divider />
 
-          <Grid container spacing={2}>
-            <Grid item xs={5}>
-              <TextField
-                select
-                label="调度方式"
-                value={value.schedule_type}
-                onChange={(e) =>
-                  onChange({
-                    ...value,
-                    schedule_type: e.target.value as TaskInput['schedule_type'],
-                    // Swap in a sane default for the other mode rather than
-                    // leaving "25" sitting in a cron field.
-                    schedule_expr: e.target.value === 'interval' ? '25' : '0 3 * * 2',
-                  })
-                }
-                fullWidth
-              >
-                <MenuItem value="interval">间隔周期</MenuItem>
-                <MenuItem value="cron">定点定时</MenuItem>
-              </TextField>
-            </Grid>
-            <Grid item xs={7}>
-              <TextField
-                label={value.schedule_type === 'interval' ? '间隔天数' : 'cron 表达式'}
-                value={value.schedule_expr}
-                onChange={(e) => set('schedule_expr', e.target.value)}
-                fullWidth
-                helperText={
-                  value.schedule_type === 'interval'
-                    ? '从上次执行时间起算'
-                    : '分 时 日 月 周,本地时区'
-                }
-              />
-            </Grid>
-          </Grid>
+          <Box sx={{ display: 'grid', gap: 2, gridTemplateColumns: '5fr 7fr' }}>
+            <TextField
+              select
+              label="调度方式"
+              value={value.schedule_type}
+              onChange={(e) =>
+                onChange({
+                  ...value,
+                  schedule_type: e.target.value as TaskInput['schedule_type'],
+                  // Swap in a sane default for the other mode rather than
+                  // leaving "25" sitting in a cron field.
+                  schedule_expr: e.target.value === 'interval' ? '25' : '0 3 * * 2',
+                })
+              }
+              fullWidth
+            >
+              <MenuItem value="interval">间隔周期</MenuItem>
+              <MenuItem value="cron">定点定时</MenuItem>
+            </TextField>
+            <TextField
+              label={value.schedule_type === 'interval' ? '间隔天数' : 'cron 表达式'}
+              value={value.schedule_expr}
+              onChange={(e) => set('schedule_expr', e.target.value)}
+              fullWidth
+              helperText={
+                value.schedule_type === 'interval'
+                  ? '从上次执行时间起算'
+                  : '分 时 日 月 周,本地时区'
+              }
+            />
+          </Box>
 
           <Box>
             <Typography variant="body2" gutterBottom>

@@ -129,6 +129,7 @@ export interface Message {
   status: string
   segments: number
   error: string | null
+  read_at?: string | null
   sim_label?: string
   sim_iccid?: string
 }
@@ -144,6 +145,7 @@ export interface Conversation {
   last_status: string
   last_ts: string
   message_count: number
+  unread_count?: number
   sim_label?: string
   sim_iccid?: string
 }
@@ -290,6 +292,26 @@ export interface AgentLog {
   ts: string
 }
 
+/** A rule hit as the debugger shows it — rendered, not just matched. */
+export interface RulePreview {
+  rule_id: number
+  rule_name: string
+  channel_id: number
+  channel_name: string
+  priority: number
+  text: string
+  title: string
+}
+
+/** One day's message counts for one card (dashboard trend chart). */
+export interface MessageStat {
+  day: string
+  sim_id: number | null
+  received: number
+  sent: number
+  sim_label: string | null
+}
+
 // -- endpoints ---------------------------------------------------------------
 
 export const api = {
@@ -332,6 +354,13 @@ export const api = {
     conversations: () => get<Conversation[]>('/api/conversations'),
     send: (device: string, number: string, body: string) =>
       post<{ refs: number[] }>('/api/messages/send', { device, number, body }),
+    /** Mark one conversation's incoming messages as read. */
+    markRead: (sim_id: number | null, peer: string) =>
+      post<{ ok: boolean; marked: number }>('/api/messages/read', { sim_id, peer }),
+    /** Total unread across all conversations (nav badge). */
+    unread: () => get<{ total: number }>('/api/messages/unread'),
+    /** Download every stored message as CSV. */
+    exportCsv: () => downloadFile('/api/messages/export', 'messages.csv'),
   },
   at: (device: string, command: string) =>
     post<{ lines: string[] }>('/api/at', { device, command }),
@@ -348,6 +377,9 @@ export const api = {
     create: (body: RuleInput) => post<Rule>('/api/rules', body),
     update: (id: number, body: RuleInput) => put<Rule>(`/api/rules/${id}`, body),
     remove: (id: number) => del<{ ok: boolean }>(`/api/rules/${id}`),
+    /** Debugger: which rules would fire for this message, fully rendered. */
+    preview: (sim_id: number | null, peer: string, body: string) =>
+      post<RulePreview[]>('/api/rules/preview', { sim_id, peer, body }),
   },
   tasks: {
     list: () => get<Task[]>('/api/tasks'),
@@ -357,6 +389,10 @@ export const api = {
     logs: () => get<TaskLog[]>('/api/task-logs'),
   },
   notifyLogs: () => get<NotifyLog[]>('/api/notify-logs'),
+  stats: {
+    /** Daily per-card counts for the dashboard trend chart. */
+    messages: (days: number) => get<MessageStat[]>(`/api/stats/messages?days=${days}`),
+  },
   notifySettings: {
     get: () => get<NotifySettings>('/api/notify-settings'),
     update: (body: NotifySettings) => put<NotifySettings>('/api/notify-settings', body),

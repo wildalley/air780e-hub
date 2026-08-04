@@ -6,7 +6,6 @@ import {
   Card,
   CardContent,
   CardHeader,
-  Grid,
   MenuItem,
   Stack,
   TextField,
@@ -55,10 +54,15 @@ export function DevicesPage() {
         </Alert>
       )}
 
-      <Grid container spacing={2}>
+      <Box
+        sx={{
+          display: 'grid',
+          gap: 2,
+          gridTemplateColumns: { xs: '1fr', md: 'repeat(2, 1fr)' },
+        }}
+      >
         {devices.map((device) => (
-          <Grid item xs={12} md={6} key={device.id}>
-            <Card>
+          <Card key={device.id}>
               <CardHeader
                 title={
                   <Typography variant="h3">
@@ -74,7 +78,13 @@ export function DevicesPage() {
               />
               <CardContent>
                 <Stack spacing={2}>
-                  <Grid container spacing={1.5}>
+                  <Box
+                    sx={{
+                      display: 'grid',
+                      gap: 1.5,
+                      gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+                    }}
+                  >
                     {[
                       ['型号', device.model || '—'],
                       ['IMEI', device.imei || '—'],
@@ -85,16 +95,16 @@ export function DevicesPage() {
                       ['注册状态', device.registered ? '已注册' : '未注册'],
                       ['最后上报', formatTs(device.last_seen_at)],
                     ].map(([label, value]) => (
-                      <Grid item xs={6} key={label}>
+                      <Box key={label}>
                         <Typography variant="caption" color="text.secondary" display="block">
                           {label}
                         </Typography>
                         <Typography variant="body2" sx={{ wordBreak: 'break-all' }}>
                           {value}
                         </Typography>
-                      </Grid>
+                      </Box>
                     ))}
-                  </Grid>
+                  </Box>
 
                   <StorageMeter used={device.storage_used} capacity={device.storage_cap} />
 
@@ -110,9 +120,8 @@ export function DevicesPage() {
                 </Stack>
               </CardContent>
             </Card>
-          </Grid>
         ))}
-      </Grid>
+      </Box>
 
       <AtConsole devices={devices} onError={(m) => toast.show(m, 'error')} />
       {toast.element}

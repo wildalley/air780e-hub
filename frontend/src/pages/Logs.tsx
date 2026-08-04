@@ -7,6 +7,7 @@ import {
   Table,
   TableBody,
   TableCell,
+  TableContainer,
   TableHead,
   TableRow,
   Tabs,
@@ -57,58 +58,62 @@ export function LogsPage() {
                 还没有日志
               </Typography>
             ) : (
-              <Table size="small">
-                <TableHead>
-                  <TableRow>
-                    <TableCell>时间</TableCell>
-                    <TableCell>设备</TableCell>
-                    <TableCell>级别</TableCell>
-                    <TableCell>内容</TableCell>
-                  </TableRow>
-                </TableHead>
-                <TableBody>
-                  {agentLogs.map((log) => (
-                    <TableRow key={log.id}>
-                      <TableCell sx={{ whiteSpace: 'nowrap' }}>{formatTs(log.ts)}</TableCell>
-                      <TableCell>{log.device || log.agent_id}</TableCell>
-                      <TableCell sx={{ color: LEVEL_COLOR[log.level] }}>{log.level}</TableCell>
-                      <TableCell>{log.message}</TableCell>
+              <TableContainer>
+                <Table size="small" sx={{ minWidth: 520 }}>
+                  <TableHead>
+                    <TableRow>
+                      <TableCell>时间</TableCell>
+                      <TableCell>设备</TableCell>
+                      <TableCell>级别</TableCell>
+                      <TableCell>内容</TableCell>
                     </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
+                  </TableHead>
+                  <TableBody>
+                    {agentLogs.map((log) => (
+                      <TableRow key={log.id}>
+                        <TableCell sx={{ whiteSpace: 'nowrap' }}>{formatTs(log.ts)}</TableCell>
+                        <TableCell>{log.device || log.agent_id}</TableCell>
+                        <TableCell sx={{ color: LEVEL_COLOR[log.level] }}>{log.level}</TableCell>
+                        <TableCell>{log.message}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </TableContainer>
             )
           ) : notifyLogs.length === 0 ? (
             <Typography variant="body2" color="text.secondary" sx={{ p: 4, textAlign: 'center' }}>
               还没有推送记录
             </Typography>
           ) : (
-            <Table size="small">
-              <TableHead>
-                <TableRow>
-                  <TableCell>时间</TableCell>
-                  <TableCell>渠道</TableCell>
-                  <TableCell>结果</TableCell>
-                  <TableCell>尝试</TableCell>
-                  <TableCell>详情</TableCell>
-                </TableRow>
-              </TableHead>
-              <TableBody>
-                {notifyLogs.map((log) => (
-                  <TableRow key={log.id}>
-                    <TableCell sx={{ whiteSpace: 'nowrap' }}>{formatTs(log.ts)}</TableCell>
-                    <TableCell>{log.channel_name ?? log.channel_id}</TableCell>
-                    <TableCell
-                      sx={{ color: log.status === 'ok' ? STATUS.good : STATUS.critical }}
-                    >
-                      {log.status === 'ok' ? '成功' : '失败'}
-                    </TableCell>
-                    <TableCell>{log.attempts}</TableCell>
-                    <TableCell>{log.detail}</TableCell>
+            <TableContainer>
+              <Table size="small" sx={{ minWidth: 560 }}>
+                <TableHead>
+                  <TableRow>
+                    <TableCell>时间</TableCell>
+                    <TableCell>渠道</TableCell>
+                    <TableCell>结果</TableCell>
+                    <TableCell>尝试</TableCell>
+                    <TableCell>详情</TableCell>
                   </TableRow>
-                ))}
-              </TableBody>
-            </Table>
+                </TableHead>
+                <TableBody>
+                  {notifyLogs.map((log) => (
+                    <TableRow key={log.id}>
+                      <TableCell sx={{ whiteSpace: 'nowrap' }}>{formatTs(log.ts)}</TableCell>
+                      <TableCell>{log.channel_name ?? log.channel_id}</TableCell>
+                      <TableCell
+                        sx={{ color: log.status === 'ok' ? STATUS.good : STATUS.critical }}
+                      >
+                        {log.status === 'ok' ? '成功' : '失败'}
+                      </TableCell>
+                      <TableCell>{log.attempts}</TableCell>
+                      <TableCell>{log.detail}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </TableContainer>
           )}
         </CardContent>
       </Card>

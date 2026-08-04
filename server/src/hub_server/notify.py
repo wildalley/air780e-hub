@@ -602,6 +602,22 @@ class Notifier:
             channel, payload, message_id=None, rule_id=None, retries=0
         )
 
+    @staticmethod
+    def render_payload(
+        channel: dict[str, Any],
+        context: dict[str, str],
+        *,
+        rule: dict[str, Any] | None = None,
+    ) -> Payload:
+        """Render exactly what a channel will receive, without sending it."""
+        return Payload(
+            text=render((rule or {}).get("template") or DEFAULT_TEMPLATE, context),
+            title=render(
+                channel_config(channel).get("title") or DEFAULT_TITLE, context
+            ),
+            context=context,
+        )
+
     async def push(
         self,
         channel: dict[str, Any],
@@ -610,13 +626,7 @@ class Notifier:
         rule: dict[str, Any] | None = None,
         message_id: int | None = None,
     ) -> dict[str, Any]:
-        payload = Payload(
-            text=render((rule or {}).get("template") or DEFAULT_TEMPLATE, context),
-            title=render(
-                channel_config(channel).get("title") or DEFAULT_TITLE, context
-            ),
-            context=context,
-        )
+        payload = self.render_payload(channel, context, rule=rule)
         return await self._attempt(
             channel, payload,
             message_id=message_id,

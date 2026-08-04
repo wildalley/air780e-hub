@@ -98,6 +98,7 @@ CREATE TABLE IF NOT EXISTS messages (
     segments   INTEGER NOT NULL DEFAULT 1,
     seq        INTEGER,
     error      TEXT,
+    read_at    TEXT,
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts DESC);
@@ -246,6 +247,11 @@ class Database:
         self._lock = threading.RLock()
         with self._lock:
             self._db.executescript(SCHEMA)
+            # Additive migration: databases created before a column existed
+            # keep working without a schema-version dance.
+            cols = {row[1] for row in self._db.execute("PRAGMA table_info(messages)")}
+            if "read_at" not in cols:
+                self._db.execute("ALTER TABLE messages ADD COLUMN read_at TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -482,6 +488,8 @@ class Database:
             "       m.id AS last_id, m.body AS last_body, "
             "       m.direction AS last_direction, m.status AS last_status, "
             "       MAX(m.ts) AS last_ts, COUNT(*) AS message_count, "
+            "       SUM(CASE WHEN m.direction = 'in' AND m.read_at IS NULL "
+            "               THEN 1 ELSE 0 END) AS unread_count, "
             "       s.label AS sim_label, s.iccid AS sim_iccid "
             "FROM messages m LEFT JOIN sims s ON s.id = m.sim_id "
             "GROUP BY m.sim_id, m.peer "
@@ -489,10 +497,29 @@ class Database:
             (limit,),
         )
 
+    def mark_read(self, *, sim_id: int | None, peer: str) -> int:
+        """Mark one conversation's incoming messages as read; returns count."""
+        now = utcnow()
+        with self._lock:
+            cur = self._db.execute(
+                "UPDATE messages SET read_at = ? "
+                "WHERE direction = 'in' AND read_at IS NULL "
+                "  AND peer = ? AND sim_id IS ?",
+                (now, peer, sim_id),
+            )
+        return cur.rowcount
+
+    def unread_total(self) -> int:
+        row = self.one(
+            "SELECT COUNT(*) AS n FROM messages "
+            "WHERE direction = 'in' AND read_at IS NULL"
+        )
+        return int(row["n"]) if row else 0
+
     def messages(
         self,
         *,
-        limit: int = 50,
+        limit: int | None = 50,
         offset: int = 0,
         sim_id: int | None = None,
         direction: str | None = None,
@@ -514,13 +541,15 @@ class Database:
             clauses.append("(m.body LIKE ? OR m.peer LIKE ?)")
             params.extend([f"%{search}%", f"%{search}%"])
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        params.extend([limit, offset])
-        return self.query(
+        sql = (
             "SELECT m.*, s.label AS sim_label, s.iccid AS sim_iccid "
             "FROM messages m LEFT JOIN sims s ON s.id = m.sim_id "
-            f"{where} ORDER BY m.ts DESC, m.id DESC LIMIT ? OFFSET ?",
-            tuple(params),
+            f"{where} ORDER BY m.ts DESC, m.id DESC"
         )
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+        return self.query(sql, tuple(params))
 
     def count_messages(self, **filters: Any) -> int:
         row = self.one("SELECT COUNT(*) AS n FROM messages")

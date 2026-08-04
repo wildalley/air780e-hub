@@ -1,8 +1,9 @@
-import { useState, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { Link as RouterLink, useLocation } from 'react-router-dom'
 import {
   alpha,
   AppBar,
+  Badge,
   Box,
   Drawer,
   IconButton,
@@ -31,6 +32,7 @@ import MenuIcon from '@mui/icons-material/Menu'
 import LightIcon from '@mui/icons-material/LightModeOutlined'
 import DarkIcon from '@mui/icons-material/DarkModeOutlined'
 import LogoutIcon from '@mui/icons-material/LogoutOutlined'
+import { api } from '../api'
 import { VIZ, type Mode } from '../tokens'
 
 const WIDTH = 224
@@ -103,6 +105,25 @@ export function Layout({ children, mode, onToggleMode, onLogout }: Props) {
   const theme = useTheme()
   const location = useLocation()
   const [open, setOpen] = useState(false)
+  const [unread, setUnread] = useState(0)
+
+  // The nav badge: cheap COUNT poll, same cadence as the dashboard refresh.
+  useEffect(() => {
+    let alive = true
+    const refresh = () =>
+      api.messages
+        .unread()
+        .then((data) => {
+          if (alive) setUnread(data.total)
+        })
+        .catch(() => {})
+    void refresh()
+    const timer = setInterval(refresh, 15_000)
+    return () => {
+      alive = false
+      clearInterval(timer)
+    }
+  }, [])
 
   const selectedTint = alpha(
     theme.palette.primary.main,
@@ -151,7 +172,13 @@ export function Layout({ children, mode, onToggleMode, onLogout }: Props) {
                   }}
                 >
                   <ListItemIcon sx={{ minWidth: 36, color: 'text.secondary' }}>
-                    {item.icon}
+                    {item.to === '/messages' && unread > 0 ? (
+                      <Badge badgeContent={unread} color="error" max={99}>
+                        {item.icon}
+                      </Badge>
+                    ) : (
+                      item.icon
+                    )}
                   </ListItemIcon>
                   <ListItemText
                     primary={item.label}
@@ -167,7 +194,7 @@ export function Layout({ children, mode, onToggleMode, onLogout }: Props) {
   )
 
   return (
-    <Box sx={{ display: 'flex', minHeight: '100vh' }}>
+    <Box sx={{ display: 'flex', minHeight: '100dvh' }}>
       {/* Translucent chrome: content scrolls under, the blur keeps text
           legible, and the surface reads as material rather than a bar
           (Apple §12). */}
@@ -246,7 +273,16 @@ export function Layout({ children, mode, onToggleMode, onLogout }: Props) {
         {nav}
       </Drawer>
 
-      <Box component="main" sx={{ flexGrow: 1, p: { xs: 2, md: 3 }, width: 0 }}>
+      <Box
+        component="main"
+        sx={{
+          flexGrow: 1,
+          p: { xs: 2, md: 3 },
+          width: 0,
+          display: 'flex',
+          flexDirection: 'column',
+        }}
+      >
         <Toolbar variant="dense" />
         {children}
       </Box>

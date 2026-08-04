@@ -685,6 +685,44 @@ def test_testing_an_unknown_channel_is_404(admin):
     assert admin.post("/api/channels/999/test").status_code == 404
 
 
+def test_rule_preview_uses_the_same_rendering_as_delivery(admin, settings):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    db = admin.app.state.hub.db
+    sim_id = db.upsert_sim(ICCID)
+    db.execute("UPDATE sims SET label = ? WHERE id = ?", ("移动主卡", sim_id))
+    channel = admin.post("/api/channels", json={
+        "name": "Bark",
+        "type": "bark",
+        "config": {
+            "url": "https://api.day.app/k",
+            "title": "告警 {card}",
+        },
+    }).json()
+    admin.post("/api/rules", json={
+        "name": "验证码",
+        "channel_id": channel["id"],
+        "match": "keyword",
+        "pattern": "验证码",
+        "template": "{timestamp}|{sender}|{message}",
+    })
+
+    response = admin.post("/api/rules/preview", json={
+        "sim_id": sim_id,
+        "peer": "10086",
+        "body": "验证码 123456",
+    })
+    assert response.status_code == 200
+    hit = response.json()[0]
+    assert hit["title"] == "告警 移动主卡"
+    timestamp, sender, message = hit["text"].split("|")
+    assert sender == "10086"
+    assert message == "验证码 123456"
+    datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+    assert timestamp[:10] == datetime.now(ZoneInfo(settings.timezone)).strftime("%Y-%m-%d")
+
+
 def test_channel_can_be_updated_and_disabled(admin):
     channel = admin.post("/api/channels", json={
         "name": "Bark", "type": "bark", "config": {"url": "https://api.day.app/k"},

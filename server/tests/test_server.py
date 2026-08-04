@@ -279,6 +279,99 @@ def test_conversations_group_by_card_and_correspondent(admin):
     assert threads[1]["message_count"] == 2
     assert threads[2]["message_count"] == 1
 
+def test_unread_receipts_are_isolated_by_card_and_correspondent(admin):
+    db = admin.app.state.hub.db
+    now = _minutes_ago(1)
+    common = {
+        "agent_id": "home-arch",
+        "device": "a",
+        "ts": now,
+    }
+    db.insert_message(
+        **common, direction="in", peer="10086", body="card a",
+        iccid="89860622180012345670",
+    )
+    db.insert_message(
+        **common, direction="in", peer="95555", body="another peer",
+        iccid="89860622180012345670",
+    )
+    db.insert_message(
+        **common, direction="in", peer="10086", body="card b",
+        iccid="89860622180012345671",
+    )
+    db.insert_message(
+        **common, direction="out", peer="10086", body="reply",
+        iccid="89860622180012345670",
+    )
+
+    assert admin.get("/api/messages/unread").json() == {"total": 3}
+    sims = {row["iccid"]: row["id"] for row in admin.get("/api/sims").json()}
+    card_a = sims["89860622180012345670"]
+    response = admin.post(
+        "/api/messages/read", json={"sim_id": card_a, "peer": "10086"}
+    )
+    assert response.json() == {"ok": True, "marked": 1}
+    assert admin.get("/api/messages/unread").json() == {"total": 2}
+
+    unread = {
+        (row["sim_id"], row["peer"]): row["unread_count"]
+        for row in admin.get("/api/conversations").json()
+    }
+    assert unread[(card_a, "10086")] == 0
+    assert unread[(card_a, "95555")] == 1
+    assert unread[(sims["89860622180012345671"], "10086")] == 1
+
+
+def test_message_export_is_utf8_csv_with_intact_multiline_bodies(admin):
+    import csv
+    import io
+
+    body = "验证码,123456\n请勿泄漏"
+    admin.app.state.hub.db.insert_message(
+        agent_id="home-arch",
+        device="a",
+        direction="in",
+        peer="10086",
+        body=body,
+        ts=_minutes_ago(1),
+        iccid="89860622180012345670",
+    )
+
+    response = admin.get("/api/messages/export")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/csv")
+    assert response.content.startswith(b"\xef\xbb\xbf")
+    rows = list(csv.reader(io.StringIO(response.content.decode("utf-8-sig"))))
+    assert rows[0] == [
+        "id", "ts", "direction", "sim_id", "sim_label", "peer", "body", "status",
+    ]
+    assert rows[1][5:7] == ["10086", body]
+
+
+def test_message_stats_count_each_card_for_the_requested_window(admin):
+    db = admin.app.state.hub.db
+    for device, iccid in [
+        ("a", "89860622180012345670"),
+        ("b", "89860622180012345671"),
+    ]:
+        db.insert_message(
+            agent_id="home-arch",
+            device=device,
+            direction="in",
+            peer="10086",
+            body=device,
+            ts=_minutes_ago(1),
+            iccid=iccid,
+        )
+
+    rows = admin.get("/api/stats/messages?days=2").json()
+    assert len(rows) == 2
+    assert {row["sim_id"] for row in rows} == {
+        sim["id"] for sim in admin.get("/api/sims").json()
+    }
+    assert sum(row["received"] for row in rows) == 2
+    assert sum(row["sent"] for row in rows) == 0
+
 
 def test_a_thread_can_be_read_back_in_full(admin):
     with _connect(admin) as ws:

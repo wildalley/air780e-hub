@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link as RouterLink } from 'react-router-dom'
 import {
   Box,
@@ -6,20 +6,32 @@ import {
   Card,
   CardContent,
   CardHeader,
-  Grid,
+  CircularProgress,
   Stack,
   Table,
   TableBody,
   TableCell,
+  TableContainer,
   TableHead,
   TableRow,
+  ToggleButton,
+  ToggleButtonGroup,
   Typography,
 } from '@mui/material'
+import {
+  Bar,
+  BarChart,
+  CartesianGrid,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from 'recharts'
 import RouterIcon from '@mui/icons-material/RouterOutlined'
 import TodayIcon from '@mui/icons-material/MarkEmailUnreadOutlined'
 import AllSmsIcon from '@mui/icons-material/MailOutline'
 import TaskIcon from '@mui/icons-material/EventRepeatOutlined'
-import { api, type Overview, type StatusPoint } from '../api'
+import { api, type MessageStat, type Overview, type StatusPoint } from '../api'
 import { StatTile } from '../components/StatTile'
 import { StorageMeter } from '../components/StorageMeter'
 import { SignalChart, type SignalSeries } from '../components/SignalChart'
@@ -38,6 +50,8 @@ export function DashboardPage() {
   const [overview, setOverview] = useState<Overview | null>(null)
   const [history, setHistory] = useState<Record<string, StatusPoint[]>>({})
   const [hours, setHours] = useState(24)
+  const [stats, setStats] = useState<MessageStat[] | null>(null)
+  const [statsDays, setStatsDays] = useState(30)
 
   const load = useCallback(async () => {
     const data = await api.overview()
@@ -61,6 +75,25 @@ export function DashboardPage() {
     return () => clearInterval(timer)
   }, [load])
 
+  // The trend chart moves on the scale of days, not seconds — a slow poll is
+  // enough, and it must not sit on the dashboard's 15 s refresh.
+  useEffect(() => {
+    let alive = true
+    const refresh = () =>
+      api.stats
+        .messages(statsDays)
+        .then((rows) => {
+          if (alive) setStats(rows)
+        })
+        .catch(() => {})
+    void refresh()
+    const timer = setInterval(refresh, 60_000)
+    return () => {
+      alive = false
+      clearInterval(timer)
+    }
+  }, [statsDays])
+
   if (!overview) return <Loading />
 
   const { counters, devices, recent_messages: recent } = overview
@@ -79,8 +112,14 @@ export function DashboardPage() {
     <Stack spacing={3}>
       <PageHeader title="仪表盘" subtitle="模块、短信与存储,一目了然" />
 
-      <Grid container spacing={2}>
-        <Grid item xs={6} md={3} sx={entranceStyle(0)}>
+      <Box
+        sx={{
+          display: 'grid',
+          gap: 2,
+          gridTemplateColumns: { xs: 'repeat(2, 1fr)', md: 'repeat(4, 1fr)' },
+        }}
+      >
+        <Box sx={entranceStyle(0)}>
           <StatTile
             label="模块在线"
             value={`${counters.devices_online} / ${counters.devices_total}`}
@@ -89,14 +128,14 @@ export function DashboardPage() {
             icon={<RouterIcon />}
             compact={false}
           />
-        </Grid>
-        <Grid item xs={6} md={3} sx={entranceStyle(60)}>
+        </Box>
+        <Box sx={entranceStyle(60)}>
           <StatTile label="今日短信" value={counters.messages_today} icon={<TodayIcon />} />
-        </Grid>
-        <Grid item xs={6} md={3} sx={entranceStyle(120)}>
+        </Box>
+        <Box sx={entranceStyle(120)}>
           <StatTile label="短信总数" value={counters.messages_total} icon={<AllSmsIcon />} />
-        </Grid>
-        <Grid item xs={6} md={3} sx={entranceStyle(180)}>
+        </Box>
+        <Box sx={entranceStyle(180)}>
           <StatTile
             label="启用的保号任务"
             value={counters.tasks_enabled}
@@ -109,16 +148,26 @@ export function DashboardPage() {
             }
             icon={<TaskIcon />}
           />
-        </Grid>
-      </Grid>
+        </Box>
+      </Box>
 
       <Box sx={entranceStyle(220)}>
         <SignalChart series={series} hours={hours} onHoursChange={setHours} />
       </Box>
 
-      <Grid container spacing={2}>
+      <Box sx={entranceStyle(240)}>
+        <TrendCard stats={stats} days={statsDays} onDaysChange={setStatsDays} viz={viz} />
+      </Box>
+
+      <Box
+        sx={{
+          display: 'grid',
+          gap: 2,
+          gridTemplateColumns: { xs: '1fr', md: 'repeat(2, 1fr)' },
+        }}
+      >
         {devices.map((device, index) => (
-          <Grid item xs={12} md={6} key={device.id} sx={entranceStyle(260 + index * 60)}>
+          <Box key={device.id} sx={entranceStyle(260 + index * 60)}>
             <Card
               sx={{
                 height: '100%',
@@ -181,9 +230,9 @@ export function DashboardPage() {
                 </Stack>
               </CardContent>
             </Card>
-          </Grid>
+          </Box>
         ))}
-      </Grid>
+      </Box>
 
       <Box sx={entranceStyle(400)}>
         <Card>
@@ -201,39 +250,149 @@ export function DashboardPage() {
                 还没有短信
               </Typography>
             ) : (
-              <Table size="small">
-                <TableHead>
-                  <TableRow>
-                    <TableCell>时间</TableCell>
-                    <TableCell>卡</TableCell>
-                    <TableCell>对方</TableCell>
-                    <TableCell>内容</TableCell>
-                  </TableRow>
-                </TableHead>
-                <TableBody>
-                  {recent.map((message) => (
-                    <TableRow key={message.id}>
-                      <TableCell sx={{ whiteSpace: 'nowrap' }}>{formatTs(message.ts)}</TableCell>
-                      <TableCell>{message.sim_label || message.device}</TableCell>
-                      <TableCell>{message.peer}</TableCell>
-                      <TableCell
-                        sx={{
-                          maxWidth: 420,
-                          overflow: 'hidden',
-                          textOverflow: 'ellipsis',
-                          whiteSpace: 'nowrap',
-                        }}
-                      >
-                        {message.body}
-                      </TableCell>
+              <TableContainer>
+                <Table size="small">
+                  <TableHead>
+                    <TableRow>
+                      <TableCell>时间</TableCell>
+                      <TableCell>卡</TableCell>
+                      <TableCell>对方</TableCell>
+                      <TableCell>内容</TableCell>
                     </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
+                  </TableHead>
+                  <TableBody>
+                    {recent.map((message) => (
+                      <TableRow key={message.id}>
+                        <TableCell sx={{ whiteSpace: 'nowrap' }}>{formatTs(message.ts)}</TableCell>
+                        <TableCell>{message.sim_label || message.device}</TableCell>
+                        <TableCell>{message.peer}</TableCell>
+                        <TableCell
+                          sx={{
+                            maxWidth: 420,
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            whiteSpace: 'nowrap',
+                          }}
+                        >
+                          {message.body}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </TableContainer>
             )}
           </CardContent>
         </Card>
       </Box>
     </Stack>
+  )
+}
+
+/**
+ * Message volume over time — stacked received/sent per day.
+ *
+ * Zero days are filled so a quiet stretch reads as a flat baseline rather
+ * than a gap in the axis.
+ */
+function TrendCard({
+  stats,
+  days,
+  onDaysChange,
+  viz,
+}: {
+  stats: MessageStat[] | null
+  days: number
+  onDaysChange: (days: number) => void
+  viz: (typeof VIZ)[Mode]
+}) {
+  const data = useMemo(() => {
+    const byDay = new Map<string, { day: string; received: number; sent: number }>()
+    for (const row of stats ?? []) {
+      const entry = byDay.get(row.day) ?? { day: row.day, received: 0, sent: 0 }
+      entry.received += row.received
+      entry.sent += row.sent
+      byDay.set(row.day, entry)
+    }
+    const out: { day: string; received: number; sent: number }[] = []
+    const today = new Date()
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date(today)
+      d.setDate(today.getDate() - i)
+      const key = d.toISOString().slice(0, 10)
+      out.push(byDay.get(key) ?? { day: key, received: 0, sent: 0 })
+    }
+    return out
+  }, [stats, days])
+
+  const shortDay = (iso: string) => {
+    const d = new Date(`${iso}T00:00:00`)
+    return `${d.getMonth() + 1}/${d.getDate()}`
+  }
+
+  return (
+    <Card>
+      <CardHeader
+        title={<Typography variant="h3">短信趋势</Typography>}
+        action={
+          <ToggleButtonGroup
+            size="small"
+            exclusive
+            value={days}
+            onChange={(_, next) => next && onDaysChange(next)}
+          >
+            <ToggleButton value={7}>7 天</ToggleButton>
+            <ToggleButton value={30}>30 天</ToggleButton>
+            <ToggleButton value={90}>90 天</ToggleButton>
+          </ToggleButtonGroup>
+        }
+      />
+      <CardContent>
+        {stats === null ? (
+          <Box sx={{ display: 'flex', justifyContent: 'center', py: 4 }}>
+            <CircularProgress size={24} />
+          </Box>
+        ) : data.every((d) => d.received === 0 && d.sent === 0) ? (
+          <Typography variant="body2" color="text.secondary" sx={{ py: 3, textAlign: 'center' }}>
+            这段时间还没有短信
+          </Typography>
+        ) : (
+          <ResponsiveContainer width="100%" height={220}>
+            <BarChart data={data} margin={{ top: 4, right: 4, left: -18, bottom: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke={viz.gridline} vertical={false} />
+              <XAxis
+                dataKey="day"
+                tick={{ fontSize: 11, fill: viz.axis }}
+                tickFormatter={shortDay}
+                interval="preserveStartEnd"
+                minTickGap={24}
+                stroke={viz.axis}
+              />
+              <YAxis
+                allowDecimals={false}
+                tick={{ fontSize: 11, fill: viz.axis }}
+                stroke={viz.axis}
+              />
+              <Tooltip
+                cursor={{ fill: viz.gridline, opacity: 0.5 }}
+                contentStyle={{
+                  background: viz.surface,
+                  border: `1px solid ${viz.border}`,
+                  borderRadius: 12,
+                  fontSize: 13,
+                }}
+                labelFormatter={shortDay}
+                formatter={(value: number | string, name: string) => [
+                  String(value),
+                  name === 'received' ? '收到' : '发出',
+                ]}
+              />
+              <Bar dataKey="received" stackId="volume" fill={viz.series[0]} />
+              <Bar dataKey="sent" stackId="volume" fill={viz.series[1]} radius={[3, 3, 0, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        )}
+      </CardContent>
+    </Card>
   )
 }

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import {
   Alert,
+  Box,
   Button,
   Card,
   CardContent,
@@ -11,6 +12,7 @@ import {
   DialogActions,
   DialogContent,
   DialogTitle,
+  Divider,
   IconButton,
   MenuItem,
   Stack,
@@ -18,6 +20,7 @@ import {
   Table,
   TableBody,
   TableCell,
+  TableContainer,
   TableHead,
   TableRow,
   TextField,
@@ -36,6 +39,7 @@ import {
   type NotifySettings,
   type Rule,
   type RuleInput,
+  type RulePreview,
   type Sim,
 } from '../api'
 import { Loading, useToast } from '../components/common'
@@ -211,15 +215,16 @@ export function NotifyPage() {
               还没有渠道。先建一个,再用规则把短信路由过去。
             </Typography>
           ) : (
-            <Table size="small">
-              <TableHead>
-                <TableRow>
-                  <TableCell>名称</TableCell>
-                  <TableCell>类型</TableCell>
-                  <TableCell>启用</TableCell>
-                  <TableCell align="right" />
-                </TableRow>
-              </TableHead>
+            <TableContainer>
+              <Table size="small" sx={{ minWidth: 420 }}>
+                <TableHead>
+                  <TableRow>
+                    <TableCell>名称</TableCell>
+                    <TableCell>类型</TableCell>
+                    <TableCell>启用</TableCell>
+                    <TableCell align="right" />
+                  </TableRow>
+                </TableHead>
               <TableBody>
                 {channels.map((channel) => (
                   <TableRow key={channel.id}>
@@ -272,6 +277,7 @@ export function NotifyPage() {
                 ))}
               </TableBody>
             </Table>
+            </TableContainer>
           )}
         </CardContent>
       </Card>
@@ -296,22 +302,25 @@ export function NotifyPage() {
               还没有规则。没有规则时不会推送任何短信。
             </Typography>
           ) : (
-            <Table size="small">
-              <TableHead>
-                <TableRow>
-                  <TableCell>名称</TableCell>
-                  <TableCell>范围</TableCell>
-                  <TableCell>匹配</TableCell>
-                  <TableCell>渠道</TableCell>
-                  <TableCell>启用</TableCell>
-                  <TableCell align="right" />
-                </TableRow>
-              </TableHead>
+            <TableContainer>
+              <Table size="small" sx={{ minWidth: 560 }}>
+                <TableHead>
+                  <TableRow>
+                    <TableCell>名称</TableCell>
+                    <TableCell sx={{ display: { xs: 'none', sm: 'table-cell' } }}>
+                      范围
+                    </TableCell>
+                    <TableCell>匹配</TableCell>
+                    <TableCell>渠道</TableCell>
+                    <TableCell>启用</TableCell>
+                    <TableCell align="right" />
+                  </TableRow>
+                </TableHead>
               <TableBody>
                 {rules.map((rule) => (
                   <TableRow key={rule.id}>
                     <TableCell>{rule.name || `规则 ${rule.id}`}</TableCell>
-                    <TableCell>
+                    <TableCell sx={{ display: { xs: 'none', sm: 'table-cell' } }}>
                       {rule.sim_id
                         ? sims.find((s) => s.id === rule.sim_id)?.label || `卡 ${rule.sim_id}`
                         : '全部卡'}
@@ -363,6 +372,7 @@ export function NotifyPage() {
                 ))}
               </TableBody>
             </Table>
+            </TableContainer>
           )}
         </CardContent>
       </Card>
@@ -371,6 +381,8 @@ export function NotifyPage() {
         一条短信命中多条规则时,同一个渠道只推一次(取优先级最高的模板)。推送结果见「日志 →
         推送日志」。
       </Typography>
+
+      <RuleTesterCard sims={sims} onError={(m) => toast.show(m, 'error')} />
 
       {channelEdit !== undefined && (
         <ChannelDialog
@@ -400,6 +412,137 @@ export function NotifyPage() {
       )}
       {toast.element}
     </Stack>
+  )
+}
+
+function RuleTesterCard({
+  sims,
+  onError,
+}: {
+  sims: Sim[]
+  onError: (message: string) => void
+}) {
+  const [simId, setSimId] = useState<string>('')
+  const [peer, setPeer] = useState('')
+  const [body, setBody] = useState('')
+  const [result, setResult] = useState<RulePreview[] | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  const preview = async () => {
+    setBusy(true)
+    try {
+      const parsed = simId ? Number(simId) : null
+      setResult(await api.rules.preview(parsed, peer.trim(), body))
+    } catch (err) {
+      onError(err instanceof ApiError ? err.message : '预览失败')
+      setResult([])
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader
+        title={<Typography variant="h3">规则调试器</Typography>}
+        subheader={
+          <Typography variant="caption" color="text.secondary">
+            粘贴一条真实短信,看它会命中哪些规则、实际推出去长什么样 —— 不真的发送。
+          </Typography>
+        }
+      />
+      <CardContent>
+        <Stack spacing={2}>
+          <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
+            <TextField
+              select
+              size="small"
+              label="卡(留空 = 全部卡)"
+              value={simId}
+              onChange={(e) => setSimId(e.target.value)}
+              sx={{ minWidth: 160 }}
+            >
+              <MenuItem value="">全部卡</MenuItem>
+              {sims.map((sim) => (
+                <MenuItem key={sim.id} value={sim.id}>
+                  {sim.label || sim.iccid.slice(-6)}
+                </MenuItem>
+              ))}
+            </TextField>
+            <TextField
+              size="small"
+              label="发件号码(可选)"
+              value={peer}
+              onChange={(e) => setPeer(e.target.value)}
+              placeholder="10086"
+              sx={{ minWidth: 160 }}
+            />
+            <TextField
+              size="small"
+              label="短信内容"
+              value={body}
+              onChange={(e) => setBody(e.target.value)}
+              placeholder="【移动】验证码 123456,请勿泄露"
+              multiline
+              minRows={1}
+              maxRows={4}
+              sx={{ flexGrow: 1 }}
+            />
+            <Button
+              variant="outlined"
+              onClick={() => void preview()}
+              disabled={busy || body.trim().length === 0}
+              sx={{ alignSelf: 'flex-start', height: 40, whiteSpace: 'nowrap' }}
+            >
+              预览命中
+            </Button>
+          </Stack>
+
+          {busy ? (
+            <Box sx={{ display: 'flex', justifyContent: 'center', py: 2 }}>
+              <CircularProgress size={24} />
+            </Box>
+          ) : result !== null ? (
+            result.length === 0 ? (
+              <Typography variant="body2" color="text.secondary">
+                没有规则命中。想收到这条短信的话,先建一条匹配它的规则。
+              </Typography>
+            ) : (
+              <Stack divider={<Divider />} spacing={1.5}>
+                {result.map((hit) => (
+                  <Box key={hit.rule_id}>
+                    <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 0.5 }}>
+                      <Chip size="small" label={hit.rule_name} color="primary" variant="outlined" />
+                      <Typography variant="body2" color="text.secondary">
+                        → {hit.channel_name}(优先级 {hit.priority})
+                      </Typography>
+                    </Stack>
+                    <Box
+                      component="pre"
+                      sx={{
+                        m: 0,
+                        p: 1.5,
+                        borderRadius: 1.5,
+                        bgcolor: 'background.default',
+                        border: 1,
+                        borderColor: 'divider',
+                        fontSize: 13,
+                        whiteSpace: 'pre-wrap',
+                        wordBreak: 'break-word',
+                        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                      }}
+                    >
+                      {hit.title ? `标题:${hit.title}\n` : ''}
+                      {hit.text}
+                    </Box>
+                  </Box>
+                ))}
+              </Stack>
+            )
+          ) : null}
+        </Stack>
+      </CardContent>
+    </Card>
   )
 }
 

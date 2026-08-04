@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react'
 import {
   Alert,
   Avatar,
@@ -29,6 +36,9 @@ import ArrowBackIcon from '@mui/icons-material/ArrowBackOutlined'
 import EditIcon from '@mui/icons-material/EditOutlined'
 import ErrorIcon from '@mui/icons-material/ErrorOutline'
 import RefreshIcon from '@mui/icons-material/RefreshOutlined'
+import DownloadIcon from '@mui/icons-material/FileDownloadOutlined'
+import ContentCopyIcon from '@mui/icons-material/ContentCopyOutlined'
+import CheckIcon from '@mui/icons-material/CheckOutlined'
 import { api, ApiError, type Conversation, type Device, type Message } from '../api'
 import { Loading, useToast } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
@@ -51,6 +61,50 @@ const THREAD_PAGE = 200
 // segmentation, and Unicode content splits far earlier.
 const SINGLE_SEGMENT = 70
 
+/**
+ * The last 4–8 digit run in the body, if any.  This is the whole point of the
+ * box — the verification code.  Lookbehind/lookahead keep a longer run like a
+ * phone number from matching a prefix of itself.
+ */
+const OTP_RE = /(?<!\d)(\d{4,8})(?!\d)/g
+
+export function detectOtp(body: string): string | null {
+  let code: string | null = null
+  for (const match of body.matchAll(OTP_RE)) code = match[1]
+  return code
+}
+
+/** Split a body around its codes; codes render as highlighted tokens. */
+function highlightOtp(body: string): ReactNode[] {
+  const parts: ReactNode[] = []
+  let last = 0
+  for (const match of body.matchAll(OTP_RE)) {
+    if (match.index > last) parts.push(body.slice(last, match.index))
+    parts.push(
+      <Box
+        component="span"
+        key={match.index}
+        sx={{
+          px: 0.5,
+          py: 0.1,
+          mx: 0.25,
+          borderRadius: 0.75,
+          bgcolor: 'primary.main',
+          color: 'primary.contrastText',
+          fontVariantNumeric: 'tabular-nums',
+          letterSpacing: '0.08em',
+          fontWeight: 700,
+        }}
+      >
+        {match[1]}
+      </Box>,
+    )
+    last = match.index + match[1].length
+  }
+  if (last < body.length) parts.push(body.slice(last))
+  return parts
+}
+
 export function MessagesPage() {
   const toast = useToast()
   const theme = useTheme()
@@ -59,6 +113,7 @@ export function MessagesPage() {
   const [threads, setThreads] = useState<Conversation[] | null>(null)
   const [selected, setSelected] = useState<Conversation | null>(null)
   const [search, setSearch] = useState('')
+  const [searchOpen, setSearchOpen] = useState(false)
   const [devices, setDevices] = useState<Device[]>([])
   const [composeOpen, setComposeOpen] = useState(false)
 
@@ -67,6 +122,9 @@ export function MessagesPage() {
     setThreads(rows)
     return rows
   }, [])
+  const refreshThreadsAfterRead = useCallback(() => {
+    void loadThreads()
+  }, [loadThreads])
 
   useEffect(() => {
     void loadThreads()
@@ -99,12 +157,22 @@ export function MessagesPage() {
   const showThread = !narrow || selected !== null
 
   return (
-    <Stack spacing={3} sx={{ height: '100%' }}>
+    <Stack spacing={3} sx={{ flexGrow: 1, minHeight: 0 }}>
       <PageHeader
         title="短信"
         subtitle="会话视图,回复在对话里完成"
         actions={
           <>
+            <Tooltip title="搜索全部短信">
+              <IconButton onClick={() => setSearchOpen(true)} size="small">
+                <SearchIcon />
+              </IconButton>
+            </Tooltip>
+            <Tooltip title="导出 CSV">
+              <IconButton onClick={() => void api.messages.exportCsv()} size="small">
+                <DownloadIcon />
+              </IconButton>
+            </Tooltip>
             <Tooltip title="刷新">
               <IconButton onClick={() => void loadThreads()} size="small">
                 <RefreshIcon />
@@ -127,7 +195,6 @@ export function MessagesPage() {
           display: 'flex',
           flexGrow: 1,
           minHeight: 0,
-          height: { xs: 'calc(100vh - 200px)', md: 'calc(100vh - 220px)' },
           overflow: 'hidden',
         }}
       >
@@ -147,6 +214,7 @@ export function MessagesPage() {
             thread={selected}
             devices={devices}
             onBack={narrow ? () => setSelected(null) : undefined}
+            onRead={refreshThreadsAfterRead}
             onSent={async () => {
               toast.show('已发送', 'success')
               await loadThreads()
@@ -155,6 +223,15 @@ export function MessagesPage() {
           />
         )}
       </Card>
+
+      <SearchDialog
+        open={searchOpen}
+        onClose={() => setSearchOpen(false)}
+        onOpenThread={(thread) => {
+          setSearchOpen(false)
+          setSelected(thread)
+        }}
+      />
 
       <ComposeDialog
         open={composeOpen}
@@ -241,7 +318,10 @@ function ThreadList({
                       <Typography
                         variant="subtitle2"
                         noWrap
-                        sx={{ flexGrow: 1, fontWeight: 600 }}
+                        sx={{
+                          flexGrow: 1,
+                          fontWeight: thread.unread_count ? 700 : 600,
+                        }}
                       >
                         {thread.peer || '(未知号码)'}
                       </Typography>
@@ -255,9 +335,12 @@ function ThreadList({
                     </Stack>
                     <Typography
                       variant="body2"
-                      color="text.secondary"
                       noWrap
-                      sx={{ mt: 0.25 }}
+                      sx={{
+                        mt: 0.25,
+                        fontWeight: thread.unread_count ? 600 : 400,
+                        color: thread.unread_count ? 'text.primary' : 'text.secondary',
+                      }}
                     >
                       {thread.last_direction === 'out' && '你:'}
                       {thread.last_body || '(空)'}
@@ -275,6 +358,13 @@ function ThreadList({
                           variant="outlined"
                           label={`${thread.message_count} 条`}
                           sx={{ height: 20, fontSize: '0.7rem' }}
+                        />
+                      )}
+                      {Boolean(thread.unread_count) && (
+                        <Chip
+                          size="small"
+                          label={thread.unread_count}
+                          sx={{ height: 20, minWidth: 20, fontSize: '0.7rem', color: 'primary.contrastText', bgcolor: 'primary.main' }}
                         />
                       )}
                     </Stack>
@@ -308,12 +398,15 @@ function ThreadView({
   thread,
   devices,
   onBack,
+  onRead,
   onSent,
   onError,
 }: {
   thread: Conversation | null
   devices: Device[]
   onBack?: () => void
+  /** Fired after this thread's incoming messages are marked read. */
+  onRead?: () => void
   onSent: () => void | Promise<void>
   onError: (message: string) => void
 }) {
@@ -331,7 +424,12 @@ function ThreadView({
     })
     // The API returns newest first; a conversation reads oldest first.
     setMessages([...data.items].reverse())
-  }, [thread])
+    // Opening a conversation is the read receipt.
+    if (data.items.some((m) => m.direction === 'in' && !m.read_at)) {
+      await api.messages.markRead(thread.sim_id, thread.peer)
+      onRead?.()
+    }
+  }, [thread, onRead])
 
   useEffect(() => {
     setMessages(null)
@@ -342,6 +440,33 @@ function ThreadView({
   useEffect(() => {
     bottom.current?.scrollIntoView({ block: 'end' })
   }, [messages])
+
+  // Hooks stay unconditional while the empty-state render has no thread.
+  const device = thread
+    ? (devices.find(
+        (d) => d.iccid && thread.sim_iccid && d.iccid === thread.sim_iccid,
+      ) ?? devices.find((d) => d.name === thread.device))
+    : undefined
+  const online = Boolean(device?.online)
+
+  const sendText = useCallback(
+    async (body: string): Promise<boolean> => {
+      if (!device || !thread) return false
+      setBusy(true)
+      try {
+        await api.messages.send(device.name, thread.peer, body)
+        await load()
+        await onSent()
+        return true
+      } catch (err) {
+        onError(err instanceof ApiError ? err.message : '发送失败')
+        return false
+      } finally {
+        setBusy(false)
+      }
+    },
+    [device, thread, load, onSent, onError],
+  )
 
   if (!thread) {
     return (
@@ -359,26 +484,13 @@ function ThreadView({
     )
   }
 
-  // Reply from the card the thread belongs to — replying from the other one
-  // would reach the correspondent from a number they do not recognise.
-  const device = devices.find(
-    (d) => d.iccid && thread.sim_iccid && d.iccid === thread.sim_iccid,
-  ) ?? devices.find((d) => d.name === thread.device)
-  const online = Boolean(device?.online)
-
   const send = async () => {
-    if (!device) return
-    setBusy(true)
-    try {
-      await api.messages.send(device.name, thread.peer, draft)
-      setDraft('')
-      await load()
-      await onSent()
-    } catch (err) {
-      onError(err instanceof ApiError ? err.message : '发送失败')
-    } finally {
-      setBusy(false)
-    }
+    if (await sendText(draft)) setDraft('')
+  }
+
+  const retry = (message: Message) => {
+    // Re-send the failed message verbatim; the toast from onSent confirms.
+    void sendText(message.body)
   }
 
   return (
@@ -417,6 +529,7 @@ function ThreadView({
                 key={message.id}
                 message={message}
                 showDay={index === 0 || !sameDay(messages[index - 1].ts, message.ts)}
+                onRetry={retry}
               />
             ))}
             <div ref={bottom} />
@@ -431,7 +544,7 @@ function ThreadView({
             这张卡当前不在任何在线模块上,无法回复
           </Alert>
         ) : (
-          <Stack direction="row" spacing={1} alignItems="flex-end">
+          <Stack direction="row" spacing={1} alignItems="flex-start">
             <TextField
               fullWidth
               size="small"
@@ -462,7 +575,6 @@ function ThreadView({
               onClick={() => void send()}
               disabled={!online || busy || !draft.trim()}
               aria-label="发送"
-              sx={{ mb: 2.5 }}
             >
               <SendIcon />
             </IconButton>
@@ -473,9 +585,31 @@ function ThreadView({
   )
 }
 
-function Bubble({ message, showDay }: { message: Message; showDay: boolean }) {
+function Bubble({
+  message,
+  showDay,
+  onRetry,
+}: {
+  message: Message
+  showDay: boolean
+  onRetry?: (message: Message) => void
+}) {
   const outgoing = message.direction === 'out'
   const failed = message.status === 'failed'
+  const code = detectOtp(message.body)
+  const [copied, setCopied] = useState(false)
+
+  const copy = async () => {
+    if (!code) return
+    try {
+      await navigator.clipboard.writeText(code)
+    } catch {
+      // Clipboard needs a secure context; the copy button just won't work.
+      return
+    }
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1200)
+  }
 
   return (
     <>
@@ -512,7 +646,7 @@ function Bubble({ message, showDay }: { message: Message; showDay: boolean }) {
               wordBreak: 'break-word',
             }}
           >
-            <Typography variant="body2">{message.body}</Typography>
+            <Typography variant="body2">{highlightOtp(message.body)}</Typography>
           </Box>
           <Stack
             direction="row"
@@ -531,13 +665,33 @@ function Bubble({ message, showDay }: { message: Message; showDay: boolean }) {
               </Typography>
             )}
             {failed && (
-              <Tooltip title={message.error ?? '未知原因'}>
-                <Stack direction="row" spacing={0.25} alignItems="center">
-                  <ErrorIcon sx={{ fontSize: 14, color: STATUS.critical }} />
-                  <Typography variant="caption" sx={{ color: STATUS.critical }}>
-                    发送失败
-                  </Typography>
-                </Stack>
+              <>
+                <Tooltip title={message.error ?? '未知原因'}>
+                  <Stack direction="row" spacing={0.25} alignItems="center">
+                    <ErrorIcon sx={{ fontSize: 14, color: STATUS.critical }} />
+                    <Typography variant="caption" sx={{ color: STATUS.critical }}>
+                      发送失败
+                    </Typography>
+                  </Stack>
+                </Tooltip>
+                {onRetry && (
+                  <Tooltip title="重新发送">
+                    <IconButton size="small" onClick={() => onRetry(message)} aria-label="重新发送">
+                      <RefreshIcon sx={{ fontSize: 14 }} />
+                    </IconButton>
+                  </Tooltip>
+                )}
+              </>
+            )}
+            {code && (
+              <Tooltip title={copied ? '已复制' : `复制验证码 ${code}`}>
+                <IconButton size="small" onClick={() => void copy()} aria-label="复制验证码">
+                  {copied ? (
+                    <CheckIcon sx={{ fontSize: 14, color: STATUS.good }} />
+                  ) : (
+                    <ContentCopyIcon sx={{ fontSize: 14 }} />
+                  )}
+                </IconButton>
               </Tooltip>
             )}
           </Stack>
@@ -682,4 +836,131 @@ function shortTime(ts: string): string {
   if (Number.isNaN(d.getTime())) return ''
   if (sameDay(d.toISOString(), new Date().toISOString())) return clockTime(ts)
   return `${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+}
+
+// --------------------------------------------------------------------------
+// full-text search — across every card and number, not just open threads
+// --------------------------------------------------------------------------
+
+function SearchDialog({
+  open,
+  onClose,
+  onOpenThread,
+}: {
+  open: boolean
+  onClose: () => void
+  onOpenThread: (thread: Conversation) => void
+}) {
+  const [query, setQuery] = useState('')
+  const [results, setResults] = useState<Message[] | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    if (open) {
+      setQuery('')
+      setResults(null)
+    }
+  }, [open])
+
+  useEffect(() => {
+    if (!open || query.trim().length < 2) {
+      setResults(null)
+      setBusy(false)
+      return
+    }
+    let cancelled = false
+    setResults(null)
+    setBusy(true)
+    const timer = setTimeout(() => {
+      void api.messages
+        .list({ search: query.trim(), limit: 50 })
+        .then((data) => {
+          if (!cancelled) setResults(data.items)
+        })
+        .catch(() => {
+          if (!cancelled) setResults([])
+        })
+        .finally(() => {
+          if (!cancelled) setBusy(false)
+        })
+    }, 250)
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+  }, [open, query])
+
+  const openThread = (message: Message) =>
+    onOpenThread({
+      sim_id: message.sim_id,
+      peer: message.peer,
+      device: message.device,
+      last_id: message.id,
+      last_body: message.body,
+      last_direction: message.direction,
+      last_status: message.status,
+      last_ts: message.ts,
+      message_count: 0,
+      sim_label: message.sim_label,
+      sim_iccid: message.sim_iccid,
+    })
+
+  return (
+    <Dialog open={open} onClose={onClose} fullWidth maxWidth="sm">
+      <DialogTitle>搜索全部短信</DialogTitle>
+      <DialogContent>
+        <TextField
+          autoFocus
+          fullWidth
+          size="small"
+          placeholder="号码或内容,至少 2 个字"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          InputProps={{
+            startAdornment: (
+              <InputAdornment position="start">
+                <SearchIcon fontSize="small" />
+              </InputAdornment>
+            ),
+          }}
+        />
+        <Box sx={{ mt: 1.5 }}>
+          {results === null ? (
+            <Typography variant="body2" color="text.secondary" sx={{ py: 3, textAlign: 'center' }}>
+              {busy ? '搜索中…' : '输入关键词开始搜索'}
+            </Typography>
+          ) : results.length === 0 ? (
+            <Typography variant="body2" color="text.secondary" sx={{ py: 3, textAlign: 'center' }}>
+              没有匹配的短信
+            </Typography>
+          ) : (
+            <List disablePadding>
+              {results.map((message) => (
+                <ListItemButton
+                  key={message.id}
+                  onClick={() => openThread(message)}
+                  sx={{ borderRadius: 2, alignItems: 'flex-start', py: 1, gap: 1.5 }}
+                >
+                  <Box sx={{ minWidth: 0, flexGrow: 1 }}>
+                    <Stack direction="row" alignItems="baseline" spacing={1}>
+                      <Typography variant="subtitle2" noWrap sx={{ flexGrow: 1 }}>
+                        {message.peer}
+                      </Typography>
+                      <Typography variant="caption" color="text.secondary" sx={{ flexShrink: 0 }}>
+                        {message.sim_label || message.sim_iccid?.slice(-6)}
+                      </Typography>
+                    </Stack>
+                    <Typography variant="body2" color="text.secondary" noWrap>
+                      {message.direction === 'out' ? '你:' : '收到:'}
+                      {message.body}
+                    </Typography>
+                  </Box>
+                </ListItemButton>
+              ))}
+            </List>
+          )}
+        </Box>
+      </DialogContent>
+    </Dialog>
+  )
 }
