@@ -48,7 +48,7 @@ export function OnlineChip({ online }: { online: boolean }) {
 
 export function Loading() {
   return (
-    <Box sx={{ display: 'flex', justifyContent: 'center', py: 6 }}>
+    <Box sx={{ display: 'flex', flexGrow: 1, justifyContent: 'center', alignItems: 'center', minHeight: '50vh' }}>
       <CircularProgress size={28} />
     </Box>
   )

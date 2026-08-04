@@ -74,7 +74,7 @@ export default function App() {
 
   let content
   if (status === null) {
-    content = <Loading />
+    content = null
   } else if (!status.authenticated) {
     content = (
       <LoginPage
@@ -113,7 +113,7 @@ export default function App() {
       <CssBaseline />
       <GlobalStyles
         styles={{
-          'html, body, #root': { height: '100%' },
+          'html, body, #root': { height: '100%', display: 'flex', flexDirection: 'column' },
           body: {
             WebkitFontSmoothing: 'antialiased',
             MozOsxFontSmoothing: 'grayscale',
