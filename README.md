@@ -169,6 +169,21 @@ npm run build
 - [AT 指令与硬件说明](docs/at-reference.md)
 - [设计与里程碑](docs/PLAN.md)
 
+## 参考与致谢
+
+项目在需求分析、硬件验证和交互设计阶段参考了以下公开资料与相关项目：
+
+| 项目 / 资料 | 本项目参考的内容 |
+|---|---|
+| [合宙 Air780E AT 指令文档](https://docs.openluat.com/air780e/at/app/at_command) | AT 指令格式、EC618 模块行为和硬件能力边界 |
+| [SimAdmin](https://github.com/3899/SimAdmin) | Web 管理功能覆盖、设备状态展示和交互模式；本项目没有 fork，其 ModemManager / QMI 与单 modem 架构不适合当前的 Agent / Server 多卡模型 |
+| [chenxuuu/sms_forwarding](https://github.com/chenxuuu/sms_forwarding) | 短信转发、保号任务和通知配置的产品设计思路 |
+| [soxfmr/linux-air780e](https://github.com/soxfmr/linux-air780e) | Linux 下的 Air780E USB 枚举、AT 交互和 PDU 处理经验 |
+| [y-guang/air780e-sms-cli](https://github.com/y-guang/air780e-sms-cli) | 轻量命令行短信工具的使用流程 |
+| [Ansen/Air780E-SMS](https://github.com/Ansen/Air780E-SMS) | LuatOS 侧短信转发方案的相关实现 |
+
+air780e-hub 是独立实现，不包含上述项目复制的源代码。第三方项目及文档仍分别受其原始许可证和使用条款约束。
+
 ## 目录
 
 ```text
