@@ -167,3 +167,13 @@ def verify_agent_token(presented: str | None, expected: str) -> bool:
     if not presented or not expected:
         return False
     return hmac.compare_digest(presented, expected)
+
+
+def hash_agent_token(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def verify_agent_token_hash(presented: str | None, expected_hash: str) -> bool:
+    if not presented or not expected_hash:
+        return False
+    return hmac.compare_digest(hash_agent_token(presented), expected_hash)

@@ -11,19 +11,30 @@ from __future__ import annotations
 import json
 import logging
 import os
+import platform
+import secrets
+import shutil
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Literal
+from typing import Any, Iterable, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
 from .alerts import SETTING_ENABLED
-from .auth import SESSION_COOKIE, AuthError
+from . import __version__
+from .auth import SESSION_COOKIE, AuthError, hash_agent_token
+from .config import ConfigError
 from .db import SETTING_MESSAGE_RETENTION_DAYS, utcnow
-from .gateway import AgentUnavailable, CommandFailed
+from .gateway import (
+    SETTING_PREVIOUS_AGENT_TOKEN_EXPIRES_AT,
+    SETTING_PREVIOUS_AGENT_TOKEN_HASH,
+    AgentUnavailable,
+    CommandFailed,
+)
 from .notify import match_rules
 from .state import AppState
 
@@ -112,6 +123,14 @@ class TaskBody(BaseModel):
     random_suffix: bool = True
     retry_max: int = Field(default=3, ge=0, le=10)
     notify_on_result: bool = True
+
+
+class IncidentStatusBody(BaseModel):
+    status: Literal["active", "acknowledged", "resolved"]
+
+
+class RotateAgentTokenBody(BaseModel):
+    grace_minutes: int = Field(default=60, ge=0, le=7 * 24 * 60)
 
 
 # --------------------------------------------------------------------------
@@ -236,6 +255,27 @@ def build_router(state: AppState) -> APIRouter:
             "FROM devices d LEFT JOIN sims s ON s.id = d.sim_id ORDER BY d.name"
         )
 
+    @router.get("/devices/history", dependencies=guard)
+    def all_device_history(
+        hours: int = Query(24, ge=1, le=24 * 30),
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Return every device series in one request for the dashboard."""
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(hours=hours)
+        ).isoformat(timespec="seconds")
+        names = [row["name"] for row in state.db.query("SELECT name FROM devices")]
+        grouped: dict[str, list[dict[str, Any]]] = {name: [] for name in names}
+        rows = state.db.query(
+            "SELECT d.name, s.ts, s.online, s.registered, s.rssi, s.dbm, "
+            "s.bars, s.rsrp, s.rsrq, s.storage_used, s.storage_cap "
+            "FROM device_status s JOIN devices d ON d.id = s.device_id "
+            "WHERE s.ts >= ? ORDER BY d.name, s.ts",
+            (cutoff,),
+        )
+        for row in rows:
+            grouped.setdefault(row.pop("name"), []).append(row)
+        return grouped
+
     @router.get("/devices/{name}/history", dependencies=guard)
     def device_history(
         name: str, hours: int = Query(24, ge=1, le=24 * 30)
@@ -301,7 +341,9 @@ def build_router(state: AppState) -> APIRouter:
                 limit=limit, offset=offset, sim_id=sim_id,
                 direction=direction, peer=peer, search=search,
             ),
-            "total": state.db.count_messages(),
+            "total": state.db.count_messages(
+                sim_id=sim_id, direction=direction, peer=peer, search=search
+            ),
         }
 
     @router.get("/conversations", dependencies=guard)
@@ -342,24 +384,31 @@ def build_router(state: AppState) -> APIRouter:
         sim_id: int | None = None,
         peer: str | None = None,
         search: str | None = None,
-    ) -> Response:
-        """Stored messages as CSV.  Bodies included — the admin owns them."""
+    ) -> StreamingResponse:
+        """Stream stored messages as CSV without materialising the export."""
         import csv
         import io
 
-        rows = state.db.messages(
-            limit=limit, sim_id=sim_id, peer=peer, search=search
-        )
-        buffer = io.StringIO()
-        # BOM so Excel opens UTF-8 Chinese correctly.
-        buffer.write("\ufeff")
-        writer = csv.writer(buffer)
-        writer.writerow(
-            ["id", "ts", "direction", "sim_id", "sim_label", "peer", "body", "status"]
-        )
-        for message in rows:
-            writer.writerow(
-                [
+        def generate() -> Iterable[str]:
+            buffer = io.StringIO()
+            writer = csv.writer(buffer)
+
+            def line(values: list[Any]) -> str:
+                buffer.seek(0)
+                buffer.truncate(0)
+                writer.writerow(values)
+                return buffer.getvalue()
+
+            # BOM makes Excel recognise the UTF-8 Chinese payload.
+            yield "\ufeff"
+            yield line([
+                "id", "ts", "direction", "sim_id", "sim_label", "peer",
+                "body", "status",
+            ])
+            for message in state.db.iter_messages(
+                limit=limit, sim_id=sim_id, peer=peer, search=search
+            ):
+                yield line([
                     message["id"],
                     message["ts"],
                     message["direction"],
@@ -368,10 +417,10 @@ def build_router(state: AppState) -> APIRouter:
                     message["peer"],
                     message["body"],
                     message["status"],
-                ]
-            )
-        return Response(
-            buffer.getvalue(),
+                ])
+
+        return StreamingResponse(
+            generate(),
             media_type="text/csv; charset=utf-8",
             headers={
                 "Content-Disposition": 'attachment; filename="messages.csv"',
@@ -629,10 +678,129 @@ def build_router(state: AppState) -> APIRouter:
             "SELECT * FROM agent_logs ORDER BY ts DESC LIMIT ?", (limit,)
         )
 
+    # -- operations -------------------------------------------------------
+
+    @router.get("/operations/diagnostics", dependencies=guard)
+    def diagnostics() -> dict[str, Any]:
+        db_path = state.settings.db_path
+        wal_path = db_path.with_name(db_path.name + "-wal")
+        disk = shutil.disk_usage(state.settings.data_dir)
+        counts = {
+            "messages": state.db.one("SELECT COUNT(*) AS n FROM messages")["n"],
+            "status_samples": state.db.one(
+                "SELECT COUNT(*) AS n FROM device_status"
+            )["n"],
+            "active_incidents": state.db.one(
+                "SELECT COUNT(*) AS n FROM incidents WHERE status != 'resolved'"
+            )["n"],
+            "audit_events": state.db.one(
+                "SELECT COUNT(*) AS n FROM audit_events"
+            )["n"],
+        }
+        return {
+            "server": {
+                "version": __version__,
+                "python": platform.python_version(),
+                "started_at": state.started_at,
+                "uptime_seconds": int(time.monotonic() - state.started_monotonic),
+            },
+            "runtime": {
+                "agents_connected": len(state.gateway.connections),
+                "pending_commands": state.gateway.pending_command_count,
+                "notifications_inflight": state.notifier.inflight_count,
+                "offline_timers": state.alerter.pending_count,
+            },
+            "storage": {
+                "database_bytes": db_path.stat().st_size if db_path.exists() else 0,
+                "wal_bytes": wal_path.stat().st_size if wal_path.exists() else 0,
+                "disk_total_bytes": disk.total,
+                "disk_free_bytes": disk.free,
+            },
+            "counts": counts,
+            "agents": state.db.query(
+                "SELECT a.*, COUNT(d.id) AS device_count "
+                "FROM agents a LEFT JOIN devices d ON d.agent_id = a.id "
+                "GROUP BY a.id ORDER BY a.id"
+            ),
+        }
+
+    @router.get("/operations/audit", dependencies=guard)
+    def audit_events(limit: int = Query(200, ge=1, le=2000)) -> list[dict[str, Any]]:
+        return state.db.query(
+            "SELECT * FROM audit_events ORDER BY ts DESC, id DESC LIMIT ?", (limit,)
+        )
+
+    @router.get("/operations/incidents", dependencies=guard)
+    def incidents(
+        status: Literal["open", "all"] = "open",
+        limit: int = Query(200, ge=1, le=2000),
+    ) -> list[dict[str, Any]]:
+        where = "WHERE status != 'resolved'" if status == "open" else ""
+        return state.db.query(
+            f"SELECT * FROM incidents {where} "
+            "ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 "
+            "ELSE 2 END, last_seen_at DESC LIMIT ?",
+            (limit,),
+        )
+
+    @router.get("/operations/incidents/count", dependencies=guard)
+    def incident_count() -> dict[str, int]:
+        row = state.db.one(
+            "SELECT COUNT(*) AS n FROM incidents WHERE status != 'resolved'"
+        )
+        return {"total": int(row["n"]) if row else 0}
+
+    @router.put("/operations/incidents/{incident_id}", dependencies=guard)
+    def update_incident(
+        incident_id: int, body: IncidentStatusBody
+    ) -> dict[str, Any]:
+        row = state.db.set_incident_status(incident_id, body.status)
+        if row is None:
+            raise HTTPException(status_code=404, detail="no such incident")
+        return row
+
     @router.get("/system/agent-token", dependencies=guard)
-    def agent_token() -> dict[str, Any]:
+    def agent_token(request: Request) -> dict[str, Any]:
         """The token the agent must present.  Shown so it can be copied once."""
-        return {"token": state.settings.agent_token}
+        state.db.record_audit(
+            "read agent token",
+            target="agent-token",
+            client_ip=request.client.host if request.client else "",
+        )
+        return {
+            "token": state.settings.agent_token,
+            "rotatable": not state.settings.agent_token_from_env,
+            "previous_valid_until": state.db.get_setting(
+                SETTING_PREVIOUS_AGENT_TOKEN_EXPIRES_AT, None
+            ),
+        }
+
+    @router.post("/system/agent-token/rotate", dependencies=guard)
+    def rotate_agent_token(body: RotateAgentTokenBody) -> dict[str, Any]:
+        old_token = state.settings.agent_token
+        new_token = secrets.token_urlsafe(32)
+        try:
+            state.settings.replace_agent_token(new_token)
+        except ConfigError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+        if body.grace_minutes:
+            expires = (
+                datetime.now(timezone.utc) + timedelta(minutes=body.grace_minutes)
+            ).isoformat(timespec="seconds")
+            state.db.set_setting(
+                SETTING_PREVIOUS_AGENT_TOKEN_HASH, hash_agent_token(old_token)
+            )
+            state.db.set_setting(SETTING_PREVIOUS_AGENT_TOKEN_EXPIRES_AT, expires)
+        else:
+            expires = None
+            state.db.set_setting(SETTING_PREVIOUS_AGENT_TOKEN_HASH, "")
+            state.db.set_setting(SETTING_PREVIOUS_AGENT_TOKEN_EXPIRES_AT, "")
+
+        return {
+            "token": new_token,
+            "previous_valid_until": expires,
+        }
 
     @router.post("/system/purge", dependencies=guard)
     def purge() -> dict[str, Any]:
@@ -642,7 +810,7 @@ def build_router(state: AppState) -> APIRouter:
         )
 
     @router.get("/system/backup", dependencies=guard)
-    def backup() -> FileResponse:
+    def backup(request: Request) -> FileResponse:
         """Download a consistent snapshot of the whole database.
 
         A snapshot is written to a temp file (SQLite's online-backup API, so
@@ -656,6 +824,11 @@ def build_router(state: AppState) -> APIRouter:
         except Exception:
             os.unlink(tmp)
             raise
+        state.db.record_audit(
+            "download backup",
+            target="database",
+            client_ip=request.client.host if request.client else "",
+        )
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         return FileResponse(
             tmp,

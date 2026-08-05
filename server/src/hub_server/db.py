@@ -207,6 +207,35 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS audit_events (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts        TEXT NOT NULL,
+    action    TEXT NOT NULL,
+    target    TEXT NOT NULL DEFAULT '',
+    status    TEXT NOT NULL DEFAULT 'ok',
+    detail    TEXT NOT NULL DEFAULT '',
+    client_ip TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_audit_events_ts ON audit_events(ts DESC);
+
+CREATE TABLE IF NOT EXISTS incidents (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint     TEXT UNIQUE NOT NULL,
+    kind            TEXT NOT NULL,
+    severity        TEXT NOT NULL DEFAULT 'warning',
+    source          TEXT NOT NULL DEFAULT '',
+    title           TEXT NOT NULL,
+    detail          TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'active',
+    occurrences     INTEGER NOT NULL DEFAULT 1,
+    first_seen_at   TEXT NOT NULL,
+    last_seen_at    TEXT NOT NULL,
+    acknowledged_at TEXT,
+    resolved_at     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_incidents_status_seen
+    ON incidents(status, last_seen_at DESC);
 """
 
 
@@ -526,6 +555,27 @@ class Database:
         peer: str | None = None,
         search: str | None = None,
     ) -> list[dict[str, Any]]:
+        where, params = self._message_filter(
+            sim_id=sim_id, direction=direction, peer=peer, search=search
+        )
+        sql = (
+            "SELECT m.*, s.label AS sim_label, s.iccid AS sim_iccid "
+            "FROM messages m LEFT JOIN sims s ON s.id = m.sim_id "
+            f"{where} ORDER BY m.ts DESC, m.id DESC"
+        )
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+        return self.query(sql, tuple(params))
+
+    @staticmethod
+    def _message_filter(
+        *,
+        sim_id: int | None = None,
+        direction: str | None = None,
+        peer: str | None = None,
+        search: str | None = None,
+    ) -> tuple[str, list[Any]]:
         clauses: list[str] = []
         params: list[Any] = []
         if sim_id is not None:
@@ -541,18 +591,72 @@ class Database:
             clauses.append("(m.body LIKE ? OR m.peer LIKE ?)")
             params.extend([f"%{search}%", f"%{search}%"])
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return where, params
+
+    def iter_messages(
+        self,
+        *,
+        limit: int | None = None,
+        sim_id: int | None = None,
+        direction: str | None = None,
+        peer: str | None = None,
+        search: str | None = None,
+        batch_size: int = 500,
+    ) -> Iterable[dict[str, Any]]:
+        """Stream a stable read without retaining every message in memory.
+
+        A separate read-only connection lets WAL continue accepting gateway
+        writes while a large export is being downloaded. In-memory databases
+        are only used by tests, where falling back to a bounded list is fine.
+        """
+        if str(self.path) == ":memory:":
+            yield from self.messages(
+                limit=limit,
+                sim_id=sim_id,
+                direction=direction,
+                peer=peer,
+                search=search,
+            )
+            return
+
+        where, params = self._message_filter(
+            sim_id=sim_id, direction=direction, peer=peer, search=search
+        )
         sql = (
             "SELECT m.*, s.label AS sim_label, s.iccid AS sim_iccid "
             "FROM messages m LEFT JOIN sims s ON s.id = m.sim_id "
             f"{where} ORDER BY m.ts DESC, m.id DESC"
         )
         if limit is not None:
-            sql += " LIMIT ? OFFSET ?"
-            params.extend([limit, offset])
-        return self.query(sql, tuple(params))
+            sql += " LIMIT ?"
+            params.append(limit)
 
-    def count_messages(self, **filters: Any) -> int:
-        row = self.one("SELECT COUNT(*) AS n FROM messages")
+        connection = sqlite3.connect(
+            f"file:{self.path.resolve()}?mode=ro", uri=True
+        )
+        connection.row_factory = sqlite3.Row
+        try:
+            cursor = connection.execute(sql, tuple(params))
+            while rows := cursor.fetchmany(batch_size):
+                for row in rows:
+                    yield dict(row)
+        finally:
+            connection.close()
+
+    def count_messages(
+        self,
+        *,
+        sim_id: int | None = None,
+        direction: str | None = None,
+        peer: str | None = None,
+        search: str | None = None,
+    ) -> int:
+        where, params = self._message_filter(
+            sim_id=sim_id, direction=direction, peer=peer, search=search
+        )
+        row = self.one(
+            f"SELECT COUNT(*) AS n FROM messages m {where}", tuple(params)
+        )
         return int(row["n"]) if row else 0
 
     # -- retention ---------------------------------------------------------
@@ -649,6 +753,16 @@ class Database:
         try:
             with self._lock:
                 source.backup(self._db)
+                # Older valid backups predate additive operational tables.
+                # Reapplying the idempotent schema keeps the live process usable
+                # immediately after restore without requiring a restart.
+                self._db.executescript(SCHEMA)
+                cols = {
+                    row[1]
+                    for row in self._db.execute("PRAGMA table_info(messages)")
+                }
+                if "read_at" not in cols:
+                    self._db.execute("ALTER TABLE messages ADD COLUMN read_at TEXT")
         finally:
             source.close()
 
@@ -669,3 +783,105 @@ class Database:
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, json.dumps(value, ensure_ascii=False)),
         )
+
+    # -- operations -------------------------------------------------------
+
+    def record_audit(
+        self,
+        action: str,
+        *,
+        target: str = "",
+        status: str = "ok",
+        detail: str = "",
+        client_ip: str = "",
+    ) -> None:
+        """Persist metadata about an admin action, never its request body."""
+        self.execute(
+            "INSERT INTO audit_events (ts, action, target, status, detail, client_ip) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                utcnow(),
+                action[:128],
+                target[:256],
+                status[:32],
+                detail[:1000],
+                client_ip[:64],
+            ),
+        )
+
+    def open_incident(
+        self,
+        fingerprint: str,
+        *,
+        kind: str,
+        severity: str,
+        source: str,
+        title: str,
+        detail: str = "",
+    ) -> dict[str, Any]:
+        """Open or refresh one logical incident identified by fingerprint."""
+        now = utcnow()
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO incidents "
+                "(fingerprint, kind, severity, source, title, detail, status, "
+                " occurrences, first_seen_at, last_seen_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'active', 1, ?, ?) "
+                "ON CONFLICT(fingerprint) DO UPDATE SET "
+                "kind = excluded.kind, severity = excluded.severity, "
+                "source = excluded.source, title = excluded.title, "
+                "detail = excluded.detail, "
+                "status = CASE WHEN incidents.status = 'resolved' "
+                "              THEN 'active' ELSE incidents.status END, "
+                "occurrences = incidents.occurrences + 1, "
+                "first_seen_at = CASE WHEN incidents.status = 'resolved' "
+                "                     THEN excluded.first_seen_at "
+                "                     ELSE incidents.first_seen_at END, "
+                "last_seen_at = excluded.last_seen_at, "
+                "acknowledged_at = CASE WHEN incidents.status = 'resolved' "
+                "                       THEN NULL ELSE incidents.acknowledged_at END, "
+                "resolved_at = NULL",
+                (
+                    fingerprint[:256], kind[:64], severity[:16], source[:128],
+                    title[:256], detail[:1000], now, now,
+                ),
+            )
+            row = self._db.execute(
+                "SELECT * FROM incidents WHERE fingerprint = ?", (fingerprint[:256],)
+            ).fetchone()
+        return dict(row)
+
+    def resolve_incident(self, fingerprint: str, *, detail: str = "") -> bool:
+        now = utcnow()
+        with self._lock:
+            if detail:
+                cursor = self._db.execute(
+                    "UPDATE incidents SET status = 'resolved', detail = ?, "
+                    "last_seen_at = ?, resolved_at = ? "
+                    "WHERE fingerprint = ? AND status != 'resolved'",
+                    (detail[:1000], now, now, fingerprint[:256]),
+                )
+            else:
+                cursor = self._db.execute(
+                    "UPDATE incidents SET status = 'resolved', last_seen_at = ?, "
+                    "resolved_at = ? WHERE fingerprint = ? AND status != 'resolved'",
+                    (now, now, fingerprint[:256]),
+                )
+        return cursor.rowcount > 0
+
+    def set_incident_status(self, incident_id: int, status: str) -> dict[str, Any] | None:
+        if status not in {"active", "acknowledged", "resolved"}:
+            raise ValueError("invalid incident status")
+        now = utcnow()
+        acknowledged = now if status == "acknowledged" else None
+        resolved = now if status == "resolved" else None
+        with self._lock:
+            self._db.execute(
+                "UPDATE incidents SET status = ?, acknowledged_at = ?, resolved_at = ? "
+                "WHERE id = ?",
+                (status, acknowledged, resolved, incident_id),
+            )
+            row = self._db.execute(
+                "SELECT * FROM incidents WHERE id = ?", (incident_id,)
+            ).fetchone()
+        return dict(row) if row else None

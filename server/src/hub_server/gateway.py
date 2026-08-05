@@ -16,9 +16,10 @@ import json
 import logging
 import secrets
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
-from .auth import verify_agent_token
+from .auth import verify_agent_token, verify_agent_token_hash
 from .config import Settings
 from .db import Database, utcnow
 
@@ -29,6 +30,8 @@ CLOSE_PROTOCOL_ERROR = 4002
 CLOSE_AGENT_CONFLICT = 4003
 
 COMMAND_TIMEOUT = 30.0
+SETTING_PREVIOUS_AGENT_TOKEN_HASH = "previous_agent_token_hash"
+SETTING_PREVIOUS_AGENT_TOKEN_EXPIRES_AT = "previous_agent_token_expires_at"
 
 MessageHook = Callable[[int, dict[str, Any]], Awaitable[None]]
 TaskResultHook = Callable[[int, dict[str, Any]], Awaitable[None]]
@@ -81,13 +84,35 @@ class Gateway:
         self.connections: dict[str, AgentConnection] = {}
         self._pending: dict[str, asyncio.Future] = {}
 
+    @property
+    def pending_command_count(self) -> int:
+        return len(self._pending)
+
     # -- connection lifecycle ---------------------------------------------
 
     def authenticate(self, header: str | None) -> bool:
         token = ""
         if header and header.lower().startswith("bearer "):
             token = header[7:].strip()
-        return verify_agent_token(token, self.settings.agent_token)
+        if verify_agent_token(token, self.settings.agent_token):
+            return True
+        expected_hash = str(
+            self.db.get_setting(SETTING_PREVIOUS_AGENT_TOKEN_HASH, "") or ""
+        )
+        expires_at = str(
+            self.db.get_setting(SETTING_PREVIOUS_AGENT_TOKEN_EXPIRES_AT, "") or ""
+        )
+        if not expected_hash or not expires_at:
+            return False
+        try:
+            expires = datetime.fromisoformat(expires_at)
+        except ValueError:
+            return False
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
+        if expires <= datetime.now(timezone.utc):
+            return False
+        return verify_agent_token_hash(token, expected_hash)
 
     async def serve(self, websocket: Any) -> None:
         """Drive one agent connection start to finish."""
@@ -96,6 +121,13 @@ class Gateway:
         if not self.authenticate(websocket.headers.get("authorization")):
             log.warning("agent connection rejected: bad token")
             await websocket.close(code=CLOSE_AUTH_FAILED, reason="bad token")
+            return
+
+        # Deployment checks need to verify the complete HTTP upgrade and the
+        # bearer token without registering a fake agent in the database.
+        if websocket.query_params.get("self_check") == "1":
+            await websocket.send_text(json.dumps({"type": "self_check", "ok": True}))
+            await websocket.close(code=1000, reason="self-check complete")
             return
 
         agent_id: str | None = None
@@ -242,7 +274,7 @@ class Gateway:
             await self.on_message(message_id, frame)
 
     def _apply_sms_out(self, agent_id: str, frame: dict[str, Any]) -> None:
-        self.db.insert_message(
+        message_id = self.db.insert_message(
             agent_id=agent_id,
             device=frame.get("device", ""),
             direction="out",
@@ -255,6 +287,15 @@ class Gateway:
             seq=frame.get("seq"),
             error=frame.get("error"),
         )
+        if frame.get("status") == "failed":
+            self.db.open_incident(
+                f"sms-send:{message_id}",
+                kind="sms_send_failed",
+                severity="warning",
+                source=f"{agent_id}/{frame.get('device', '')}",
+                title="短信发送失败",
+                detail=str(frame.get("error") or "运营商或模块未返回成功状态"),
+            )
 
     def _apply_status(self, agent_id: str, frame: dict[str, Any]) -> None:
         payload = dict(frame)
@@ -265,6 +306,19 @@ class Gateway:
         # only on the ones that state it, so the alerter sees real edges.
         if "online" in frame:
             self._note_device(agent_id, frame.get("device", ""), bool(frame.get("online")))
+        if "registered" in frame:
+            fingerprint = f"network-registration:{agent_id}:{frame.get('device', '')}"
+            if frame.get("online") is not False and not frame.get("registered"):
+                self.db.open_incident(
+                    fingerprint,
+                    kind="network_unregistered",
+                    severity="warning",
+                    source=f"{agent_id}/{frame.get('device', '')}",
+                    title="模块未注册到移动网络",
+                    detail="模块在线，但当前未注册到运营商网络",
+                )
+            elif frame.get("registered"):
+                self.db.resolve_incident(fingerprint, detail="移动网络注册已恢复")
 
     def _apply_log(self, agent_id: str, frame: dict[str, Any]) -> None:
         self.db.execute(
@@ -295,6 +349,20 @@ class Gateway:
         task_id = frame.get("task_id")
         if task_id is None:
             return
+
+        task = self.db.one("SELECT name FROM tasks WHERE id = ?", (task_id,)) or {}
+        fingerprint = f"keepalive-task:{task_id}"
+        if frame.get("status") == "failed":
+            self.db.open_incident(
+                fingerprint,
+                kind="task_failed",
+                severity="warning",
+                source=task.get("name") or f"任务 {task_id}",
+                title=f"{task.get('name') or f'保号任务 {task_id}'} 执行失败",
+                detail=str(frame.get("error") or frame.get("detail") or "执行失败"),
+            )
+        elif frame.get("status") == "ok":
+            self.db.resolve_incident(fingerprint, detail="保号任务执行已恢复")
 
         # "skipped" means nothing was attempted, so it must not count as a run;
         # a failed attempt did happen and is what the next interval counts from.

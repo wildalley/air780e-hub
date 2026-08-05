@@ -166,6 +166,29 @@ def test_agent_needs_a_valid_token(client):
     assert excinfo.value.code == 4001
 
 
+def test_websocket_self_check_authenticates_without_registering_agent(client):
+    with client.websocket_connect(
+        "/ws?self_check=1",
+        headers={"Authorization": "Bearer test-token"},
+    ) as ws:
+        assert ws.receive_json() == {"type": "self_check", "ok": True}
+
+    assert client.app.state.hub.gateway.connections == {}
+    assert client.app.state.hub.db.query("SELECT id FROM agents") == []
+
+
+def test_websocket_self_check_rejects_a_bad_token(client):
+    from starlette.websockets import WebSocketDisconnect
+
+    with pytest.raises(WebSocketDisconnect) as excinfo:
+        with client.websocket_connect(
+            "/ws?self_check=1",
+            headers={"Authorization": "Bearer wrong"},
+        ) as ws:
+            ws.receive_json()
+    assert excinfo.value.code == 4001
+
+
 def test_hello_registers_devices_and_sims(admin):
     with _connect(admin) as ws:
         _greet(ws)
@@ -348,6 +371,25 @@ def test_message_export_is_utf8_csv_with_intact_multiline_bodies(admin):
     assert rows[1][5:7] == ["10086", body]
 
 
+def test_message_list_total_uses_the_same_filters(admin):
+    db = admin.app.state.hub.db
+    for direction, peer, body in [
+        ("in", "10086", "balance 42"),
+        ("out", "10086", "query"),
+        ("in", "95555", "other"),
+    ]:
+        db.insert_message(
+            agent_id="home-arch", device="a", direction=direction, peer=peer,
+            body=body, ts=_minutes_ago(1), iccid="89860622180012345670",
+        )
+
+    result = admin.get(
+        "/api/messages?direction=in&peer=10086&search=balance"
+    ).json()
+    assert result["total"] == 1
+    assert [item["body"] for item in result["items"]] == ["balance 42"]
+
+
 def test_message_stats_count_each_card_for_the_requested_window(admin):
     db = admin.app.state.hub.db
     for device, iccid in [
@@ -402,6 +444,9 @@ def test_status_is_recorded_for_the_history_graph(admin):
 
     history = admin.get("/api/devices/a/history?hours=24").json()
     assert [row["rssi"] for row in history] == [24, 18, 11]
+    histories = admin.get("/api/devices/history?hours=24").json()
+    assert [row["rssi"] for row in histories["a"]] == [24, 18, 11]
+    assert histories["b"] == []
 
 
 def test_history_window_respects_offset_timestamps(admin):
@@ -730,6 +775,97 @@ def test_overview_carries_the_sim_label(admin):
 
 def test_agent_token_is_readable_for_setup(admin):
     assert admin.get("/api/system/agent-token").json()["token"] == "test-token"
+
+
+def test_agent_token_rotation_supports_a_bounded_grace_period(admin):
+    state = admin.app.state.hub
+    response = admin.post(
+        "/api/system/agent-token/rotate", json={"grace_minutes": 5}
+    )
+    assert response.status_code == 200
+    replacement = response.json()["token"]
+    assert replacement != "test-token"
+    assert state.settings.token_path.read_text().strip() == replacement
+    assert state.gateway.authenticate(f"Bearer {replacement}")
+    assert state.gateway.authenticate("Bearer test-token")
+
+    second = admin.post(
+        "/api/system/agent-token/rotate", json={"grace_minutes": 0}
+    ).json()["token"]
+    assert state.gateway.authenticate(f"Bearer {second}")
+    assert not state.gateway.authenticate(f"Bearer {replacement}")
+    assert not state.gateway.authenticate("Bearer test-token")
+
+
+def test_environment_controlled_agent_token_cannot_rotate_online(admin):
+    admin.app.state.hub.settings.agent_token_from_env = True
+    response = admin.post(
+        "/api/system/agent-token/rotate", json={"grace_minutes": 5}
+    )
+    assert response.status_code == 409
+    assert "HUB_AGENT_TOKEN" in response.json()["detail"]
+
+
+def test_operations_diagnostics_and_audit_are_available_to_admin(admin):
+    diagnostics = admin.get("/api/operations/diagnostics")
+    assert diagnostics.status_code == 200
+    body = diagnostics.json()
+    assert body["server"]["version"] == "0.1.0"
+    assert body["runtime"]["agents_connected"] == 0
+    assert body["storage"]["disk_free_bytes"] > 0
+
+    admin.post("/api/system/purge")
+    events = admin.get("/api/operations/audit").json()
+    assert any(event["action"] == "POST /api/system/purge" for event in events)
+    assert "hunter2hunter" not in json.dumps(events)
+
+
+def test_incidents_can_be_acknowledged_and_resolved(admin):
+    incident = admin.app.state.hub.db.open_incident(
+        "test:device-a",
+        kind="test",
+        severity="warning",
+        source="device-a",
+        title="test incident",
+        detail="safe detail",
+    )
+
+    open_rows = admin.get("/api/operations/incidents").json()
+    assert [row["id"] for row in open_rows] == [incident["id"]]
+
+    acknowledged = admin.put(
+        f"/api/operations/incidents/{incident['id']}",
+        json={"status": "acknowledged"},
+    ).json()
+    assert acknowledged["status"] == "acknowledged"
+    assert acknowledged["acknowledged_at"] is not None
+
+    resolved = admin.put(
+        f"/api/operations/incidents/{incident['id']}",
+        json={"status": "resolved"},
+    ).json()
+    assert resolved["status"] == "resolved"
+    assert admin.get("/api/operations/incidents").json() == []
+    assert admin.get("/api/operations/incidents?status=all").json()[0]["id"] == incident["id"]
+
+
+def test_network_registration_incident_tracks_recovery(admin):
+    with _connect(admin) as ws:
+        _greet(ws)
+        ws.send_json({
+            "type": "status", "seq": 1, "device": "a", "online": True,
+            "registered": False, "ts": _minutes_ago(1),
+        })
+        ws.receive_json()
+        assert admin.get("/api/operations/incidents").json()[0]["kind"] == "network_unregistered"
+
+        ws.send_json({
+            "type": "status", "seq": 2, "device": "a", "online": True,
+            "registered": True, "ts": _minutes_ago(0),
+        })
+        ws.receive_json()
+
+    assert admin.get("/api/operations/incidents").json() == []
 
 
 # --------------------------------------------------------------------------

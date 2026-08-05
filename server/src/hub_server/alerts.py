@@ -62,6 +62,10 @@ class OfflineAlerter:
     def enabled(self) -> bool:
         return bool(self.db.get_setting(SETTING_ENABLED, True))
 
+    @property
+    def pending_count(self) -> int:
+        return len(self._pending)
+
     # -- the one entry point ----------------------------------------------
 
     def note(self, agent_id: str, device: str, online: bool) -> None:
@@ -91,6 +95,9 @@ class OfflineAlerter:
         pending = self._pending.pop(key, None)
         if pending is not None:
             pending.cancel()  # recovered inside the grace window — stay quiet
+        self.db.resolve_incident(
+            self._fingerprint(key), detail="设备已恢复在线"
+        )
         if key in self._alerted:
             self._alerted.discard(key)
             self._spawn(
@@ -111,6 +118,15 @@ class OfflineAlerter:
         if not self.enabled or self.db.device_online(*key):
             return
         self._alerted.add(key)
+        label = self._device_label(*key)
+        self.db.open_incident(
+            self._fingerprint(key),
+            kind="device_offline",
+            severity="critical",
+            source=f"{key[0]}/{key[1]}",
+            title=f"{label} 离线",
+            detail=f"超过 {self.grace:.0f} 秒未恢复",
+        )
         await self._deliver(
             key, title="模块掉线", tag="掉线", phrase="已离线", time_label="掉线时间"
         )
@@ -150,6 +166,10 @@ class OfflineAlerter:
             or (f"…{iccid[-4:]}" if iccid else "")
         )
         return f"{name}({device})" if name else device
+
+    @staticmethod
+    def _fingerprint(key: Key) -> str:
+        return f"device-offline:{key[0]}:{key[1]}"
 
     # -- task plumbing -----------------------------------------------------
 

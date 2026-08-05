@@ -2,7 +2,7 @@
 
 面向 Air780E AT 固件模块的多卡短信中枢。项目由本地 Agent、中心 Server 和 Web 管理界面组成，提供短信收发、通知转发、保号任务、设备监控与数据备份能力。
 
-当前状态：M0–M7 已完成；Agent 与 Server 共 278 项自动化测试通过。
+当前状态：M0–M7 已完成；Agent 与 Server 共 284 项自动化测试通过。公开发布基线的 CI、依赖/镜像扫描和部署自检已纳入仓库；许可证、发行方式和正式支持矩阵仍需在首个 Release 前由仓库所有者确认。
 
 > 本仓库中的域名、电话号码、IMEI、ICCID、Token 和消息内容均为示例值，不对应真实账户或设备。运行时配置、数据库、日志和凭据不得提交到版本库。
 
@@ -35,7 +35,10 @@
 - 信号、注册状态、运营商、存储与在线状态监控
 - 7 / 30 / 90 天短信趋势和信号历史曲线
 - 模块掉线告警、Web AT 调试台
+- 运维中心集中展示服务诊断、Agent 状态、磁盘占用、事件与管理审计
+- 模块离线、网络未注册和通知失败事件，可确认、解决并在恢复时自动关闭
 - 短信保留期、SQLite 快照备份与恢复
+- Agent Token 支持带有限宽限期的在线轮换
 - 响应式桌面和移动端界面
 
 ## 架构
@@ -69,6 +72,7 @@ Agent 主动连接 Server，因此连接模块的网络不需要公网 IP 或端
 
 - Web 管理端强制使用管理员密码和会话认证，不提供免密模式。
 - Agent 使用独立预共享 Token 连接 Server。
+- 管理员可在线轮换 Agent Token；宽限期只应用于上一个 Token，并应在期限内更新所有 Agent。
 - 公网部署必须使用 HTTPS / WSS，并由可信反向代理传递 WebSocket 升级头。
 - Server 数据目录包含短信、会话、Token 和推送渠道凭据，必须限制访问并定期备份。
 - Agent 配置包含连接 Token，建议权限设为 `0600`。
@@ -111,6 +115,8 @@ docker exec air780e-hub hub-server token
 ```
 
 浏览器打开部署地址并设置管理员密码。
+
+上线后运行 `python3 deploy/self_check.py`，可同时验证健康检查、WebSocket 反向代理和 Agent Token；完整命令见[部署指南](docs/deploy.md)。
 
 ### 2. 安装 Agent
 
@@ -164,6 +170,8 @@ npm run build
 ## 文档
 
 - [部署指南](docs/deploy.md)
+- [发布清单](docs/release.md)
+- [变更日志](CHANGELOG.md)
 - [通知渠道与规则](docs/notify.md)
 - [Agent / Server 协议](docs/protocol.md)
 - [AT 指令与硬件说明](docs/at-reference.md)

@@ -7,10 +7,29 @@
 FROM node:22-alpine AS frontend
 
 WORKDIR /build
-COPY frontend/package.json frontend/package-lock.json* ./
-RUN npm ci || npm install
+COPY frontend/package.json frontend/package-lock.json frontend/.npmrc ./
+RUN npm ci
 COPY frontend/ ./
 RUN npm run build
+
+
+# --- Python environment ------------------------------------------------------
+FROM python:3.12-slim AS python-build
+
+COPY --from=ghcr.io/astral-sh/uv:0.11.28 /uv /usr/local/bin/uv
+
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy
+
+WORKDIR /app
+
+COPY server/pyproject.toml server/uv.lock ./
+COPY server/src ./src
+
+# Include the SPA before packaging, then install exactly the versions in
+# uv.lock. The runtime receives this environment without a resolver or uv.
+COPY --from=frontend /build/dist ./src/hub_server/www
+RUN uv sync --frozen --no-dev --no-editable
 
 
 # --- runtime ----------------------------------------------------------------
@@ -18,26 +37,18 @@ FROM python:3.12-slim AS runtime
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    PIP_NO_CACHE_DIR=1 \
     HUB_DATA_DIR=/data \
-    HUB_PORT=8080
+    HUB_PORT=8080 \
+    PATH="/app/.venv/bin:$PATH"
 
 WORKDIR /app
 
-COPY server/pyproject.toml ./
-COPY server/src ./src
-
-# The built SPA ships inside the package, so one process on one port serves
-# both the API and the UI — that makes the whole deployment a single
-# reverse-proxy entry.  Copy it in before the install so it gets packaged.
-COPY --from=frontend /build/dist ./src/hub_server/www
-
-RUN pip install --no-cache-dir .
+COPY --from=python-build /app/.venv /app/.venv
 
 # Runs unprivileged; /data is the only writable path it needs.
 RUN useradd --system --uid 10001 --home /app hub \
     && mkdir -p /data \
-    && chown -R hub:hub /data /app
+    && chown hub:hub /data
 USER hub
 
 VOLUME ["/data"]

@@ -25,6 +25,7 @@ import SimIcon from '@mui/icons-material/SimCardOutlined'
 import TaskIcon from '@mui/icons-material/EventRepeatOutlined'
 import ConsoleIcon from '@mui/icons-material/TerminalOutlined'
 import NotifyIcon from '@mui/icons-material/NotificationsActiveOutlined'
+import OperationsIcon from '@mui/icons-material/MonitorHeartOutlined'
 import LogsIcon from '@mui/icons-material/ReceiptLongOutlined'
 import BackupIcon from '@mui/icons-material/BackupOutlined'
 import SettingsIcon from '@mui/icons-material/SettingsOutlined'
@@ -45,6 +46,7 @@ const NAV = [
   { to: '/tasks', label: '保号任务', icon: <TaskIcon /> },
   { to: '/console', label: 'AT 调试', icon: <ConsoleIcon /> },
   { to: '/notify', label: '通知', icon: <NotifyIcon /> },
+  { to: '/operations', label: '运维中心', icon: <OperationsIcon /> },
   { to: '/logs', label: '日志', icon: <LogsIcon /> },
   { to: '/backup', label: '备份恢复', icon: <BackupIcon /> },
   { to: '/settings', label: '设置', icon: <SettingsIcon /> },
@@ -106,17 +108,19 @@ export function Layout({ children, mode, onToggleMode, onLogout }: Props) {
   const location = useLocation()
   const [open, setOpen] = useState(false)
   const [unread, setUnread] = useState(0)
+  const [incidents, setIncidents] = useState(0)
 
   // The nav badge: cheap COUNT poll, same cadence as the dashboard refresh.
   useEffect(() => {
     let alive = true
     const refresh = () =>
-      api.messages
-        .unread()
-        .then((data) => {
-          if (alive) setUnread(data.total)
-        })
-        .catch(() => {})
+      Promise.allSettled([api.messages.unread(), api.operations.incidentCount()]).then(
+        ([unreadResult, incidentResult]) => {
+          if (!alive) return
+          if (unreadResult.status === 'fulfilled') setUnread(unreadResult.value.total)
+          if (incidentResult.status === 'fulfilled') setIncidents(incidentResult.value.total)
+        },
+      )
     void refresh()
     const timer = setInterval(refresh, 15_000)
     return () => {
@@ -172,8 +176,13 @@ export function Layout({ children, mode, onToggleMode, onLogout }: Props) {
                   }}
                 >
                   <ListItemIcon sx={{ minWidth: 36, color: 'text.secondary' }}>
-                    {item.to === '/messages' && unread > 0 ? (
-                      <Badge badgeContent={unread} color="error" max={99}>
+                    {(item.to === '/messages' && unread > 0) ||
+                    (item.to === '/operations' && incidents > 0) ? (
+                      <Badge
+                        badgeContent={item.to === '/messages' ? unread : incidents}
+                        color="error"
+                        max={99}
+                      >
                         {item.icon}
                       </Badge>
                     ) : (

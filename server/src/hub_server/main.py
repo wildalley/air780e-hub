@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -23,6 +24,59 @@ log = logging.getLogger(__name__)
 
 PURGE_INTERVAL = 6 * 3600
 FRONTEND_DIR = Path(__file__).parent / "www"
+
+
+class AuditMiddleware:
+    """Record admin mutations without buffering request or response bodies."""
+
+    def __init__(self, app, *, state: AppState) -> None:
+        self.app = app
+        self.state = state
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        method = scope["method"]
+        path = scope["path"]
+        should_audit = path.startswith("/api/") and method in {
+            "POST", "PUT", "PATCH", "DELETE",
+        }
+        if not should_audit:
+            await self.app(scope, receive, send)
+            return
+
+        started = time.monotonic()
+        status_code = 500
+
+        async def capture_status(message) -> None:
+            nonlocal status_code
+            if message["type"] == "http.response.start":
+                status_code = message["status"]
+            await send(message)
+
+        try:
+            await self.app(scope, receive, capture_status)
+        except Exception:
+            self._record(method, path, "error", "unhandled server error", scope)
+            raise
+        self._record(
+            method,
+            path,
+            "ok" if status_code < 400 else "rejected",
+            f"HTTP {status_code}; {time.monotonic() - started:.3f}s",
+            scope,
+        )
+
+    def _record(self, method, path, status, detail, scope) -> None:
+        client = scope.get("client")
+        self.state.db.record_audit(
+            f"{method} {path}",
+            status=status,
+            detail=detail,
+            client_ip=client[0] if client else "",
+        )
 
 
 async def _housekeeping(state: AppState) -> None:
@@ -70,6 +124,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         openapi_url=None,
     )
     app.state.hub = state
+
+    app.add_middleware(AuditMiddleware, state=state)
 
     router = build_router(state)
     app.include_router(router)

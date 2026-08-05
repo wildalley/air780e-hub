@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from .auth import Auth
 from .alerts import OfflineAlerter
@@ -23,6 +25,8 @@ class AppState:
     gateway: Gateway
     notifier: Notifier
     alerter: OfflineAlerter
+    started_at: str
+    started_monotonic: float
 
     @classmethod
     def build(cls, settings: Settings) -> "AppState":
@@ -47,6 +51,8 @@ class AppState:
         state = cls(
             settings=settings, db=db, auth=auth, gateway=gateway,
             notifier=notifier, alerter=alerter,
+            started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            started_monotonic=time.monotonic(),
         )
         log.info("data dir %s, timezone %s", settings.data_dir, settings.timezone)
         if not auth.is_configured:

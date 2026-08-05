@@ -54,18 +54,12 @@ export function DashboardPage() {
   const [statsDays, setStatsDays] = useState(30)
 
   const load = useCallback(async () => {
-    const data = await api.overview()
+    const [data, statusHistory] = await Promise.all([
+      api.overview(),
+      api.devices.histories(hours).catch(() => ({})),
+    ])
     setOverview(data)
-    const entries = await Promise.all(
-      data.devices.map(async (device) => {
-        try {
-          return [device.name, await api.devices.history(device.name, hours)] as const
-        } catch {
-          return [device.name, [] as StatusPoint[]] as const
-        }
-      }),
-    )
-    setHistory(Object.fromEntries(entries))
+    setHistory(statusHistory)
   }, [hours])
 
   useEffect(() => {

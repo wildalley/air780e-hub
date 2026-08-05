@@ -9,6 +9,10 @@ JSON over WebSocket。**连接方向始终是 agent 主动拨出**,Server 不向
 - 编码:每帧一个 JSON 对象,UTF-8
 - 心跳:WebSocket ping/pong,30 秒一次;90 秒无 pong 视为断开
 
+部署自检可连接 `/ws?self_check=1`,仍需提供相同的 Bearer Token。认证成功后
+Server 返回 `{"type":"self_check","ok":true}` 并正常关闭连接,且不会登记临时
+Agent 或修改业务数据。该参数只用于连通性检查,正式 Agent 不应携带。
+
 ---
 
 ## 1. 可靠性模型

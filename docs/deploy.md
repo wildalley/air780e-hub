@@ -58,6 +58,21 @@ docker exec air780e-hub hub-server token
 
 首次访问 Web 管理端时，系统会要求设置管理员密码。系统不提供免密模式。
 
+#### 轮换 Agent Token
+
+在 Web 管理端的“设置”页可以轮换 Agent Token，并为旧 Token 设置有限宽限期。
+推荐顺序如下：
+
+1. 选择足以更新全部 Agent 的最短宽限期并执行轮换；
+2. 将新 Token 写入每台 Agent 的仓库外配置，保持文件权限为 `0600`；
+3. 逐台重启 Agent，并在“运维中心”确认重新连接；
+4. 使用新 Token 运行部署自检；
+5. 宽限期结束后确认没有 Agent 离线，再安全销毁旧 Token 副本。
+
+系统只保留紧邻的上一个 Token；再次轮换会立即废止更早的 Token。若通过
+`HUB_AGENT_TOKEN` 环境变量提供 Token，Web 管理端不能在线轮换，应修改部署环境并
+重启 Server，同时协调更新所有 Agent。
+
 ### 1.4 反向代理
 
 生产环境必须使用 HTTPS。以下 Nginx 示例同时代理普通 HTTP 和 WebSocket：
@@ -101,6 +116,22 @@ server {
 curl --fail https://sms.example.com/healthz
 ```
 
+使用仓库自带的自检器验证完整入口。它读取 Token 后只在内存中使用，不会把
+Token 打印到输出，也不会创建临时 Agent 记录：
+
+```bash
+token_file=$(mktemp)
+trap 'rm -f "$token_file"' EXIT
+chmod 600 "$token_file"
+docker exec air780e-hub hub-server token >"$token_file"
+python3 deploy/self_check.py \
+  --url https://sms.example.com \
+  --token-file "$token_file"
+```
+
+检查器失败时会分别报告 `/healthz`、TLS/升级头和 Token 校验。局域网直连的
+明文临时验收可以使用 `--allow-http`，不应将该选项用于公网部署。
+
 WebSocket 握手检查（把占位符替换为本机安全保存的 Token，不要把真实值提交到文件）：
 
 ```bash
@@ -132,6 +163,16 @@ docker compose -f deploy/docker-compose.yml up -d --build
 - 停止容器后复制 volume 内容。
 
 备份包含短信正文、号码、会话和推送凭据，必须加密并限制访问。
+
+### 1.6 运维中心
+
+Web 管理端的“运维中心”每 15 秒刷新一次，集中展示 Server 运行时间、数据库与
+磁盘占用、Agent 连接状态、待处理命令、发送中的通知和离线观察计时器。
+
+系统会为模块离线、网络未注册和通知投递失败创建事件。管理员可以确认或解决
+事件；对应状态恢复时，系统会自动解决仍未关闭的事件。“管理审计”记录 API
+变更操作、结果、耗时和来源地址，但不会保存请求正文、短信内容或凭据。审计记录
+不能替代反向代理访问日志和主机级安全日志，生产环境仍应按既定保留策略集中保存。
 
 ## 2. 部署 Agent
 

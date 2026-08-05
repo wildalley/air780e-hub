@@ -460,6 +460,10 @@ class Notifier:
     async def aclose(self) -> None:
         await self.client.aclose()
 
+    @property
+    def inflight_count(self) -> int:
+        return len(self._inflight)
+
     # -- entry points ------------------------------------------------------
 
     async def on_message(self, message_id: int, frame: dict[str, Any]) -> None:
@@ -685,13 +689,36 @@ class Notifier:
         attempts: int,
         detail: str,
     ) -> None:
+        safe_detail = scrub(detail)
         self.db.execute(
             "INSERT INTO notify_logs "
             "(message_id, channel_id, rule_id, status, attempts, detail, ts) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (message_id, channel_id, rule_id, status, attempts,
-             scrub(detail), utcnow()),
+             safe_detail, utcnow()),
         )
+        fingerprint = (
+            f"notify-channel:{channel_id}" if channel_id is not None else "notify-queue"
+        )
+        if status == "failed":
+            channel = (
+                self.db.one("SELECT name FROM channels WHERE id = ?", (channel_id,))
+                if channel_id is not None
+                else None
+            )
+            label = (channel or {}).get("name") or (
+                f"渠道 {channel_id}" if channel_id is not None else "通知队列"
+            )
+            self.db.open_incident(
+                fingerprint,
+                kind="notification_failed",
+                severity="warning",
+                source=str(label),
+                title=f"{label} 投递失败",
+                detail=safe_detail or f"尝试 {attempts} 次后失败",
+            )
+        elif status == "ok":
+            self.db.resolve_incident(fingerprint, detail="通知投递已恢复")
 
     # -- context -----------------------------------------------------------
 

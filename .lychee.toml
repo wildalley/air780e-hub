@@ -1,0 +1,6 @@
+# Markdown checks in CI are intentionally offline and deterministic. External
+# documentation links are still visible to reviewers, but a provider outage
+# must not make an otherwise valid change unmergeable.
+offline = true
+exclude = ["^mailto:"]
+exclude_path = ["frontend/node_modules", "frontend/dist", "server/src/hub_server/www"]

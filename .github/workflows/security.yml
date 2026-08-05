@@ -1,0 +1,111 @@
+name: Security
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    - cron: "23 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  secret-scan:
+    name: Secret scan (full history)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Scan repository
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Review changed dependencies
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+
+  python-audit:
+    name: Python dependency audit (${{ matrix.project }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [agent, server]
+    defaults:
+      run:
+        working-directory: ${{ matrix.project }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: ${{ matrix.project }}/uv.lock
+      - name: Install locked dependencies
+        run: uv sync --frozen --extra dev
+      - name: Export locked runtime dependencies
+        run: >-
+          uv export --quiet --frozen --no-dev --no-emit-project
+          --format requirements-txt
+          --output-file "$RUNNER_TEMP/requirements.txt"
+      - name: Audit locked runtime dependencies
+        run: >-
+          uv run --frozen --extra dev --with pip-audit pip-audit
+          --strict --requirement "$RUNNER_TEMP/requirements.txt"
+
+  frontend-audit:
+    name: Frontend dependency audit
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install locked dependencies
+        run: npm ci
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
+
+  container-scan:
+    name: Container image scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Build image for scanning
+        run: docker build --tag air780e-hub:security -f server/Dockerfile .
+      - name: Scan image
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          image-ref: air780e-hub:security
+          format: table
+          exit-code: "1"
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH

@@ -292,6 +292,75 @@ export interface AgentLog {
   ts: string
 }
 
+export interface DiagnosticAgent {
+  id: string
+  version: string
+  connected: number
+  last_seen_at: string | null
+  last_seq: number
+  device_count: number
+}
+
+export interface Diagnostics {
+  server: {
+    version: string
+    python: string
+    started_at: string
+    uptime_seconds: number
+  }
+  runtime: {
+    agents_connected: number
+    pending_commands: number
+    notifications_inflight: number
+    offline_timers: number
+  }
+  storage: {
+    database_bytes: number
+    wal_bytes: number
+    disk_total_bytes: number
+    disk_free_bytes: number
+  }
+  counts: {
+    messages: number
+    status_samples: number
+    active_incidents: number
+    audit_events: number
+  }
+  agents: DiagnosticAgent[]
+}
+
+export interface Incident {
+  id: number
+  fingerprint: string
+  kind: string
+  severity: 'critical' | 'warning' | 'info'
+  source: string
+  title: string
+  detail: string
+  status: 'active' | 'acknowledged' | 'resolved'
+  occurrences: number
+  first_seen_at: string
+  last_seen_at: string
+  acknowledged_at: string | null
+  resolved_at: string | null
+}
+
+export interface AuditEvent {
+  id: number
+  ts: string
+  action: string
+  target: string
+  status: string
+  detail: string
+  client_ip: string
+}
+
+export interface AgentTokenInfo {
+  token: string
+  rotatable: boolean
+  previous_valid_until: string | null
+}
+
 /** A rule hit as the debugger shows it — rendered, not just matched. */
 export interface RulePreview {
   rule_id: number
@@ -326,6 +395,8 @@ export const api = {
   overview: () => get<Overview>('/api/overview'),
   devices: {
     list: () => get<Device[]>('/api/devices'),
+    histories: (hours: number) =>
+      get<Record<string, StatusPoint[]>>(`/api/devices/history?hours=${hours}`),
     history: (name: string, hours: number) =>
       get<StatusPoint[]>(`/api/devices/${encodeURIComponent(name)}/history?hours=${hours}`),
     refresh: (name: string) =>
@@ -359,7 +430,7 @@ export const api = {
       post<{ ok: boolean; marked: number }>('/api/messages/read', { sim_id, peer }),
     /** Total unread across all conversations (nav badge). */
     unread: () => get<{ total: number }>('/api/messages/unread'),
-    /** Download every stored message as CSV. */
+    /** Download stored messages as a streamed CSV. */
     exportCsv: () => downloadFile('/api/messages/export', 'messages.csv'),
   },
   at: (device: string, command: string) =>
@@ -398,8 +469,22 @@ export const api = {
     update: (body: NotifySettings) => put<NotifySettings>('/api/notify-settings', body),
   },
   logs: () => get<AgentLog[]>('/api/logs'),
+  operations: {
+    diagnostics: () => get<Diagnostics>('/api/operations/diagnostics'),
+    audit: () => get<AuditEvent[]>('/api/operations/audit'),
+    incidents: (status: 'open' | 'all' = 'open') =>
+      get<Incident[]>(`/api/operations/incidents?status=${status}`),
+    incidentCount: () => get<{ total: number }>('/api/operations/incidents/count'),
+    setIncidentStatus: (id: number, status: Incident['status']) =>
+      put<Incident>(`/api/operations/incidents/${id}`, { status }),
+  },
   system: {
-    agentToken: () => get<{ token: string }>('/api/system/agent-token'),
+    agentToken: () => get<AgentTokenInfo>('/api/system/agent-token'),
+    rotateAgentToken: (grace_minutes: number) =>
+      post<Pick<AgentTokenInfo, 'token' | 'previous_valid_until'>>(
+        '/api/system/agent-token/rotate',
+        { grace_minutes },
+      ),
     purge: () => post<Record<string, number>>('/api/system/purge'),
     /** Download a full SQLite snapshot; browser saves it under the server's name. */
     backup: () => downloadFile('/api/system/backup', 'hub-backup.db'),

@@ -32,6 +32,7 @@ class Settings:
     # Shared secret the agent presents on /ws.  Generated on first start if
     # unset, and written next to the database so it survives restarts.
     agent_token: str = ""
+    agent_token_from_env: bool = False
 
     session_ttl_hours: int = 24 * 14
     # Default SMS retention, in days; 0 disables deletion.  The operator can
@@ -64,11 +65,13 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
+        configured_token = os.environ.get("HUB_AGENT_TOKEN", "").strip()
         settings = cls(
             data_dir=Path(os.environ.get("HUB_DATA_DIR", "/data")),
             host=os.environ.get("HUB_HOST", "0.0.0.0"),
             port=int(os.environ.get("HUB_PORT", "8080")),
-            agent_token=os.environ.get("HUB_AGENT_TOKEN", "").strip(),
+            agent_token=configured_token,
+            agent_token_from_env=bool(configured_token),
             session_ttl_hours=int(os.environ.get("HUB_SESSION_TTL_HOURS", 24 * 14)),
             message_retention_days=int(
                 os.environ.get("HUB_MESSAGE_RETENTION_DAYS", "90")
@@ -101,3 +104,22 @@ class Settings:
         self.token_path.write_text(self.agent_token + "\n")
         self.token_path.chmod(0o600)
         return self.agent_token
+
+    def replace_agent_token(self, token: str) -> None:
+        """Persist a generated replacement without a partially written file."""
+        if self.agent_token_from_env:
+            raise ConfigError(
+                "HUB_AGENT_TOKEN controls this deployment; rotate it in the "
+                "deployment environment and restart the server"
+            )
+        temporary = self.token_path.with_name(f".{self.token_path.name}.tmp")
+        try:
+            temporary.write_text(token + "\n", encoding="utf-8")
+            temporary.chmod(0o600)
+            temporary.replace(self.token_path)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+        self.agent_token = token
