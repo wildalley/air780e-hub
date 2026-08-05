@@ -287,15 +287,22 @@ class Gateway:
             seq=frame.get("seq"),
             error=frame.get("error"),
         )
-        if frame.get("status") == "failed":
+        # Aggregate per module, not per message: a fingerprint carrying
+        # message_id could never recover, so every failed send would leave a
+        # permanently active incident behind.
+        fingerprint = f"sms-send:{agent_id}:{frame.get('device', '')}"
+        status = frame.get("status")
+        if status == "failed":
             self.db.open_incident(
-                f"sms-send:{message_id}",
+                fingerprint,
                 kind="sms_send_failed",
                 severity="warning",
                 source=f"{agent_id}/{frame.get('device', '')}",
                 title="短信发送失败",
                 detail=str(frame.get("error") or "运营商或模块未返回成功状态"),
             )
+        elif status in {"sent", "delivered"}:
+            self.db.resolve_incident(fingerprint, detail="短信发送已恢复")
 
     def _apply_status(self, agent_id: str, frame: dict[str, Any]) -> None:
         payload = dict(frame)
@@ -306,9 +313,21 @@ class Gateway:
         # only on the ones that state it, so the alerter sees real edges.
         if "online" in frame:
             self._note_device(agent_id, frame.get("device", ""), bool(frame.get("online")))
-        if "registered" in frame:
+        if "registered" in frame or frame.get("online") is False:
             fingerprint = f"network-registration:{agent_id}:{frame.get('device', '')}"
-            if frame.get("online") is not False and not frame.get("registered"):
+            if frame.get("online") is False:
+                # An offline module can neither register nor send.  Leaving
+                # these open would strand extra incidents next to the offline
+                # one and keep the nav badge lit after the real problem is
+                # acknowledged; device_offline already covers this state.
+                self.db.resolve_incident(
+                    fingerprint, detail="模块已离线，注册状态由掉线事件跟踪"
+                )
+                self.db.resolve_incident(
+                    f"sms-send:{agent_id}:{frame.get('device', '')}",
+                    detail="模块已离线，发送状态由掉线事件跟踪",
+                )
+            elif not frame.get("registered"):
                 self.db.open_incident(
                     fingerprint,
                     kind="network_unregistered",
@@ -317,7 +336,7 @@ class Gateway:
                     title="模块未注册到移动网络",
                     detail="模块在线，但当前未注册到运营商网络",
                 )
-            elif frame.get("registered"):
+            else:
                 self.db.resolve_incident(fingerprint, detail="移动网络注册已恢复")
 
     def _apply_log(self, agent_id: str, frame: dict[str, Any]) -> None:

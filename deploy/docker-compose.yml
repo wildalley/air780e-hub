@@ -28,6 +28,14 @@ services:
       # with: docker exec air780e-hub hub-server token
       HUB_MESSAGE_RETENTION_DAYS: "${HUB_MESSAGE_RETENTION_DAYS:-90}"
       HUB_STATUS_RETENTION_DAYS: "${HUB_STATUS_RETENTION_DAYS:-30}"
+      # Agent, task and notification logs.  None of these follows message
+      # retention, so each needs a horizon of its own; 0 keeps them forever.
+      HUB_LOG_RETENTION_DAYS: "${HUB_LOG_RETENTION_DAYS:-30}"
+      HUB_AUDIT_RETENTION_DAYS: "${HUB_AUDIT_RETENTION_DAYS:-180}"
+      # Applies to resolved incidents only; an open one is kept until it closes.
+      HUB_INCIDENT_RETENTION_DAYS: "${HUB_INCIDENT_RETENTION_DAYS:-90}"
+      # Ceiling on audit rows, enforced after the age cutoff.
+      HUB_AUDIT_MAX_ROWS: "${HUB_AUDIT_MAX_ROWS:-200000}"
       HUB_BEHIND_PROXY: "${HUB_BEHIND_PROXY:-true}"
 
     healthcheck:

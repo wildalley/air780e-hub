@@ -236,6 +236,14 @@ CREATE TABLE IF NOT EXISTS incidents (
 );
 CREATE INDEX IF NOT EXISTS idx_incidents_status_seen
     ON incidents(status, last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_incidents_resolved_at
+    ON incidents(resolved_at);
+
+-- The log tables are read newest-first and pruned oldest-first; both the API
+-- queries and retention rely on these.
+CREATE INDEX IF NOT EXISTS idx_agent_logs_ts ON agent_logs(ts);
+CREATE INDEX IF NOT EXISTS idx_task_logs_ts ON task_logs(ts);
+CREATE INDEX IF NOT EXISTS idx_notify_logs_ts ON notify_logs(ts);
 """
 
 
@@ -661,9 +669,28 @@ class Database:
 
     # -- retention ---------------------------------------------------------
 
-    def purge(self, *, message_days: int, status_days: int) -> dict[str, int]:
-        """Delete aged rows.  Verification codes should not live forever."""
-        removed = {"messages": 0, "status": 0, "ingested": 0}
+    def purge(
+        self,
+        *,
+        message_days: int,
+        status_days: int,
+        log_days: int = 0,
+        audit_days: int = 0,
+        incident_days: int = 0,
+        audit_max_rows: int = 0,
+    ) -> dict[str, int]:
+        """Delete aged rows.  Verification codes should not live forever.
+
+        Every append-only table needs a horizon of its own.  Only notify_logs
+        tied to a message disappear with it (ON DELETE CASCADE); rows from task
+        receipts and channel tests carry no message_id and would otherwise
+        outlive every other trace of the event.
+        """
+        removed = {
+            "messages": 0, "status": 0, "ingested": 0,
+            "agent_logs": 0, "task_logs": 0, "notify_logs": 0,
+            "audit_events": 0, "incidents": 0,
+        }
         if message_days > 0:
             cutoff = (
                 datetime.now(timezone.utc) - timedelta(days=message_days)
@@ -677,6 +704,44 @@ class Database:
             ).isoformat()
             removed["status"] = self.execute(
                 "DELETE FROM device_status WHERE ts < ?", (cutoff,)
+            ).rowcount
+        if log_days > 0:
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(days=log_days)
+            ).isoformat()
+            for table in ("agent_logs", "task_logs", "notify_logs"):
+                removed[table] = self.execute(
+                    f"DELETE FROM {table} WHERE ts < ?", (cutoff,)
+                ).rowcount
+        if audit_days > 0:
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(days=audit_days)
+            ).isoformat()
+            removed["audit_events"] = self.execute(
+                "DELETE FROM audit_events WHERE ts < ?", (cutoff,)
+            ).rowcount
+        if audit_max_rows > 0:
+            # Keep the newest rows.  id is monotonic, so the cutoff id is the
+            # one audit_max_rows back from the newest.
+            row = self.one(
+                "SELECT id FROM audit_events ORDER BY id DESC LIMIT 1 OFFSET ?",
+                (audit_max_rows - 1,),
+            )
+            if row is not None:
+                removed["audit_events"] += self.execute(
+                    "DELETE FROM audit_events WHERE id < ?", (row["id"],)
+                ).rowcount
+        if incident_days > 0:
+            # Only closed incidents age out; an unresolved one stays until it
+            # recovers or an admin acts on it, however old it is.
+            cutoff = (
+                datetime.now(timezone.utc) - timedelta(days=incident_days)
+            ).isoformat()
+            removed["incidents"] = self.execute(
+                "DELETE FROM incidents "
+                "WHERE status = 'resolved' AND resolved_at IS NOT NULL "
+                "AND resolved_at < ?",
+                (cutoff,),
             ).rowcount
         # Idempotency records only need to outlive a plausible replay window.
         cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()

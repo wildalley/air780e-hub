@@ -797,6 +797,34 @@ def test_agent_token_rotation_supports_a_bounded_grace_period(admin):
     assert not state.gateway.authenticate("Bearer test-token")
 
 
+def test_agent_token_file_is_never_briefly_world_readable(tmp_path):
+    """The token is a bearer credential, so it must be born private.
+
+    Creating the file and then chmod-ing it leaves a window in which any local
+    user can read it; under a 0022 umask that window is real.
+    """
+    import os
+
+    previous = os.umask(0o022)  # the permissive umask that made the window real
+    try:
+        settings = Settings(data_dir=tmp_path)
+        settings.data_dir.mkdir(parents=True, exist_ok=True)
+        settings.ensure_agent_token()
+
+        assert settings.token_path.stat().st_mode & 0o777 == 0o600
+
+        # A rewrite tightens a file that was already loose, and truncates
+        # rather than leaving a longer previous token's tail behind.
+        settings.token_path.chmod(0o644)
+        settings.replace_agent_token("L" * 80)
+        settings.replace_agent_token("short-token")
+        assert settings.token_path.stat().st_mode & 0o777 == 0o600
+        assert settings.token_path.read_text() == "short-token\n"
+        assert list(tmp_path.glob(".agent_token*")) == []
+    finally:
+        os.umask(previous)
+
+
 def test_environment_controlled_agent_token_cannot_rotate_online(admin):
     admin.app.state.hub.settings.agent_token_from_env = True
     response = admin.post(
@@ -866,6 +894,183 @@ def test_network_registration_incident_tracks_recovery(admin):
         ws.receive_json()
 
     assert admin.get("/api/operations/incidents").json() == []
+
+
+def test_failed_sends_aggregate_per_module_and_recover(admin):
+    """A failed send must not leave an incident nothing can ever close.
+
+    Fingerprinting on message_id opened a fresh permanently-active incident per
+    failure, so a card with no balance would light the nav badge forever and an
+    admin could only clear it by hand, one row at a time.
+    """
+    with _connect(admin) as ws:
+        _greet(ws)
+        for seq in (1, 2, 3):
+            ws.send_json({
+                "type": "sms_out", "seq": seq, "device": "a",
+                "peer": "10086", "body": f"attempt {seq}", "status": "failed",
+                "error": "CMS ERROR 500", "ts": _minutes_ago(3 - seq),
+            })
+            ws.receive_json()
+
+        open_rows = admin.get("/api/operations/incidents").json()
+        assert len(open_rows) == 1
+        assert open_rows[0]["kind"] == "sms_send_failed"
+        assert open_rows[0]["occurrences"] == 3
+
+        ws.send_json({
+            "type": "sms_out", "seq": 4, "device": "a", "peer": "10086",
+            "body": "finally", "status": "sent", "ts": _minutes_ago(0),
+        })
+        ws.receive_json()
+
+    assert admin.get("/api/operations/incidents").json() == []
+
+
+def test_going_offline_closes_the_module_specific_incidents(admin):
+    """device_offline already speaks for a module that is gone.
+
+    An unregistered or failing module that then drops off would otherwise strand
+    its incidents: neither can recover while the module is offline.
+    """
+    with _connect(admin) as ws:
+        _greet(ws)
+        ws.send_json({
+            "type": "status", "seq": 1, "device": "a", "online": True,
+            "registered": False, "ts": _minutes_ago(2),
+        })
+        ws.receive_json()
+        ws.send_json({
+            "type": "sms_out", "seq": 2, "device": "a", "peer": "10086",
+            "body": "x", "status": "failed", "ts": _minutes_ago(2),
+        })
+        ws.receive_json()
+        assert len(admin.get("/api/operations/incidents").json()) == 2
+
+        # A real offline notification need not restate registration at all —
+        # the module is gone, so there is nothing to report about it.
+        ws.send_json({
+            "type": "status", "seq": 3, "device": "a", "online": False,
+            "ts": _minutes_ago(0),
+        })
+        ws.receive_json()
+
+    kinds = {row["kind"] for row in admin.get("/api/operations/incidents").json()}
+    assert "network_unregistered" not in kinds
+    assert "sms_send_failed" not in kinds
+
+
+# --------------------------------------------------------------------------
+# operational retention
+# --------------------------------------------------------------------------
+
+
+def test_unmatched_api_paths_are_not_audited(admin):
+    """The audit middleware runs ahead of authentication.
+
+    Without this, anyone who can reach the port could append a row per request
+    by spraying invented paths, and the table has no natural ceiling.
+    """
+    db = admin.app.state.hub.db
+    before = db.one("SELECT COUNT(*) AS n FROM audit_events")["n"]
+
+    for index in range(20):
+        admin.post(f"/api/not-a-route-{index}", json={})
+        admin.put(f"/api/nope/{index}", json={})
+        admin.delete(f"/api/nothing/{index}")
+
+    assert db.one("SELECT COUNT(*) AS n FROM audit_events")["n"] == before
+
+    # A real route still records, including when it rejects: a failed login is
+    # exactly what an audit trail is for.
+    admin.post("/api/auth/login", json={"password": "wrong-password"})
+    rows = db.query("SELECT action, status FROM audit_events ORDER BY id DESC LIMIT 1")
+    assert rows[0]["action"] == "POST /api/auth/login"
+    assert rows[0]["status"] == "rejected"
+
+    # So does a real route that answers 404.
+    admin.put("/api/operations/incidents/999999", json={"status": "resolved"})
+    rows = db.query("SELECT action, status FROM audit_events ORDER BY id DESC LIMIT 1")
+    assert rows[0]["action"] == "PUT /api/operations/incidents/999999"
+    assert rows[0]["status"] == "rejected"
+
+
+def test_purge_bounds_every_append_only_table(admin):
+    """Each operational table needs a horizon of its own.
+
+    Only notify_logs rows tied to a message follow it out via ON DELETE
+    CASCADE; task receipts and channel tests carry no message_id, and
+    agent_logs, task_logs, audit_events and closed incidents were unbounded.
+    """
+    db = admin.app.state.hub.db
+    old = _minutes_ago(400 * 24 * 60)
+
+    db.execute(
+        "INSERT INTO agent_logs (agent_id, device, level, message, ts) "
+        "VALUES ('a', 'a', 'warning', 'ancient', ?)", (old,),
+    )
+    db.execute(
+        "INSERT INTO task_logs (task_id, ts, status) VALUES (NULL, ?, 'ok')", (old,)
+    )
+    # message_id NULL: a task receipt or channel test, with nothing to cascade
+    # from.
+    db.execute(
+        "INSERT INTO notify_logs (message_id, status, attempts, detail, ts) "
+        "VALUES (NULL, 'ok', 1, '', ?)", (old,),
+    )
+    db.execute("INSERT INTO audit_events (ts, action) VALUES (?, 'ancient')", (old,))
+
+    db.open_incident("closed", kind="test", severity="warning", source="s",
+                     title="closed long ago")
+    db.resolve_incident("closed", detail="done")
+    db.execute("UPDATE incidents SET resolved_at = ? WHERE fingerprint = 'closed'", (old,))
+    db.open_incident("still-open", kind="test", severity="critical", source="s",
+                     title="unresolved and old")
+    db.execute(
+        "UPDATE incidents SET first_seen_at = ?, last_seen_at = ? "
+        "WHERE fingerprint = 'still-open'", (old, old),
+    )
+
+    removed = db.purge(
+        message_days=90, status_days=30, log_days=30,
+        audit_days=180, incident_days=90,
+    )
+    assert removed["agent_logs"] == 1
+    assert removed["task_logs"] == 1
+    assert removed["notify_logs"] == 1
+    assert removed["audit_events"] == 1
+    assert removed["incidents"] == 1
+
+    # An unresolved incident stays however old it is — it is still the truth
+    # about the system.
+    assert db.one(
+        "SELECT status FROM incidents WHERE fingerprint = 'still-open'"
+    )["status"] == "active"
+
+
+def test_audit_row_cap_keeps_the_newest_rows(admin):
+    """Age alone cannot bound a table an unauthenticated caller can append to."""
+    db = admin.app.state.hub.db
+    db.execute("DELETE FROM audit_events")
+    for index in range(50):
+        db.record_audit(f"POST /api/thing/{index}", status="ok")
+
+    removed = db.purge(message_days=0, status_days=0, audit_max_rows=10)
+
+    assert removed["audit_events"] == 40
+    remaining = db.query("SELECT action FROM audit_events ORDER BY id")
+    assert len(remaining) == 10
+    assert remaining[-1]["action"] == "POST /api/thing/49"
+    assert remaining[0]["action"] == "POST /api/thing/40"
+
+
+def test_purge_endpoint_reports_every_table(admin):
+    body = admin.post("/api/system/purge").json()
+    for table in (
+        "messages", "status", "ingested", "agent_logs", "task_logs",
+        "notify_logs", "audit_events", "incidents",
+    ):
+        assert table in body
 
 
 # --------------------------------------------------------------------------

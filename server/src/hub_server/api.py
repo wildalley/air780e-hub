@@ -807,6 +807,10 @@ def build_router(state: AppState) -> APIRouter:
         return state.db.purge(
             message_days=state.message_retention_days,
             status_days=state.settings.status_retention_days,
+            log_days=state.settings.log_retention_days,
+            audit_days=state.settings.audit_retention_days,
+            incident_days=state.settings.incident_retention_days,
+            audit_max_rows=state.settings.audit_max_rows,
         )
 
     @router.get("/system/backup", dependencies=guard)

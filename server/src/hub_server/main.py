@@ -61,6 +61,18 @@ class AuditMiddleware:
         except Exception:
             self._record(method, path, "error", "unhandled server error", scope)
             raise
+
+        # This middleware sits ahead of authentication, so anyone who can reach
+        # the port can append rows.  The router records the matched route in
+        # this same scope dict, and an unknown /api path is absorbed by the SPA
+        # catch-all ("/{path:path}") rather than a route of its own — so
+        # spraying invented paths leaves no trace, while a rejected call on a
+        # real route (a failed login above all) is still recorded.  Retention
+        # and the row cap bound what remains.
+        matched = getattr(scope.get("route"), "path", "")
+        if not matched.startswith("/api/"):
+            return
+
         self._record(
             method,
             path,
@@ -87,6 +99,10 @@ async def _housekeeping(state: AppState) -> None:
             removed = state.db.purge(
                 message_days=state.message_retention_days,
                 status_days=state.settings.status_retention_days,
+                log_days=state.settings.log_retention_days,
+                audit_days=state.settings.audit_retention_days,
+                incident_days=state.settings.incident_retention_days,
+                audit_max_rows=state.settings.audit_max_rows,
             )
             state.auth.purge_expired_sessions()
             if any(removed.values()):

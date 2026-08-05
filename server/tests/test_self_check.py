@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import os
 import socket
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -78,6 +81,38 @@ def test_self_check_reports_bad_token_without_printing_it(
     output = capsys.readouterr()
     assert "code 4001" in output.err
     assert "wrong-token" not in output.out + output.err
+
+
+def test_self_check_lines_stay_in_order_when_piped(live_server, monkeypatch):
+    """Run it as a real process: capsys cannot show this failure.
+
+    Failures go to stderr so a wrapper can filter them, but a piped stdout is
+    block buffered while stderr is not.  Without flushing stdout first, an
+    operator reading the log sees [FAIL] above the [PASS] lines that preceded
+    it and mistakes which check broke.
+    """
+    url, _ = live_server
+    environment = dict(os.environ)
+    environment["HUB_AGENT_TOKEN"] = "wrong-token"
+    environment["HUB_BIND_ADDRESS"] = "127.0.0.1"
+
+    # Both streams into one pipe, which is what a log file or `2>&1` gives and
+    # the only way the ordering is observable.
+    completed = subprocess.run(
+        [sys.executable, str(SCRIPT), "--url", url, "--allow-http"],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, env=environment, timeout=60,
+    )
+
+    assert completed.returncode == 1
+    assert [
+        line for line in completed.stdout.splitlines() if line.startswith("[")
+    ] == [
+        "[PASS] deployment environment",
+        "[PASS] health endpoint (agents_connected=0)",
+        "[FAIL] WebSocket: WebSocket closed with code 4001: bad token",
+    ]
+    assert "wrong-token" not in completed.stdout
 
 
 def test_self_check_requires_https_unless_explicitly_allowed():

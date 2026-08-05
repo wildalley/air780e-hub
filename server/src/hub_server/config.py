@@ -23,6 +23,26 @@ def _bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _write_private(path: Path, text: str) -> None:
+    """Create *path* already private, then write it.
+
+    Opening with mode 0o600 rather than chmod-ing afterwards matters: the token
+    is a bearer credential, and a write-then-chmod leaves a window in which any
+    local user can read it.  O_TRUNC keeps a rewrite from leaving a longer
+    previous token's tail behind.
+    """
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        handle = os.fdopen(descriptor, "w", encoding="utf-8")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    with handle:  # fdopen owns the descriptor from here on
+        handle.write(text)
+    # An existing file keeps its old mode through O_CREAT, so state it.
+    os.chmod(path, 0o600)
+
+
 @dataclass
 class Settings:
     data_dir: Path = Path("/data")
@@ -40,6 +60,16 @@ class Settings:
     # effective value (see AppState.message_retention_days).
     message_retention_days: int = 90
     status_retention_days: int = 30
+    # Operational bookkeeping.  These tables are append-only and none of them
+    # is bounded by message retention, so each needs its own horizon; 0
+    # disables deletion for that table.
+    log_retention_days: int = 30
+    audit_retention_days: int = 180
+    incident_retention_days: int = 90
+    # A hard ceiling on audit rows, enforced after the age cutoff.  The audit
+    # middleware runs ahead of authentication, so an unauthenticated caller can
+    # append rows; age alone would not bound the table inside the horizon.
+    audit_max_rows: int = 200_000
 
     # Push retries *per channel*, on top of the first attempt.  A phone that
     # missed a verification code is the failure mode worth spending time on.
@@ -79,6 +109,14 @@ class Settings:
             status_retention_days=int(
                 os.environ.get("HUB_STATUS_RETENTION_DAYS", "30")
             ),
+            log_retention_days=int(os.environ.get("HUB_LOG_RETENTION_DAYS", "30")),
+            audit_retention_days=int(
+                os.environ.get("HUB_AUDIT_RETENTION_DAYS", "180")
+            ),
+            incident_retention_days=int(
+                os.environ.get("HUB_INCIDENT_RETENTION_DAYS", "90")
+            ),
+            audit_max_rows=int(os.environ.get("HUB_AUDIT_MAX_ROWS", "200000")),
             notify_retries=int(os.environ.get("HUB_NOTIFY_RETRIES", "2")),
             notify_timeout=float(os.environ.get("HUB_NOTIFY_TIMEOUT", "10")),
             offline_alert_grace=float(
@@ -101,8 +139,7 @@ class Settings:
                 return self.agent_token
 
         self.agent_token = secrets.token_urlsafe(32)
-        self.token_path.write_text(self.agent_token + "\n")
-        self.token_path.chmod(0o600)
+        _write_private(self.token_path, self.agent_token + "\n")
         return self.agent_token
 
     def replace_agent_token(self, token: str) -> None:
@@ -114,12 +151,11 @@ class Settings:
             )
         temporary = self.token_path.with_name(f".{self.token_path.name}.tmp")
         try:
-            temporary.write_text(token + "\n", encoding="utf-8")
-            temporary.chmod(0o600)
+            _write_private(temporary, token + "\n")
             temporary.replace(self.token_path)
-        finally:
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
+        except BaseException:
+            # replace() either happened or it did not; only a failure can leave
+            # the temporary file behind.
+            temporary.unlink(missing_ok=True)
+            raise
         self.agent_token = token

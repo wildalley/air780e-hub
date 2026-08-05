@@ -344,10 +344,23 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _report(line: str, *, failure: bool = False) -> None:
+    """Emit one result line, keeping stdout and stderr in true order.
+
+    Failures stay on stderr so a wrapper can filter them, but stdout is block
+    buffered when piped while stderr is not — without flushing first, a piped
+    run shows every [FAIL] ahead of the [PASS] lines that came before it.
+    """
+    sys.stdout.flush()
+    stream = sys.stderr if failure else sys.stdout
+    print(line, file=stream)
+    stream.flush()
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.timeout <= 0:
-        print("[FAIL] --timeout must be greater than zero", file=sys.stderr)
+        _report("[FAIL] --timeout must be greater than zero", failure=True)
         return 2
 
     try:
@@ -357,30 +370,30 @@ def main(argv: list[str] | None = None) -> int:
             os.environ, using_https=base_url.startswith("https://")
         )
     except CheckError as exc:
-        print(f"[FAIL] configuration: {exc}", file=sys.stderr)
+        _report(f"[FAIL] configuration: {exc}", failure=True)
         return 2
 
-    print("[PASS] deployment environment")
+    _report("[PASS] deployment environment")
     for warning in warnings:
-        print(f"[WARN] {warning}")
+        _report(f"[WARN] {warning}")
 
     failures = 0
     try:
         health = check_health(base_url, timeout=args.timeout)
-        print(
+        _report(
             "[PASS] health endpoint "
             f"(agents_connected={health.get('agents_connected', 'unknown')})"
         )
     except CheckError as exc:
         failures += 1
-        print(f"[FAIL] health endpoint: {exc}", file=sys.stderr)
+        _report(f"[FAIL] health endpoint: {exc}", failure=True)
 
     try:
         check_websocket(base_url, token, timeout=args.timeout)
-        print("[PASS] WebSocket upgrade, proxy headers and Agent Token")
+        _report("[PASS] WebSocket upgrade, proxy headers and Agent Token")
     except CheckError as exc:
         failures += 1
-        print(f"[FAIL] WebSocket: {exc}", file=sys.stderr)
+        _report(f"[FAIL] WebSocket: {exc}", failure=True)
 
     return 1 if failures else 0
 

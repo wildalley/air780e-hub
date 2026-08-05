@@ -198,7 +198,7 @@ export function SettingsPage({ onPasswordChanged }: { onPasswordChanged: () => v
           title={<Typography variant="h3">数据清理</Typography>}
           subheader={
             <Typography variant="caption" color="text.secondary">
-              按保留期删除过期短信与状态采样。保留期在容器环境变量里设置。
+              按保留期删除过期短信、状态采样、日志、审计与已解决事件。保留期在容器环境变量里设置。
             </Typography>
           }
         />
@@ -215,7 +215,9 @@ export function SettingsPage({ onPasswordChanged }: { onPasswordChanged: () => v
             </Button>
             {purged && (
               <Typography variant="body2" color="text.secondary">
-                删除:短信 {purged.messages ?? 0} 条,状态采样 {purged.status ?? 0} 条
+                删除:短信 {purged.messages ?? 0} 条,状态采样 {purged.status ?? 0} 条,日志{' '}
+                {(purged.agent_logs ?? 0) + (purged.task_logs ?? 0) + (purged.notify_logs ?? 0)} 条,
+                审计 {purged.audit_events ?? 0} 条,已解决事件 {purged.incidents ?? 0} 条
               </Typography>
             )}
           </Stack>
