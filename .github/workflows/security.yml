@@ -102,7 +102,7 @@ jobs:
       - name: Build image for scanning
         run: docker build --tag air780e-hub:security -f server/Dockerfile .
       - name: Scan image
-        uses: aquasecurity/trivy-action@v0.30.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: air780e-hub:security
           format: table
