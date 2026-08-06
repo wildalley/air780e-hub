@@ -210,6 +210,23 @@ def _parse_udh(udh: bytes) -> Concat | None:
     return None
 
 
+def _decode_ucs2(payload: bytes) -> str:
+    """UTF-16 with byte order taken from a leading BOM when one is present.
+
+    Nearly every network sends UCS-2 big-endian with no BOM, which is the
+    default here.  A few prepend U+FEFF, and a rare sender emits little-endian
+    marked by the byte-swapped U+FFFE; honouring both costs nothing and avoids
+    turning a whole message into CJK mojibake when a sender does the unusual
+    thing.  This is *not* a fix for GSM 7-bit content mislabelled as UCS-2 by a
+    bad TP-DCS — no byte-order choice recovers that; see ``alphabet_from_dcs``.
+    """
+    if payload[:2] == b"\xfe\xff":
+        return payload[2:].decode("utf-16-be", errors="replace")
+    if payload[:2] == b"\xff\xfe":
+        return payload[2:].decode("utf-16-le", errors="replace")
+    return payload.decode("utf-16-be", errors="replace")
+
+
 def _decode_user_data(
     body: bytes, udl: int, dcs: int, has_udh: bool
 ) -> tuple[str, Concat | None, str]:
@@ -232,7 +249,7 @@ def _decode_user_data(
         text = gsm7.decode(septets)
     elif alphabet == "ucs2":
         payload = body[udh_octets:udl] if udl <= len(body) else body[udh_octets:]
-        text = payload.decode("utf-16-be", errors="replace")
+        text = _decode_ucs2(payload)
     else:
         payload = body[udh_octets:udl] if udl <= len(body) else body[udh_octets:]
         text = payload.decode("latin-1", errors="replace")

@@ -33,7 +33,17 @@ SmsCallback = Callable[[DecodedSms], None | Awaitable[None]]
 # survives the agent being restarted mid-delivery.
 CNMI_STORE_AND_NOTIFY = "AT+CNMI=2,1,0,0,0"
 
+# Ask the module to *push* a URC whenever registration changes, so a SIM that
+# drops off and comes back updates `registered` without waiting for the next
+# status poll.  Mode 1 reports the bare stat; mode 2 adds location/act fields.
+# We use 1 for the widest module support — `_on_registration` copes with both.
+CREG_ENABLE = "AT+CREG=1"   # circuit-switched / 2G
+CEREG_ENABLE = "AT+CEREG=1"  # EPS / LTE
+
 SEND_TIMEOUT = 60.0
+
+# States that mean "attached to the network": 1 = home, 5 = roaming.
+REGISTERED_STATES = ("1", "5")
 
 
 def _tpdu_octets(pdu: str) -> int | None:
@@ -151,6 +161,16 @@ class Air780E:
 
         await self.client.execute(CNMI_STORE_AND_NOTIFY)
 
+        # Turn on unsolicited registration reporting.  Not every module
+        # implements both domains, and a missing one must not abort setup —
+        # the periodic refresh in `read_registration` covers whatever URCs
+        # never arrive.
+        for command in (CREG_ENABLE, CEREG_ENABLE):
+            try:
+                await self.client.execute(command)
+            except ATError as exc:
+                log.debug("%s not accepted: %s", command, exc)
+
         self.info = await self.read_info()
         self._start_background()
         return self.info
@@ -196,11 +216,62 @@ class Air780E:
         if cops and (match := re.search(r'"([^"]+)"', cops)):
             info.operator = match.group(1)
 
-        reg = await quiet("AT+CEREG?")
-        if reg and (match := re.search(r"\+CEREG:\s*\d+,\s*(\d+)", reg)):
-            info.registered = match.group(1) in ("1", "5")
+        info.registered = await self.read_registration()
 
         return info
+
+    async def read_registration(self) -> bool:
+        """True if the module is registered on *either* the CS or EPS domain.
+
+        Checking only ``AT+CEREG?`` (LTE/EPS) misses a SIM that fell back to
+        2G and is registered on the circuit-switched domain reported by
+        ``AT+CREG?`` — common when roaming, which is exactly when a foreign
+        SIM like giffgaff lands here.  ``1`` is home, ``5`` is roaming; both
+        mean "attached".
+        """
+        for command, prefix in (("AT+CEREG?", "CEREG"), ("AT+CREG?", "CREG")):
+            try:
+                response = await self.client.execute(command)
+            except ATError as exc:
+                log.debug("%s failed: %s", command, exc)
+                continue
+            value = response.first(f"+{prefix}:") or ""
+            # Query form is "<n>,<stat>[,...]"; the stat is the second field.
+            match = re.match(r"\s*\d+\s*,\s*(\d+)", value)
+            if match and match.group(1) in REGISTERED_STATES:
+                return True
+        return False
+
+    async def recover_registration(self) -> bool:
+        """Nudge a module that is stuck unregistered back onto the network.
+
+        Re-selects the operator automatically, and if that alone does not take,
+        cycles the radio with ``AT+CFUN``.  Returns the registration state
+        afterwards.  Cycling the radio drops any data session, so callers
+        should reserve this for a module that has stayed unregistered rather
+        than firing it on the first missed sample.
+        """
+        try:
+            await self.client.execute("AT+COPS=0", timeout=30.0)
+        except ATError as exc:
+            log.warning("AT+COPS=0 failed during recovery: %s", exc)
+
+        if await self.read_registration():
+            return True
+
+        try:
+            await self.client.execute("AT+CFUN=0", timeout=30.0)
+            await asyncio.sleep(1.0)
+            await self.client.execute("AT+CFUN=1", timeout=30.0)
+        except ATError as exc:
+            log.warning("AT+CFUN cycle failed during recovery: %s", exc)
+            return await self.read_registration()
+
+        # The radio needs a moment to reattach after CFUN=1.
+        await asyncio.sleep(3.0)
+        registered = await self.read_registration()
+        self.info.registered = registered
+        return registered
 
     async def read_signal(self) -> Signal:
         signal = Signal()
@@ -405,7 +476,12 @@ class Air780E:
             await self._emit(complete)
 
     def _on_registration(self, urc: ATUrc) -> None:
-        match = re.match(r"\s*\d+\s*,\s*(\d+)", urc.params)
+        # An unsolicited +CREG/+CEREG is stat-first: "+CREG: 1" or, in mode 2,
+        # "+CREG: 1,\"00C3\",\"1234ABCD\",7".  (The query form "<n>,<stat>" is
+        # consumed by the pending AT+CxREG? command, never routed here.)  The
+        # earlier "<n>,<stat>" pattern silently marked a registered module as
+        # unregistered whenever a mode-2 URC carried location fields.
+        match = re.match(r"\s*(\d+)", urc.params)
         state = match.group(1) if match else urc.params.strip()
         self.info.registered = state in ("1", "5")
 

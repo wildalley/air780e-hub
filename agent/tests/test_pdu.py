@@ -19,6 +19,7 @@ from air780e_agent.pdu import (
     encode_submit,
     gsm7,
 )
+from air780e_agent.pdu.codec import _decode_ucs2
 
 # A textbook SMS-DELIVER: "How are you?" from +31641600986.
 DELIVER_HOW_ARE_YOU = (
@@ -111,6 +112,38 @@ def test_alphabet_from_dcs():
     assert alphabet_from_dcs(0x04) == "8bit"
     assert alphabet_from_dcs(0xF0) == "gsm7"
     assert alphabet_from_dcs(0xF4) == "8bit"
+
+
+# --------------------------------------------------------------------------
+# UCS-2 byte order
+# --------------------------------------------------------------------------
+
+
+def test_ucs2_big_endian_without_bom():
+    # The common case: UTF-16BE, no BOM.  "中文" is U+4E2D U+6587.
+    payload = bytes.fromhex("4E2D6587")
+    assert _decode_ucs2(payload) == "中文"
+
+
+def test_ucs2_big_endian_with_bom():
+    # A leading FE FF marks big-endian and must be stripped, not decoded.
+    payload = b"\xfe\xff" + bytes.fromhex("4E2D6587")
+    assert _decode_ucs2(payload) == "中文"
+
+
+def test_ucs2_little_endian_with_bom():
+    # FF FE marks little-endian: the bytes of each unit are swapped.  Decoding
+    # this as big-endian is exactly the mojibake the fix exists to prevent.
+    payload = b"\xff\xfe" + bytes.fromhex("2D4E8765")
+    assert _decode_ucs2(payload) == "中文"
+    assert _decode_ucs2(payload) != payload[2:].decode("utf-16-be")
+
+
+def test_ucs2_ascii_range_still_decodes():
+    # A BOM-less run of Latin text is the same either way; make sure the
+    # default path handles it.
+    payload = "hi".encode("utf-16-be")
+    assert _decode_ucs2(payload) == "hi"
 
 
 # --------------------------------------------------------------------------

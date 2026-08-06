@@ -1,0 +1,192 @@
+"""Registration detection: the CS/EPS fallback and the URC parsing.
+
+These exercise the driver against a hand-built fake client rather than the
+full mock, because what matters here is the exact ``+CEREG``/``+CREG`` text
+seen on the wire — including a 2G fallback where the two domains disagree, and
+a mode-2 URC that carries location fields the old parser tripped over.
+"""
+
+from __future__ import annotations
+
+from air780e_agent.at import ATError, ATResponse, ATUrc
+from air780e_agent.modem import Air780E
+
+
+class FakeClient:
+    """Answers ``execute`` from a per-command script; records URC handlers.
+
+    ``responses`` maps a command to either an :class:`ATResponse`, an
+    ``ATError`` to raise, or a list consumed one call at a time (so a command
+    can answer differently on successive polls, as during recovery).
+    """
+
+    def __init__(self, responses: dict[str, object]) -> None:
+        self.responses = responses
+        self.calls: list[str] = []
+        self.urc_handlers: dict[str, object] = {}
+
+    def register_urc(self, prefix, handler, *, payload_lines: int = 0) -> None:
+        self.urc_handlers[prefix.upper()] = handler
+
+    async def execute(self, command: str, *, timeout=None, **kwargs) -> ATResponse:
+        self.calls.append(command)
+        result = self.responses.get(command)
+        if isinstance(result, list):
+            result = result.pop(0)
+        if isinstance(result, ATError):
+            raise result
+        if isinstance(result, ATResponse):
+            return result
+        return ATResponse(command, [], "OK")
+
+
+def _reg_response(command: str, prefix: str, stat: int) -> ATResponse:
+    # Query form is "<n>,<stat>": +CEREG: 0,1
+    return ATResponse(command, [f"{prefix}: 0,{stat}"], "OK")
+
+
+def _modem(responses: dict[str, object]) -> Air780E:
+    return Air780E(FakeClient(responses))
+
+
+# --------------------------------------------------------------------------
+# read_registration: CS/EPS fallback
+# --------------------------------------------------------------------------
+
+
+async def test_cereg_home_is_registered():
+    modem = _modem({"AT+CEREG?": _reg_response("AT+CEREG?", "+CEREG", 1)})
+    assert await modem.read_registration() is True
+
+
+async def test_cereg_roaming_is_registered():
+    modem = _modem({"AT+CEREG?": _reg_response("AT+CEREG?", "+CEREG", 5)})
+    assert await modem.read_registration() is True
+
+
+async def test_falls_back_to_2g_when_eps_not_registered():
+    # LTE says "not registered" but the SIM is up on 2G/CS — the whole point
+    # of also checking +CREG.  This is the roaming-SIM case from the field.
+    modem = _modem(
+        {
+            "AT+CEREG?": _reg_response("AT+CEREG?", "+CEREG", 0),
+            "AT+CREG?": _reg_response("AT+CREG?", "+CREG", 1),
+        }
+    )
+    assert await modem.read_registration() is True
+
+
+async def test_neither_domain_registered_is_false():
+    modem = _modem(
+        {
+            "AT+CEREG?": _reg_response("AT+CEREG?", "+CEREG", 0),
+            "AT+CREG?": _reg_response("AT+CREG?", "+CREG", 0),
+        }
+    )
+    assert await modem.read_registration() is False
+
+
+async def test_read_registration_survives_a_failed_query():
+    # A module that rejects AT+CEREG? must still be judged by AT+CREG?.
+    modem = _modem(
+        {
+            "AT+CEREG?": ATError("not supported"),
+            "AT+CREG?": _reg_response("AT+CREG?", "+CREG", 1),
+        }
+    )
+    assert await modem.read_registration() is True
+
+
+# --------------------------------------------------------------------------
+# _on_registration: unsolicited reports are stat-first
+# --------------------------------------------------------------------------
+
+
+def test_urc_bare_stat_registers():
+    modem = _modem({})
+    modem._on_registration(ATUrc(name="+CREG", params="1"))
+    assert modem.info.registered is True
+
+
+def test_urc_mode2_with_location_registers():
+    # "+CREG: 1,\"00C3\",\"1234ABCD\",7" — the location fields used to be read
+    # as the stat and flip a registered module to unregistered.
+    modem = _modem({})
+    modem._on_registration(
+        ATUrc(name="+CREG", params='1,"00C3","1234ABCD",7')
+    )
+    assert modem.info.registered is True
+
+
+def test_urc_stat_zero_unregisters():
+    modem = _modem({})
+    modem.info.registered = True
+    modem._on_registration(ATUrc(name="+CREG", params="0"))
+    assert modem.info.registered is False
+
+
+def test_urc_roaming_stat_registers():
+    modem = _modem({})
+    modem._on_registration(ATUrc(name="+CEREG", params='5,"1A2B","00C3F1D2",7'))
+    assert modem.info.registered is True
+
+
+# --------------------------------------------------------------------------
+# recover_registration
+# --------------------------------------------------------------------------
+
+
+async def test_recover_returns_early_when_cops_reattaches():
+    # AT+COPS=0 alone brings it back — no radio cycle needed.
+    modem = _modem(
+        {
+            "AT+COPS=0": ATResponse("AT+COPS=0", [], "OK"),
+            "AT+CEREG?": _reg_response("AT+CEREG?", "+CEREG", 1),
+        }
+    )
+    assert await modem.recover_registration() is True
+    assert "AT+CFUN=0" not in modem.client.calls
+
+
+async def test_recover_cycles_radio_when_cops_not_enough(monkeypatch):
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr("air780e_agent.modem.asyncio.sleep", no_sleep)
+
+    # First read (after COPS) still not registered; after the CFUN cycle it is.
+    modem = _modem(
+        {
+            "AT+COPS=0": ATResponse("AT+COPS=0", [], "OK"),
+            "AT+CFUN=0": ATResponse("AT+CFUN=0", [], "OK"),
+            "AT+CFUN=1": ATResponse("AT+CFUN=1", [], "OK"),
+            "AT+CEREG?": [
+                _reg_response("AT+CEREG?", "+CEREG", 0),
+                _reg_response("AT+CEREG?", "+CEREG", 1),
+            ],
+            "AT+CREG?": _reg_response("AT+CREG?", "+CREG", 0),
+        }
+    )
+    assert await modem.recover_registration() is True
+    assert "AT+CFUN=0" in modem.client.calls
+    assert "AT+CFUN=1" in modem.client.calls
+    assert modem.info.registered is True
+
+
+async def test_recover_reports_failure_when_still_down(monkeypatch):
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr("air780e_agent.modem.asyncio.sleep", no_sleep)
+
+    modem = _modem(
+        {
+            "AT+COPS=0": ATResponse("AT+COPS=0", [], "OK"),
+            "AT+CFUN=0": ATResponse("AT+CFUN=0", [], "OK"),
+            "AT+CFUN=1": ATResponse("AT+CFUN=1", [], "OK"),
+            "AT+CEREG?": _reg_response("AT+CEREG?", "+CEREG", 0),
+            "AT+CREG?": _reg_response("AT+CREG?", "+CREG", 0),
+        }
+    )
+    assert await modem.recover_registration() is False
+    assert modem.info.registered is False
