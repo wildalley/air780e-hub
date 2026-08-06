@@ -115,7 +115,9 @@ export function SettingsPage({ onPasswordChanged }: { onPasswordChanged: () => v
             >
               修改密码
             </Button>
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: 'text.secondary'
+            }}>
               修改后所有已登录的会话都会失效,包括当前这个。
             </Typography>
           </Stack>
@@ -126,7 +128,9 @@ export function SettingsPage({ onPasswordChanged }: { onPasswordChanged: () => v
         <CardHeader
           title={<Typography variant="h3">Agent Token</Typography>}
           subheader={
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: 'text.secondary'
+            }}>
               填在本地 <code>/etc/air780e-agent/config.toml</code> 的 <code>server.token</code>
             </Typography>
           }
@@ -140,7 +144,9 @@ export function SettingsPage({ onPasswordChanged }: { onPasswordChanged: () => v
               显示 Token
             </Button>
           ) : (
-            <Stack spacing={2} alignItems="flex-start">
+            <Stack spacing={2} sx={{
+              alignItems: 'flex-start'
+            }}>
               <Box
                 component="code"
                 sx={{
@@ -179,7 +185,9 @@ export function SettingsPage({ onPasswordChanged }: { onPasswordChanged: () => v
                 </Button>
               </Stack>
               {tokenInfo.previous_valid_until && (
-                <Typography variant="caption" color="warning.main">
+                <Typography variant="caption" sx={{
+                  color: 'warning.main'
+                }}>
                   上一个 Token 可使用至 {new Date(tokenInfo.previous_valid_until).toLocaleString()}
                 </Typography>
               )}
@@ -197,13 +205,17 @@ export function SettingsPage({ onPasswordChanged }: { onPasswordChanged: () => v
         <CardHeader
           title={<Typography variant="h3">数据清理</Typography>}
           subheader={
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: 'text.secondary'
+            }}>
               按保留期删除过期短信、状态采样、日志、审计与已解决事件。保留期在容器环境变量里设置。
             </Typography>
           }
         />
         <CardContent>
-          <Stack spacing={2} alignItems="flex-start">
+          <Stack spacing={2} sx={{
+            alignItems: 'flex-start'
+          }}>
             <Button
               variant="outlined"
               onClick={async () => {
@@ -214,7 +226,9 @@ export function SettingsPage({ onPasswordChanged }: { onPasswordChanged: () => v
               立即清理
             </Button>
             {purged && (
-              <Typography variant="body2" color="text.secondary">
+              <Typography variant="body2" sx={{
+                color: 'text.secondary'
+              }}>
                 删除:短信 {purged.messages ?? 0} 条,状态采样 {purged.status ?? 0} 条,日志{' '}
                 {(purged.agent_logs ?? 0) + (purged.task_logs ?? 0) + (purged.notify_logs ?? 0)} 条,
                 审计 {purged.audit_events ?? 0} 条,已解决事件 {purged.incidents ?? 0} 条

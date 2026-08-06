@@ -28,7 +28,7 @@ import SendIcon from '@mui/icons-material/SendOutlined'
 import SearchIcon from '@mui/icons-material/SearchOutlined'
 import ArrowBackIcon from '@mui/icons-material/ArrowBackOutlined'
 import EditIcon from '@mui/icons-material/EditOutlined'
-import ErrorIcon from '@mui/icons-material/ErrorOutline'
+import ErrorIcon from '@mui/icons-material/ErrorOutlined'
 import RefreshIcon from '@mui/icons-material/RefreshOutlined'
 import DownloadIcon from '@mui/icons-material/FileDownloadOutlined'
 import ContentCopyIcon from '@mui/icons-material/ContentCopyOutlined'
@@ -270,12 +270,14 @@ function ThreadList({
           placeholder="搜索号码或内容"
           value={search}
           onChange={(e) => onSearch(e.target.value)}
-          InputProps={{
-            startAdornment: (
-              <InputAdornment position="start">
-                <SearchIcon fontSize="small" />
-              </InputAdornment>
-            ),
+          slotProps={{
+            input: {
+              startAdornment: (
+                <InputAdornment position="start">
+                  <SearchIcon fontSize="small" />
+                </InputAdornment>
+              ),
+            }
           }}
         />
       </Box>
@@ -286,9 +288,11 @@ function ThreadList({
         ) : threads.length === 0 ? (
           <Typography
             variant="body2"
-            color="text.secondary"
-            sx={{ p: 4, textAlign: 'center' }}
-          >
+            sx={{
+              color: 'text.secondary',
+              p: 4,
+              textAlign: 'center'
+            }}>
             还没有短信
           </Typography>
         ) : (
@@ -305,7 +309,9 @@ function ThreadList({
                 >
                   <PeerAvatar peer={thread.peer} />
                   <Box sx={{ minWidth: 0, flexGrow: 1 }}>
-                    <Stack direction="row" alignItems="baseline" spacing={1}>
+                    <Stack direction="row" spacing={1} sx={{
+                      alignItems: 'baseline'
+                    }}>
                       <Typography
                         variant="subtitle2"
                         noWrap
@@ -318,9 +324,10 @@ function ThreadList({
                       </Typography>
                       <Typography
                         variant="caption"
-                        color="text.secondary"
-                        sx={{ flexShrink: 0 }}
-                      >
+                        sx={{
+                          color: 'text.secondary',
+                          flexShrink: 0
+                        }}>
                         {shortTime(thread.last_ts)}
                       </Typography>
                     </Stack>
@@ -465,10 +472,14 @@ function ThreadView({
         sx={{ flexGrow: 1, alignItems: 'center', justifyContent: 'center', p: 4 }}
         spacing={1}
       >
-        <Typography variant="body1" color="text.secondary">
+        <Typography variant="body1" sx={{
+          color: 'text.secondary'
+        }}>
           选择左边的一个会话
         </Typography>
-        <Typography variant="caption" color="text.secondary">
+        <Typography variant="caption" sx={{
+          color: 'text.secondary'
+        }}>
           或者点右上角「新会话」给一个新号码发短信
         </Typography>
       </Stack>
@@ -488,10 +499,12 @@ function ThreadView({
     <Stack sx={{ flexGrow: 1, minWidth: 0, minHeight: 0 }}>
       <Stack
         direction="row"
-        alignItems="center"
         spacing={1.5}
-        sx={{ p: 1.5, flexShrink: 0 }}
-      >
+        sx={{
+          alignItems: 'center',
+          p: 1.5,
+          flexShrink: 0
+        }}>
         {onBack && (
           <IconButton onClick={onBack} size="small" aria-label="返回会话列表">
             <ArrowBackIcon />
@@ -502,7 +515,9 @@ function ThreadView({
           <Typography variant="h3" noWrap>
             {thread.peer || '(未知号码)'}
           </Typography>
-          <Typography variant="caption" color="text.secondary">
+          <Typography variant="caption" sx={{
+            color: 'text.secondary'
+          }}>
             {thread.sim_label || thread.sim_iccid || thread.device}
             {device && !online && ' · 模块离线'}
           </Typography>
@@ -535,7 +550,9 @@ function ThreadView({
             这张卡当前不在任何在线模块上,无法回复
           </Alert>
         ) : (
-          <Stack direction="row" spacing={1} alignItems="flex-start">
+          <Stack direction="row" spacing={1} sx={{
+            alignItems: 'flex-start'
+          }}>
             <TextField
               fullWidth
               size="small"
@@ -642,23 +659,31 @@ function Bubble({
           <Stack
             direction="row"
             spacing={0.75}
-            alignItems="center"
-            justifyContent={outgoing ? 'flex-end' : 'flex-start'}
-            sx={{ mt: 0.4, px: 0.5 }}
-          >
+            sx={{
+              alignItems: 'center',
+              justifyContent: outgoing ? 'flex-end' : 'flex-start',
+              mt: 0.4,
+              px: 0.5
+            }}>
             {/* Spelled out, not just implied by which side it sits on. */}
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: 'text.secondary'
+            }}>
               {outgoing ? '发出' : '收到'} {clockTime(message.ts)}
             </Typography>
             {message.segments > 1 && (
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: 'text.secondary'
+              }}>
                 · {message.segments} 段
               </Typography>
             )}
             {failed && (
               <>
                 <Tooltip title={message.error ?? '未知原因'}>
-                  <Stack direction="row" spacing={0.25} alignItems="center">
+                  <Stack direction="row" spacing={0.25} sx={{
+                    alignItems: 'center'
+                  }}>
                     <ErrorIcon sx={{ fontSize: 14, color: STATUS.critical }} />
                     <Typography variant="caption" sx={{ color: STATUS.critical }}>
                       发送失败
@@ -907,21 +932,35 @@ function SearchDialog({
           placeholder="号码或内容,至少 2 个字"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          InputProps={{
-            startAdornment: (
-              <InputAdornment position="start">
-                <SearchIcon fontSize="small" />
-              </InputAdornment>
-            ),
+          slotProps={{
+            input: {
+              startAdornment: (
+                <InputAdornment position="start">
+                  <SearchIcon fontSize="small" />
+                </InputAdornment>
+              ),
+            }
           }}
         />
         <Box sx={{ mt: 1.5 }}>
           {results === null ? (
-            <Typography variant="body2" color="text.secondary" sx={{ py: 3, textAlign: 'center' }}>
+            <Typography
+              variant="body2"
+              sx={{
+                color: 'text.secondary',
+                py: 3,
+                textAlign: 'center'
+              }}>
               {busy ? '搜索中…' : '输入关键词开始搜索'}
             </Typography>
           ) : results.length === 0 ? (
-            <Typography variant="body2" color="text.secondary" sx={{ py: 3, textAlign: 'center' }}>
+            <Typography
+              variant="body2"
+              sx={{
+                color: 'text.secondary',
+                py: 3,
+                textAlign: 'center'
+              }}>
               没有匹配的短信
             </Typography>
           ) : (
@@ -933,15 +972,24 @@ function SearchDialog({
                   sx={{ borderRadius: 2, alignItems: 'flex-start', py: 1, gap: 1.5 }}
                 >
                   <Box sx={{ minWidth: 0, flexGrow: 1 }}>
-                    <Stack direction="row" alignItems="baseline" spacing={1}>
+                    <Stack direction="row" spacing={1} sx={{
+                      alignItems: 'baseline'
+                    }}>
                       <Typography variant="subtitle2" noWrap sx={{ flexGrow: 1 }}>
                         {message.peer}
                       </Typography>
-                      <Typography variant="caption" color="text.secondary" sx={{ flexShrink: 0 }}>
+                      <Typography
+                        variant="caption"
+                        sx={{
+                          color: 'text.secondary',
+                          flexShrink: 0
+                        }}>
                         {message.sim_label || message.sim_iccid?.slice(-6)}
                       </Typography>
                     </Stack>
-                    <Typography variant="body2" color="text.secondary" noWrap>
+                    <Typography variant="body2" noWrap sx={{
+                      color: 'text.secondary'
+                    }}>
                       {message.direction === 'out' ? '你:' : '收到:'}
                       {message.body}
                     </Typography>

@@ -5,12 +5,12 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
-from .auth import Auth
 from .alerts import OfflineAlerter
+from .auth import Auth
 from .config import Settings
-from .db import Database, SETTING_MESSAGE_RETENTION_DAYS
+from .db import SETTING_MESSAGE_RETENTION_DAYS, Database
 from .gateway import Gateway
 from .notify import Notifier
 
@@ -29,7 +29,7 @@ class AppState:
     started_monotonic: float
 
     @classmethod
-    def build(cls, settings: Settings) -> "AppState":
+    def build(cls, settings: Settings) -> AppState:
         db = Database(settings.db_path)
         # Nothing is connected at startup, whatever the last run left behind.
         db.mark_all_agents_disconnected()
@@ -51,7 +51,7 @@ class AppState:
         state = cls(
             settings=settings, db=db, auth=auth, gateway=gateway,
             notifier=notifier, alerter=alerter,
-            started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            started_at=datetime.now(UTC).isoformat(timespec="seconds"),
             started_monotonic=time.monotonic(),
         )
         log.info("data dir %s, timezone %s", settings.data_dir, settings.timezone)

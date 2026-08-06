@@ -94,7 +94,7 @@ class Settings:
         return self.data_dir / "agent_token"
 
     @classmethod
-    def from_env(cls) -> "Settings":
+    def from_env(cls) -> Settings:
         configured_token = os.environ.get("HUB_AGENT_TOKEN", "").strip()
         settings = cls(
             data_dir=Path(os.environ.get("HUB_DATA_DIR", "/data")),

@@ -17,8 +17,8 @@ from air780e_agent.pdu import (
     alphabet_from_dcs,
     decode_pdu,
     encode_submit,
+    gsm7,
 )
-from air780e_agent.pdu import gsm7
 
 # A textbook SMS-DELIVER: "How are you?" from +31641600986.
 DELIVER_HOW_ARE_YOU = (

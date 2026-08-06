@@ -54,7 +54,13 @@ export function LogsPage() {
         <CardContent sx={{ p: 0, '&:last-child': { pb: 0 } }}>
           {tab === 0 ? (
             agentLogs.length === 0 ? (
-              <Typography variant="body2" color="text.secondary" sx={{ p: 4, textAlign: 'center' }}>
+              <Typography
+                variant="body2"
+                sx={{
+                  color: 'text.secondary',
+                  p: 4,
+                  textAlign: 'center'
+                }}>
                 还没有日志
               </Typography>
             ) : (
@@ -82,7 +88,13 @@ export function LogsPage() {
               </TableContainer>
             )
           ) : notifyLogs.length === 0 ? (
-            <Typography variant="body2" color="text.secondary" sx={{ p: 4, textAlign: 'center' }}>
+            <Typography
+              variant="body2"
+              sx={{
+                color: 'text.secondary',
+                p: 4,
+                textAlign: 'center'
+              }}>
               还没有推送记录
             </Typography>
           ) : (
@@ -118,7 +130,9 @@ export function LogsPage() {
         </CardContent>
       </Card>
 
-      <Typography variant="caption" color="text.secondary">
+      <Typography variant="caption" sx={{
+        color: 'text.secondary'
+      }}>
         日志中不包含短信正文 —— agent 只记录发件人和长度。
       </Typography>
     </Stack>

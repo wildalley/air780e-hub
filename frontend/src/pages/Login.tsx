@@ -95,7 +95,13 @@ export function LoginPage({ needsSetup, onAuthenticated, mode, onToggleMode }: P
         }}
       >
         <CardContent sx={{ p: { xs: 3, sm: 4 } }}>
-          <Stack direction="row" spacing={1.75} alignItems="center" sx={{ mb: 3 }}>
+          <Stack
+            direction="row"
+            spacing={1.75}
+            sx={{
+              alignItems: 'center',
+              mb: 3
+            }}>
             <Box
               aria-hidden
               sx={{
@@ -117,12 +123,19 @@ export function LoginPage({ needsSetup, onAuthenticated, mode, onToggleMode }: P
               >
                 air780e hub
               </Typography>
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: 'text.secondary'
+              }}>
                 SMS 自托管网关
               </Typography>
             </Box>
           </Stack>
-          <Typography variant="body2" color="text.secondary" sx={{ mb: 3 }}>
+          <Typography
+            variant="body2"
+            sx={{
+              color: 'text.secondary',
+              mb: 3
+            }}>
             {needsSetup ? '首次使用,请设置管理员密码' : '请输入管理员密码'}
           </Typography>
 
@@ -149,7 +162,9 @@ export function LoginPage({ needsSetup, onAuthenticated, mode, onToggleMode }: P
                     fullWidth
                     required
                   />
-                  <Typography variant="caption" color="text.secondary">
+                  <Typography variant="caption" sx={{
+                    color: 'text.secondary'
+                  }}>
                     至少 8 位,且需包含大写、小写、数字、符号中的至少两类。
                   </Typography>
                 </>

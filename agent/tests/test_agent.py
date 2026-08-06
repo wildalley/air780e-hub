@@ -273,7 +273,7 @@ async def test_long_message_is_queued_once(agent):
     text = "y" * 400
     agent.mocks["a"].deliver("10086", text)
 
-    events = await agent.wait_for_events("sms_in", 1)
+    await agent.wait_for_events("sms_in", 1)
     await asyncio.sleep(0.1)
     sms_events = agent.events("sms_in")
     assert len(sms_events) == 1, "segments must be merged before queueing"

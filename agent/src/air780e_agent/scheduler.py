@@ -15,8 +15,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-from datetime import datetime, timezone
-from typing import Any, Callable
+from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import Any
 
 from .schedule import ScheduleError, next_run
 from .store import LocalStore
@@ -42,7 +43,7 @@ class TaskSkipped(RuntimeError):
 
 
 def _now() -> datetime:
-    return datetime.now(timezone.utc).astimezone()
+    return datetime.now(UTC).astimezone()
 
 
 def _iso(moment: datetime) -> str:

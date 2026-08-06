@@ -17,8 +17,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable
 
 from .errors import (
     ATCommandError,
@@ -357,7 +357,7 @@ class ATClient:
                         await asyncio.wait_for(
                             pending.prompt.wait(), timeout=prompt_timeout
                         )
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         raise ATTimeout(
                             "modem never sent the '>' prompt", command=command
                         ) from None
@@ -366,7 +366,7 @@ class ATClient:
 
                 try:
                     return await asyncio.wait_for(pending.future, timeout=timeout)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     raise ATTimeout(
                         f"no final result code within {timeout}s", command=command
                     ) from None

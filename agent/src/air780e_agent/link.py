@@ -12,7 +12,8 @@ import asyncio
 import json
 import logging
 import random
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
@@ -153,7 +154,7 @@ class ServerLink:
                     # The timeout is a safety net: if a wake is ever missed,
                     # the queue still drains within a few seconds.
                     await asyncio.wait_for(self._wake.wait(), timeout=5.0)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     pass
                 continue
 

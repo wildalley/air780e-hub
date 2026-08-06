@@ -6,6 +6,10 @@
 
 ### Added
 
+- 项目以 MIT License 发布。
+- Agent 与 Server 接入 ruff 静态检查，并加入 CI。
+- 前端接入 ESLint 与 Vitest，覆盖 API 错误处理、时间戳格式化、验证码识别和 MUI 路由链接约定，并加入 CI。
+- Python 与 JavaScript/TypeScript 的 CodeQL 代码扫描工作流。
 - Agent、Server 和前端的持续集成检查，覆盖锁定依赖、测试、构建、Compose 配置和本地 Markdown 链接。
 - Secret scan、Python/npm 依赖审计和容器镜像漏洞扫描工作流。
 - `deploy/self_check.py` 部署自检器，验证关键环境变量、健康检查、TLS、WebSocket 代理和 Agent Token。
@@ -20,6 +24,7 @@
 
 ### Fixed
 
+- 恢复数据库备份此前对**任何**合法备份都返回 500：`Database.validate_backup` 声明为 `staticmethod` 却引用 `self._REQUIRED_TABLES`，通过完整性校验的文件走到这一行即抛 `NameError`，而端点只捕获 `ValueError`。格式错误的上传在更早一步就被拒，因此这条路径从未被触发过 —— 也就一直没被发现。现改为 `classmethod`，并补上备份/恢复往返与拒绝非 Hub 数据库的测试。
 - SMTP 通知改由独立后台线程执行，避免阻塞 Server 的异步事件循环；发送完成或失败后会可靠地回传结果。
 - 短信发送失败事件此前按消息编号建指纹，没有任何恢复路径，每次失败都会留下一条永不关闭的事件并持续占用导航角标；现改为按模块聚合，发送成功即自动关闭。
 - 模块离线时，它的未注册和发送失败事件不再滞留 —— 这两种状态在离线期间无法恢复，已由掉线事件表达。

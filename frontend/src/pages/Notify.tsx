@@ -28,7 +28,7 @@ import {
   Typography,
 } from '@mui/material'
 import AddIcon from '@mui/icons-material/Add'
-import DeleteIcon from '@mui/icons-material/DeleteOutline'
+import DeleteIcon from '@mui/icons-material/DeleteOutlined'
 import EditIcon from '@mui/icons-material/EditOutlined'
 import SendIcon from '@mui/icons-material/SendOutlined'
 import {
@@ -211,7 +211,12 @@ export function NotifyPage() {
         />
         <CardContent sx={{ pt: 0 }}>
           {channels.length === 0 ? (
-            <Typography variant="body2" color="text.secondary" sx={{ py: 2 }}>
+            <Typography
+              variant="body2"
+              sx={{
+                color: 'text.secondary',
+                py: 2
+              }}>
               还没有渠道。先建一个,再用规则把短信路由过去。
             </Typography>
           ) : (
@@ -235,7 +240,9 @@ export function NotifyPage() {
                         size="small"
                         checked={Boolean(channel.enabled)}
                         onChange={() => void toggleChannel(channel)}
-                        inputProps={{ 'aria-label': `启用 ${channel.name}` }}
+                        slotProps={{
+                          input: { 'aria-label': `启用 ${channel.name}` }
+                        }}
                       />
                     </TableCell>
                     <TableCell align="right">
@@ -298,7 +305,12 @@ export function NotifyPage() {
         />
         <CardContent sx={{ pt: 0 }}>
           {rules.length === 0 ? (
-            <Typography variant="body2" color="text.secondary" sx={{ py: 2 }}>
+            <Typography
+              variant="body2"
+              sx={{
+                color: 'text.secondary',
+                py: 2
+              }}>
               还没有规则。没有规则时不会推送任何短信。
             </Typography>
           ) : (
@@ -346,7 +358,9 @@ export function NotifyPage() {
                         size="small"
                         checked={Boolean(rule.enabled)}
                         onChange={() => void toggleRule(rule)}
-                        inputProps={{ 'aria-label': `启用规则 ${rule.id}` }}
+                        slotProps={{
+                          input: { 'aria-label': `启用规则 ${rule.id}` }
+                        }}
                       />
                     </TableCell>
                     <TableCell align="right">
@@ -377,7 +391,9 @@ export function NotifyPage() {
         </CardContent>
       </Card>
 
-      <Typography variant="caption" color="text.secondary">
+      <Typography variant="caption" sx={{
+        color: 'text.secondary'
+      }}>
         一条短信命中多条规则时,同一个渠道只推一次(取优先级最高的模板)。推送结果见「日志 →
         推送日志」。
       </Typography>
@@ -446,7 +462,9 @@ function RuleTesterCard({
       <CardHeader
         title={<Typography variant="h3">规则调试器</Typography>}
         subheader={
-          <Typography variant="caption" color="text.secondary">
+          <Typography variant="caption" sx={{
+            color: 'text.secondary'
+          }}>
             粘贴一条真实短信,看它会命中哪些规则、实际推出去长什么样 —— 不真的发送。
           </Typography>
         }
@@ -504,16 +522,26 @@ function RuleTesterCard({
             </Box>
           ) : result !== null ? (
             result.length === 0 ? (
-              <Typography variant="body2" color="text.secondary">
+              <Typography variant="body2" sx={{
+                color: 'text.secondary'
+              }}>
                 没有规则命中。想收到这条短信的话,先建一条匹配它的规则。
               </Typography>
             ) : (
               <Stack divider={<Divider />} spacing={1.5}>
                 {result.map((hit) => (
                   <Box key={hit.rule_id}>
-                    <Stack direction="row" spacing={1} alignItems="center" sx={{ mb: 0.5 }}>
+                    <Stack
+                      direction="row"
+                      spacing={1}
+                      sx={{
+                        alignItems: 'center',
+                        mb: 0.5
+                      }}>
                       <Chip size="small" label={hit.rule_name} color="primary" variant="outlined" />
-                      <Typography variant="body2" color="text.secondary">
+                      <Typography variant="body2" sx={{
+                        color: 'text.secondary'
+                      }}>
                         → {hit.channel_name}(优先级 {hit.priority})
                       </Typography>
                     </Stack>
@@ -616,14 +644,20 @@ function SettingsCard({
                     ? `超过 ${days} 天的短信会被服务器自动清理`
                     : '请填 0-3650 之间的天数(0 = 永久保留)'
               }
-              inputProps={{ min: 0, max: 3650, step: 1 }}
               sx={{ maxWidth: 260 }}
+              slotProps={{
+                htmlInput: { min: 0, max: 3650, step: 1 }
+              }}
             />
-            <Stack direction="row" alignItems="center" spacing={1}>
+            <Stack direction="row" spacing={1} sx={{
+              alignItems: 'center'
+            }}>
               <Switch
                 checked={offlineAlerts}
                 onChange={(e) => setOfflineAlerts(e.target.checked)}
-                inputProps={{ 'aria-label': '模块掉线告警' }}
+                slotProps={{
+                  input: { 'aria-label': '模块掉线告警' }
+                }}
               />
               <Typography variant="body2">模块掉线时推送告警</Typography>
             </Stack>

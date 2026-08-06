@@ -27,10 +27,17 @@ export function StorageMeter({ used, capacity, label = '模块存储' }: Storage
   return (
     <Box>
       <Box sx={{ display: 'flex', justifyContent: 'space-between', mb: 0.5 }}>
-        <Typography variant="body2" color="text.secondary">
+        <Typography variant="body2" sx={{
+          color: 'text.secondary'
+        }}>
           {label}
         </Typography>
-        <Typography variant="body2" color="text.secondary" sx={{ fontVariantNumeric: 'tabular-nums' }}>
+        <Typography
+          variant="body2"
+          sx={{
+            color: 'text.secondary',
+            fontVariantNumeric: 'tabular-nums'
+          }}>
           {capacity > 0 ? `${used} / ${capacity}` : '未知'}
         </Typography>
       </Box>

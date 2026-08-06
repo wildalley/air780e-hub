@@ -1,28 +1,30 @@
 # 发布清单
 
-这份清单把可自动化的发布步骤固定下来，但不替仓库所有者决定许可证、发行方式或支持承诺。当前包和应用版本均为 `0.1.0`，尚未创建正式 Git tag。
+这份清单把可自动化的发布步骤固定下来，但不替仓库所有者决定发行方式或支持承诺。当前包和应用版本均为 `0.1.0`，尚未创建正式 Git tag。
 
 ## 发布前决策门槛
 
 首个 Release 前必须明确：
 
-1. 许可证，或明确保持专有授权；
+1. ~~许可证~~ —— 已确定：[MIT](../LICENSE)；
 2. 发行方式：源码构建、镜像，或两者；
 3. 支持矩阵：Python、Node、Linux 发行版、Air780E 型号和 AT 固件；
 4. 版本策略和兼容性承诺。
 
-这些决定完成后，把结论同步到 `README.md`、`SECURITY.md` 和本文件，再创建版本号对应的 tag。
+剩余决定完成后，把结论同步到 `README.md`、`SECURITY.md` 和本文件，再创建版本号对应的 tag。
 
 ## 自动检查
 
 在目标提交上确认 GitHub Actions 的 `CI` 和 `Security` 全部通过：
 
+- Agent / Server 的 ruff 检查；
 - Agent / Server 在 Python 3.11、3.12、3.13 上的测试；
-- 前端 `npm ci` 与生产构建；
+- 前端 `npm ci`、ESLint、Vitest 与生产构建；
 - `docker compose -f deploy/docker-compose.yml config --quiet`；
 - 本地 Markdown 链接检查；
 - 全 Git 历史 Secret scan；
 - Python 与 npm 锁定依赖审计；
+- Python 与 JavaScript/TypeScript 的 CodeQL 代码扫描；
 - 构建镜像的 HIGH / CRITICAL 漏洞扫描。
 
 再在一台干净的部署主机执行：

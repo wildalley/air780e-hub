@@ -262,7 +262,9 @@ export function ConsolePage() {
         </Alert>
       ) : (
         <>
-          <Stack direction="row" spacing={1} flexWrap="wrap" useFlexGap>
+          <Stack direction="row" spacing={1} useFlexGap sx={{
+            flexWrap: 'wrap'
+          }}>
             {QUICK.map((q) => (
               <Tooltip key={q.cmd} title={q.hint}>
                 <Chip
@@ -314,7 +316,9 @@ export function ConsolePage() {
             <div ref={bottom} />
           </Box>
 
-          <Stack direction="row" spacing={1} alignItems="flex-start">
+          <Stack direction="row" spacing={1} sx={{
+            alignItems: 'flex-start'
+          }}>
             <TextField
               fullWidth
               size="small"
@@ -335,7 +339,9 @@ export function ConsolePage() {
                     ? `已到 ${CMD_MAX} 字符上限`
                     : ' '
               }
-              InputProps={{ sx: { fontFamily: MONO } }}
+              slotProps={{
+                input: { sx: { fontFamily: MONO } }
+              }}
             />
             <Button
               variant="contained"
@@ -388,7 +394,9 @@ function ConsoleEntry({
 }) {
   return (
     <Box>
-      <Stack direction="row" spacing={1} alignItems="baseline">
+      <Stack direction="row" spacing={1} sx={{
+        alignItems: 'baseline'
+      }}>
         <Box component="span" sx={{ color: viz.series[0], userSelect: 'none' }}>
           &gt;
         </Box>

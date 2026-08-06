@@ -11,8 +11,9 @@ from __future__ import annotations
 import asyncio
 import os
 import tty
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Protocol
+from typing import Protocol
 
 from .errors import TransportClosed
 
@@ -151,7 +152,7 @@ class PipeTransport:
         self._open = False
 
     @classmethod
-    def create_pair(cls) -> tuple["PipeTransport", "PipeTransport"]:
+    def create_pair(cls) -> tuple[PipeTransport, PipeTransport]:
         a, b = cls("a"), cls("b")
         a._peer, b._peer = b, a
         return a, b

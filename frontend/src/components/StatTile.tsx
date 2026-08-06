@@ -33,8 +33,16 @@ export function StatTile({ label, value, note, accent, icon, compact = true }: S
   return (
     <Card sx={{ height: '100%' }}>
       <CardContent sx={{ py: 2.5, display: 'flex', flexDirection: 'column', gap: 1.5 }}>
-        <Stack direction="row" justifyContent="space-between" alignItems="flex-start" spacing={2}>
-          <Typography variant="body2" color="text.secondary">
+        <Stack
+          direction="row"
+          spacing={2}
+          sx={{
+            justifyContent: 'space-between',
+            alignItems: 'flex-start'
+          }}>
+          <Typography variant="body2" sx={{
+            color: 'text.secondary'
+          }}>
             {label}
           </Typography>
           {icon && (
@@ -76,7 +84,9 @@ export function StatTile({ label, value, note, accent, icon, compact = true }: S
           </Typography>
         </Box>
         {note && (
-          <Typography variant="caption" color="text.secondary">
+          <Typography variant="caption" sx={{
+            color: 'text.secondary'
+          }}>
             {note}
           </Typography>
         )}

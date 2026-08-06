@@ -77,7 +77,7 @@ class AgentConfig:
     probe_timeout: float = 3.0
 
     @classmethod
-    def load(cls, path: str | Path | None = None) -> "AgentConfig":
+    def load(cls, path: str | Path | None = None) -> AgentConfig:
         candidates = [Path(path)] if path else list(DEFAULT_CONFIG_PATHS)
         for candidate in candidates:
             if candidate.exists():
@@ -88,7 +88,7 @@ class AgentConfig:
         )
 
     @classmethod
-    def parse(cls, raw: bytes, *, source: Path | None = None) -> "AgentConfig":
+    def parse(cls, raw: bytes, *, source: Path | None = None) -> AgentConfig:
         try:
             data = tomllib.loads(raw.decode("utf-8"))
         except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:

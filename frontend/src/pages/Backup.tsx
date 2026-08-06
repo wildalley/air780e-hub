@@ -63,7 +63,9 @@ export function BackupPage() {
         <CardHeader
           title={<Typography variant="h3">下载备份</Typography>}
           subheader={
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: 'text.secondary'
+            }}>
               导出整个数据库的一致快照(短信、SIM 卡、任务、通知规则等),文件可离线保存。
             </Typography>
           }
@@ -84,7 +86,9 @@ export function BackupPage() {
         <CardHeader
           title={<Typography variant="h3">从备份恢复</Typography>}
           subheader={
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: 'text.secondary'
+            }}>
               上传之前导出的备份文件。系统会先校验再覆盖,恢复后无需重启。
             </Typography>
           }

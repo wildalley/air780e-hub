@@ -18,8 +18,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Awaitable, Callable
 
 from .at import ATClient, ATError, ATUrc, CmsError
 from .pdu import DecodedSms, PduError, Reassembler, decode_pdu, encode_submit

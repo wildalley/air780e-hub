@@ -32,10 +32,11 @@ import re
 import smtplib
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from email.message import EmailMessage
-from typing import Any, Callable
+from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -443,7 +444,7 @@ def _load_timezone(name: str) -> Any:
         # Slim base images ship no zoneinfo database; timestamps in UTC are
         # wrong-looking but harmless, a crashed push is not.
         log.warning("timezone %r unavailable (tzdata missing?); using UTC", name)
-        return timezone.utc
+        return UTC
 
 
 class Notifier:
@@ -779,5 +780,5 @@ class Notifier:
         except (TypeError, ValueError):
             return ts
         if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
+            parsed = parsed.replace(tzinfo=UTC)
         return parsed.astimezone(self._tz).strftime("%Y-%m-%d %H:%M:%S")

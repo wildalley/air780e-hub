@@ -15,9 +15,10 @@ import asyncio
 import json
 import logging
 import secrets
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Awaitable, Callable
+from datetime import UTC, datetime
+from typing import Any
 
 from .auth import verify_agent_token, verify_agent_token_hash
 from .config import Settings
@@ -109,8 +110,8 @@ class Gateway:
         except ValueError:
             return False
         if expires.tzinfo is None:
-            expires = expires.replace(tzinfo=timezone.utc)
-        if expires <= datetime.now(timezone.utc):
+            expires = expires.replace(tzinfo=UTC)
+        if expires <= datetime.now(UTC):
             return False
         return verify_agent_token_hash(token, expected_hash)
 
@@ -274,7 +275,7 @@ class Gateway:
             await self.on_message(message_id, frame)
 
     def _apply_sms_out(self, agent_id: str, frame: dict[str, Any]) -> None:
-        message_id = self.db.insert_message(
+        self.db.insert_message(
             agent_id=agent_id,
             device=frame.get("device", ""),
             direction="out",
@@ -425,7 +426,7 @@ class Gateway:
         try:
             await connection.send({**frame, "cmd_id": cmd_id})
             return await asyncio.wait_for(future, timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             raise CommandFailed(
                 f"agent {agent_id} did not answer within {timeout:.0f}s"
             ) from None

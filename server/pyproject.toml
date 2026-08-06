@@ -15,9 +15,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "httpx2>=2.9.1",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "ruff>=0.14",
 ]
 
 [project.scripts]
@@ -35,3 +35,15 @@ testpaths = ["tests"]
 pythonpath = ["src"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+# 100, not 88: the longest existing line is 93 columns, so 88 would force a
+# reflow of working code for no readability gain.
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# Deliberately not enabling BLE001 (blind-except) or S110 (try-except-pass):
+# both fire on intentional best-effort cleanup paths here, where a narrower
+# except would mean re-raising during teardown.
+select = ["E", "F", "W", "I", "UP", "B", "C4"]

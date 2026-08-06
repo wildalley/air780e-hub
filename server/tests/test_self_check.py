@@ -18,7 +18,6 @@ import uvicorn
 from hub_server.config import Settings
 from hub_server.main import create_app
 
-
 SCRIPT = Path(__file__).parents[2] / "deploy" / "self_check.py"
 SPEC = importlib.util.spec_from_file_location("deploy_self_check", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None

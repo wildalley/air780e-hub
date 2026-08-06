@@ -160,8 +160,10 @@ def next_interval(expression: str, after: datetime) -> datetime:
     """``expression`` is a number of days, counted from the last run."""
     try:
         days = float(expression)
-    except (TypeError, ValueError):
-        raise ScheduleError(f"interval must be a number of days, got {expression!r}")
+    except (TypeError, ValueError) as exc:
+        raise ScheduleError(
+            f"interval must be a number of days, got {expression!r}"
+        ) from exc
     if days <= 0:
         raise ScheduleError("interval must be greater than zero days")
     return after + timedelta(days=days)

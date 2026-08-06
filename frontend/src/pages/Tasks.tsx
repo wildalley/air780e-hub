@@ -29,7 +29,7 @@ import {
 } from '@mui/material'
 import AddIcon from '@mui/icons-material/Add'
 import EditIcon from '@mui/icons-material/EditOutlined'
-import DeleteIcon from '@mui/icons-material/DeleteOutline'
+import DeleteIcon from '@mui/icons-material/DeleteOutlined'
 import { api, ApiError, type Device, type Task, type TaskInput, type TaskLog } from '../api'
 import { Loading, formatTs, useToast } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
@@ -146,7 +146,9 @@ export function TasksPage() {
         <CardContent sx={{ p: 0, '&:last-child': { pb: 0 } }}>
           {tasks.length === 0 ? (
             <Box sx={{ p: 4, textAlign: 'center' }}>
-              <Typography variant="body2" color="text.secondary">
+              <Typography variant="body2" sx={{
+                color: 'text.secondary'
+              }}>
                 还没有保号任务。默认建议:每 25 天给运营商号码发一条短信。
               </Typography>
             </Box>
@@ -229,7 +231,9 @@ export function TasksPage() {
             执行日志
           </Typography>
           {logs.length === 0 ? (
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{
+              color: 'text.secondary'
+            }}>
               还没有执行记录
             </Typography>
           ) : (
@@ -411,7 +415,9 @@ function TaskDialog({
               valueLabelDisplay="auto"
               valueLabelFormat={(v) => `${v} 分`}
             />
-            <Typography variant="caption" color="text.secondary">
+            <Typography variant="caption" sx={{
+              color: 'text.secondary'
+            }}>
               避开整点,让发送时间看起来不像机器
             </Typography>
           </Box>
@@ -421,8 +427,10 @@ function TaskDialog({
             type="number"
             value={value.retry_max}
             onChange={(e) => set('retry_max', Math.max(0, Number(e.target.value)))}
-            inputProps={{ min: 0, max: 10 }}
             fullWidth
+            slotProps={{
+              htmlInput: { min: 0, max: 10 }
+            }}
           />
 
           <Tooltip title="在内容尾部附加几个随机字符。运营商对完全重复的短信可能拦截。">

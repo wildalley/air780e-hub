@@ -174,7 +174,13 @@ export function OperationsPage() {
                 color={diskPercent >= 90 ? 'error' : diskPercent >= 75 ? 'warning' : 'primary'}
                 sx={{ height: 7, borderRadius: 1 }}
               />
-              <Typography variant="caption" color="text.secondary" sx={{ mt: 0.75, display: 'block' }}>
+              <Typography
+                variant="caption"
+                sx={{
+                  color: 'text.secondary',
+                  mt: 0.75,
+                  display: 'block'
+                }}>
                 {formatBytes(diskUsed)} / {formatBytes(diagnostics.storage.disk_total_bytes)}，可用{' '}
                 {formatBytes(diagnostics.storage.disk_free_bytes)}
               </Typography>
@@ -216,16 +222,24 @@ export function OperationsPage() {
             </TableContainer>
 
             <Stack direction={{ xs: 'column', sm: 'row' }} spacing={3}>
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: 'text.secondary'
+              }}>
                 待处理命令 {diagnostics.runtime.pending_commands}
               </Typography>
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: 'text.secondary'
+              }}>
                 发送中的通知 {diagnostics.runtime.notifications_inflight}
               </Typography>
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: 'text.secondary'
+              }}>
                 离线观察计时器 {diagnostics.runtime.offline_timers}
               </Typography>
-              <Typography variant="caption" color="text.secondary">
+              <Typography variant="caption" sx={{
+                color: 'text.secondary'
+              }}>
                 状态采样 {diagnostics.counts.status_samples.toLocaleString()}
               </Typography>
             </Stack>
@@ -285,9 +299,13 @@ export function OperationsPage() {
                             />
                           </TableCell>
                           <TableCell sx={{ maxWidth: 380 }}>
-                            <Typography variant="body2" fontWeight={600}>{incident.title}</Typography>
+                            <Typography variant="body2" sx={{
+                              fontWeight: 600
+                            }}>{incident.title}</Typography>
                             {incident.detail && (
-                              <Typography variant="caption" color="text.secondary">
+                              <Typography variant="caption" sx={{
+                                color: 'text.secondary'
+                              }}>
                                 {incident.detail}
                               </Typography>
                             )}
@@ -297,7 +315,9 @@ export function OperationsPage() {
                           <TableCell sx={{ whiteSpace: 'nowrap' }}>{formatTs(incident.last_seen_at)}</TableCell>
                           <TableCell>{incident.occurrences}</TableCell>
                           <TableCell align="right">
-                            <Stack direction="row" spacing={1} justifyContent="flex-end">
+                            <Stack direction="row" spacing={1} sx={{
+                              justifyContent: 'flex-end'
+                            }}>
                               {incident.status === 'active' && (
                                 <Button
                                   size="small"

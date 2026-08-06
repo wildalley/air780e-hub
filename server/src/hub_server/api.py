@@ -16,16 +16,17 @@ import secrets
 import shutil
 import tempfile
 import time
-from datetime import datetime, timedelta, timezone
-from typing import Any, Iterable, Literal
+from collections.abc import Iterable
+from datetime import UTC, datetime, timedelta
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
-from .alerts import SETTING_ENABLED
 from . import __version__
+from .alerts import SETTING_ENABLED
 from .auth import SESSION_COOKIE, AuthError, hash_agent_token
 from .config import ConfigError
 from .db import SETTING_MESSAGE_RETENTION_DAYS, utcnow
@@ -261,7 +262,7 @@ def build_router(state: AppState) -> APIRouter:
     ) -> dict[str, list[dict[str, Any]]]:
         """Return every device series in one request for the dashboard."""
         cutoff = (
-            datetime.now(timezone.utc) - timedelta(hours=hours)
+            datetime.now(UTC) - timedelta(hours=hours)
         ).isoformat(timespec="seconds")
         names = [row["name"] for row in state.db.query("SELECT name FROM devices")]
         grouped: dict[str, list[dict[str, Any]]] = {name: [] for name in names}
@@ -287,7 +288,7 @@ def build_router(state: AppState) -> APIRouter:
         # that function formats with a space separator, which does not compare
         # correctly against the ISO-8601 'T' timestamps stored in the column.
         cutoff = (
-            datetime.now(timezone.utc) - timedelta(hours=hours)
+            datetime.now(UTC) - timedelta(hours=hours)
         ).isoformat(timespec="seconds")
         return state.db.query(
             "SELECT ts, online, registered, rssi, dbm, bars, rsrp, rsrq, "
@@ -568,7 +569,7 @@ def build_router(state: AppState) -> APIRouter:
         days: int = Query(30, ge=1, le=365),
     ) -> list[dict[str, Any]]:
         """Daily per-card message counts for the dashboard trend chart."""
-        since = (datetime.now(timezone.utc) - timedelta(days=days - 1)).date().isoformat()
+        since = (datetime.now(UTC) - timedelta(days=days - 1)).date().isoformat()
         rows = state.db.query(
             "SELECT date(ts) AS day, sim_id, "
             "       SUM(CASE WHEN direction = 'in' THEN 1 ELSE 0 END) AS received, "
@@ -786,7 +787,7 @@ def build_router(state: AppState) -> APIRouter:
 
         if body.grace_minutes:
             expires = (
-                datetime.now(timezone.utc) + timedelta(minutes=body.grace_minutes)
+                datetime.now(UTC) + timedelta(minutes=body.grace_minutes)
             ).isoformat(timespec="seconds")
             state.db.set_setting(
                 SETTING_PREVIOUS_AGENT_TOKEN_HASH, hash_agent_token(old_token)
@@ -833,7 +834,7 @@ def build_router(state: AppState) -> APIRouter:
             target="database",
             client_ip=request.client.host if request.client else "",
         )
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        stamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
         return FileResponse(
             tmp,
             media_type="application/octet-stream",

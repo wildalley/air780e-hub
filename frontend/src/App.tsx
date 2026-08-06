@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState, lazy, Suspense } from 'react'
-import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
 import { CssBaseline, GlobalStyles, ThemeProvider } from '@mui/material'
 import { api, ApiError } from './api'
 import { buildTheme } from './theme'

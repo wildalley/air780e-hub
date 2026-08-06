@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from 'react'
-import { Link as RouterLink, useLocation } from 'react-router-dom'
+import { Link as RouterLink, useLocation } from 'react-router'
 import {
   alpha,
   AppBar,
@@ -71,9 +71,13 @@ function Brand() {
     <Stack
       direction="row"
       spacing={1.5}
-      alignItems="center"
-      sx={{ minHeight: 48, px: 2, borderBottom: 1, borderColor: 'divider' }}
-    >
+      sx={{
+        alignItems: 'center',
+        minHeight: 48,
+        px: 2,
+        borderBottom: 1,
+        borderColor: 'divider'
+      }}>
       <Box
         aria-hidden
         sx={{
@@ -95,7 +99,12 @@ function Brand() {
         >
           air780e hub
         </Typography>
-        <Typography variant="caption" color="text.secondary" sx={{ fontSize: '0.66rem' }}>
+        <Typography
+          variant="caption"
+          sx={{
+            color: 'text.secondary',
+            fontSize: '0.66rem'
+          }}>
           SMS 自托管网关
         </Typography>
       </Box>
@@ -191,7 +200,12 @@ export function Layout({ children, mode, onToggleMode, onLogout }: Props) {
                   </ListItemIcon>
                   <ListItemText
                     primary={item.label}
-                    primaryTypographyProps={{ fontSize: 14, fontWeight: 500 }}
+                    slotProps={{
+                      // v9 removed system props from Typography, so these two
+                      // belong in sx — the codemod moved them to the right
+                      // slot but left them as bare props.
+                      primary: { sx: { fontSize: 14, fontWeight: 500 } },
+                    }}
                   />
                 </ListItemButton>
               )

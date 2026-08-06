@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Link as RouterLink } from 'react-router-dom'
+import { Link as RouterLink } from 'react-router'
 import {
   Box,
   Button,
@@ -29,7 +29,7 @@ import {
 } from 'recharts'
 import RouterIcon from '@mui/icons-material/RouterOutlined'
 import TodayIcon from '@mui/icons-material/MarkEmailUnreadOutlined'
-import AllSmsIcon from '@mui/icons-material/MailOutline'
+import AllSmsIcon from '@mui/icons-material/MailOutlined'
 import TaskIcon from '@mui/icons-material/EventRepeatOutlined'
 import { api, type MessageStat, type Overview, type StatusPoint } from '../api'
 import { StatTile } from '../components/StatTile'
@@ -174,7 +174,9 @@ export function DashboardPage() {
             >
               <CardHeader
                 title={
-                  <Stack direction="row" spacing={1} alignItems="center">
+                  <Stack direction="row" spacing={1} sx={{
+                    alignItems: 'center'
+                  }}>
                     <Box
                       aria-hidden
                       sx={{
@@ -190,7 +192,9 @@ export function DashboardPage() {
                   </Stack>
                 }
                 subheader={
-                  <Typography variant="caption" color="text.secondary">
+                  <Typography variant="caption" sx={{
+                    color: 'text.secondary'
+                  }}>
                     {device.operator || '未注册'} · {device.iccid || '无卡'}
                   </Typography>
                 }
@@ -200,7 +204,12 @@ export function DashboardPage() {
                 <Stack spacing={2}>
                   <Stack direction="row" spacing={3}>
                     <Box>
-                      <Typography variant="caption" color="text.secondary" display="block">
+                      <Typography
+                        variant="caption"
+                        sx={{
+                          color: 'text.secondary',
+                          display: 'block'
+                        }}>
                         信号
                       </Typography>
                       <Typography sx={{ fontVariantNumeric: 'tabular-nums' }}>
@@ -208,13 +217,23 @@ export function DashboardPage() {
                       </Typography>
                     </Box>
                     <Box>
-                      <Typography variant="caption" color="text.secondary" display="block">
+                      <Typography
+                        variant="caption"
+                        sx={{
+                          color: 'text.secondary',
+                          display: 'block'
+                        }}>
                         注册
                       </Typography>
                       <Typography>{device.registered ? '已注册' : '未注册'}</Typography>
                     </Box>
                     <Box>
-                      <Typography variant="caption" color="text.secondary" display="block">
+                      <Typography
+                        variant="caption"
+                        sx={{
+                          color: 'text.secondary',
+                          display: 'block'
+                        }}>
                         最后上报
                       </Typography>
                       <Typography>{relativeTs(device.last_seen_at)}</Typography>
@@ -240,7 +259,12 @@ export function DashboardPage() {
           />
           <CardContent sx={{ pt: 0 }}>
             {recent.length === 0 ? (
-              <Typography variant="body2" color="text.secondary" sx={{ py: 3 }}>
+              <Typography
+                variant="body2"
+                sx={{
+                  color: 'text.secondary',
+                  py: 3
+                }}>
                 还没有短信
               </Typography>
             ) : (
@@ -347,7 +371,13 @@ function TrendCard({
             <CircularProgress size={24} />
           </Box>
         ) : data.every((d) => d.received === 0 && d.sent === 0) ? (
-          <Typography variant="body2" color="text.secondary" sx={{ py: 3, textAlign: 'center' }}>
+          <Typography
+            variant="body2"
+            sx={{
+              color: 'text.secondary',
+              py: 3,
+              textAlign: 'center'
+            }}>
             这段时间还没有短信
           </Typography>
         ) : (

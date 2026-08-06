@@ -70,7 +70,9 @@ export function DevicesPage() {
                   </Typography>
                 }
                 subheader={
-                  <Typography variant="caption" color="text.secondary">
+                  <Typography variant="caption" sx={{
+                    color: 'text.secondary'
+                  }}>
                     {device.port} · agent {device.agent_id}
                   </Typography>
                 }
@@ -96,7 +98,12 @@ export function DevicesPage() {
                       ['最后上报', formatTs(device.last_seen_at)],
                     ].map(([label, value]) => (
                       <Box key={label}>
-                        <Typography variant="caption" color="text.secondary" display="block">
+                        <Typography
+                          variant="caption"
+                          sx={{
+                            color: 'text.secondary',
+                            display: 'block'
+                          }}>
                           {label}
                         </Typography>
                         <Typography variant="body2" sx={{ wordBreak: 'break-all' }}>
@@ -177,7 +184,9 @@ function AtConsole({
         avatar={<TerminalIcon />}
         title={<Typography variant="h3">AT 调试台</Typography>}
         subheader={
-          <Typography variant="caption" color="text.secondary">
+          <Typography variant="caption" sx={{
+            color: 'text.secondary'
+          }}>
             直接下发 AT 指令到模块。参考 docs.openluat.com/air780e/at
           </Typography>
         }

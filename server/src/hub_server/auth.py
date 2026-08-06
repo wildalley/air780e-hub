@@ -11,7 +11,7 @@ import hashlib
 import hmac
 import secrets
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from .db import Database, utcnow
 
@@ -116,7 +116,7 @@ class Auth:
 
     def create_session(self, label: str = "") -> str:
         token = secrets.token_urlsafe(32)
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         self.db.execute(
             "INSERT INTO sessions (token_hash, created_at, expires_at, label) "
             "VALUES (?, ?, ?, ?)",
@@ -142,7 +142,7 @@ class Auth:
             expires = datetime.fromisoformat(row["expires_at"])
         except ValueError:
             return False
-        if expires <= datetime.now(timezone.utc):
+        if expires <= datetime.now(UTC):
             self.revoke_session(token)
             return False
         return True
@@ -158,7 +158,7 @@ class Auth:
     def purge_expired_sessions(self) -> int:
         return self.db.execute(
             "DELETE FROM sessions WHERE expires_at < ?",
-            (datetime.now(timezone.utc).isoformat(timespec="seconds"),),
+            (datetime.now(UTC).isoformat(timespec="seconds"),),
         ).rowcount
 
 

@@ -4,7 +4,11 @@
 #   docker build -t air780e-hub -f server/Dockerfile .
 
 # --- frontend ---------------------------------------------------------------
-FROM node:25-alpine AS frontend
+# Must match `node-version` in .github/workflows/{ci,security}.yml: CI is what
+# proves the bundle builds, and a different major here means the artefact that
+# ships was never the one CI validated.  24 is the active LTS (Krypton); 25 is
+# a current release with no LTS window.
+FROM node:24-alpine AS frontend
 
 WORKDIR /build
 COPY frontend/package.json frontend/package-lock.json frontend/.npmrc ./

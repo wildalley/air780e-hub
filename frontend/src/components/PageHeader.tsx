@@ -18,20 +18,32 @@ export function PageHeader({ title, subtitle, actions }: Props) {
   return (
     <Stack
       direction={{ xs: 'column', sm: 'row' }}
-      alignItems={{ sm: 'center' }}
       spacing={1.5}
-      sx={{ minHeight: 44 }}
-    >
+      sx={{
+        alignItems: { sm: 'center' },
+        minHeight: 44
+      }}>
       <Box sx={{ flexGrow: 1, minWidth: 0 }}>
         <Typography variant="h1">{title}</Typography>
         {subtitle && (
-          <Typography variant="body2" color="text.secondary" sx={{ mt: 0.25 }}>
+          <Typography
+            variant="body2"
+            sx={{
+              color: 'text.secondary',
+              mt: 0.25
+            }}>
             {subtitle}
           </Typography>
         )}
       </Box>
       {actions && (
-        <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
+        <Stack
+          direction="row"
+          spacing={1}
+          sx={{
+            alignItems: 'center',
+            flexWrap: 'wrap'
+          }}>
           {actions}
         </Stack>
       )}

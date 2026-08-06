@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import UTC
 from pathlib import Path
 
 import pytest
@@ -149,10 +150,10 @@ def _greet(ws) -> list[dict]:
 
 
 def _minutes_ago(minutes: int) -> str:
-    from datetime import datetime, timedelta, timezone
+    from datetime import datetime, timedelta
 
     return (
-        datetime.now(timezone.utc) - timedelta(minutes=minutes)
+        datetime.now(UTC) - timedelta(minutes=minutes)
     ).isoformat(timespec="seconds")
 
 
@@ -480,7 +481,7 @@ def test_history_window_respects_offset_timestamps(admin):
 
 
 def test_message_timestamps_are_normalised_to_utc(admin):
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     with _connect(admin) as ws:
         _greet(ws)
@@ -493,7 +494,7 @@ def test_message_timestamps_are_normalised_to_utc(admin):
 
     stored = admin.get("/api/messages").json()["items"][0]["ts"]
     parsed = datetime.fromisoformat(stored)
-    assert parsed.utcoffset() == timezone.utc.utcoffset(None)
+    assert parsed.utcoffset() == UTC.utcoffset(None)
     assert parsed == datetime.fromisoformat("2026-08-02T18:00:00+08:00")
 
 
@@ -1121,3 +1122,72 @@ def test_spa_catch_all_does_not_escape_the_bundle(tmp_path, monkeypatch):
     with TestClient(main_module.create_app(settings)) as client:
         response = client.get("/../secret.txt")
         assert "not for the web" not in response.text
+
+
+# --------------------------------------------------------------------------
+# backup and restore
+# --------------------------------------------------------------------------
+
+
+def test_backup_restore_round_trip(admin):
+    """A backup this server produced must be accepted back.
+
+    The happy path was the one nobody exercised: ``validate_backup`` reached
+    its table check only for files that pass the integrity check, so every
+    *genuine* backup hit it and every malformed upload was rejected earlier.
+    A 500 on the one input that must work is invisible without this test.
+    """
+    snapshot = admin.get("/api/system/backup")
+    assert snapshot.status_code == 200
+    assert len(snapshot.content) > 0
+
+    restored = admin.post(
+        "/api/system/restore",
+        content=snapshot.content,
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["ok"] is True
+
+    # The session and the data survive the swap.
+    assert admin.get("/api/overview").status_code == 200
+
+
+def test_restore_rejects_unrelated_sqlite(admin, tmp_path):
+    """A valid SQLite file that is not a hub database is refused."""
+    import sqlite3
+
+    other = tmp_path / "unrelated.db"
+    conn = sqlite3.connect(other)
+    conn.execute("CREATE TABLE greetings (word TEXT)")
+    conn.commit()
+    conn.close()
+
+    response = admin.post(
+        "/api/system/restore",
+        content=other.read_bytes(),
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    assert response.status_code == 400
+    assert "缺少表" in response.json()["detail"]
+
+
+def test_restore_rejects_garbage_and_empty_uploads(admin):
+    """Neither a non-database blob nor an empty body may reach the live data."""
+    garbage = admin.post(
+        "/api/system/restore",
+        content=b"this is definitely not a sqlite file" * 32,
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    assert garbage.status_code == 400
+
+    empty = admin.post(
+        "/api/system/restore",
+        content=b"",
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    assert empty.status_code == 400
+    assert "未收到备份文件" in empty.json()["detail"]
+
+    # The server is still serving after both rejections.
+    assert admin.get("/api/overview").status_code == 200

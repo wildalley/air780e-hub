@@ -11,9 +11,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Callable, Protocol
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, Protocol
 
 from .at import ATClient, ATError, SerialTransport, Transport
 from .config import DeviceConfig
@@ -43,7 +44,7 @@ def _default_transport(config: DeviceConfig) -> Transport:
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    return datetime.now(UTC).astimezone().isoformat(timespec="seconds")
 
 
 @dataclass
@@ -93,7 +94,7 @@ class DeviceWorker:
         status_interval: float = 60.0,
         reconnect_max_delay: float = 60.0,
         transport_factory: TransportFactory = _default_transport,
-        registry: "PortRegistry | None" = None,
+        registry: PortRegistry | None = None,
     ) -> None:
         self.config = config
         self.store = store

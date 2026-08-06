@@ -130,12 +130,16 @@ export function SignalChart({ series, hours, onHoursChange }: Props) {
       <CardHeader
         title={<Typography variant="h3">信号强度</Typography>}
         subheader={
-          <Typography variant="caption" color="text.secondary">
+          <Typography variant="caption" sx={{
+            color: 'text.secondary'
+          }}>
             每个模块一条线,数值为 dBm(越接近 0 越强)
           </Typography>
         }
         action={
-          <Stack direction="row" spacing={1} alignItems="center">
+          <Stack direction="row" spacing={1} sx={{
+            alignItems: 'center'
+          }}>
             <ToggleButtonGroup
               size="small"
               exclusive
@@ -166,7 +170,9 @@ export function SignalChart({ series, hours, onHoursChange }: Props) {
             text tokens; the coloured line-key beside it carries identity. */}
         <Stack direction="row" spacing={3} sx={{ mb: 2, flexWrap: 'wrap' }}>
           {series.map((s) => (
-            <Stack key={s.name} direction="row" spacing={1} alignItems="center">
+            <Stack key={s.name} direction="row" spacing={1} sx={{
+              alignItems: 'center'
+            }}>
               <Box
                 aria-hidden
                 sx={{
@@ -176,7 +182,9 @@ export function SignalChart({ series, hours, onHoursChange }: Props) {
                   bgcolor: seriesColor(mode, s.index),
                 }}
               />
-              <Typography variant="body2" color="text.secondary">
+              <Typography variant="body2" sx={{
+                color: 'text.secondary'
+              }}>
                 {s.label}
               </Typography>
               <Typography variant="body2" sx={{ fontVariantNumeric: 'tabular-nums' }}>
@@ -188,14 +196,16 @@ export function SignalChart({ series, hours, onHoursChange }: Props) {
 
         {empty ? (
           <Box sx={{ py: 6, textAlign: 'center' }}>
-            <Typography variant="body2" color="text.secondary">
+            <Typography variant="body2" sx={{
+              color: 'text.secondary'
+            }}>
               还没有采样数据 —— agent 连上并上报后这里会有曲线
             </Typography>
           </Box>
         ) : view === 'chart' ? (
           // Height covers the plot *and* the x-axis band, so the card never
           // grows an inner scrollbar just to reach the tick labels.
-          <Box sx={{ height: 300 }}>
+          (<Box sx={{ height: 300 }}>
             <ResponsiveContainer width="100%" height="100%">
               <LineChart data={rows} margin={{ top: 8, right: 16, bottom: 8, left: 0 }}>
                 <CartesianGrid
@@ -236,7 +246,9 @@ export function SignalChart({ series, hours, onHoursChange }: Props) {
                     if (!active || !payload?.length) return null
                     return (
                       <Paper sx={{ px: 1.5, py: 1 }}>
-                        <Typography variant="caption" color="text.secondary">
+                        <Typography variant="caption" sx={{
+                          color: 'text.secondary'
+                        }}>
                           {formatTime(Number(label), hours)}
                         </Typography>
                         {payload.map((entry) => {
@@ -246,7 +258,9 @@ export function SignalChart({ series, hours, onHoursChange }: Props) {
                               key={String(entry.dataKey)}
                               direction="row"
                               spacing={1}
-                              alignItems="center"
+                              sx={{
+                                alignItems: 'center'
+                              }}
                             >
                               <Box
                                 aria-hidden
@@ -293,7 +307,7 @@ export function SignalChart({ series, hours, onHoursChange }: Props) {
                 ))}
               </LineChart>
             </ResponsiveContainer>
-          </Box>
+          </Box>)
         ) : (
           <TableContainer sx={{ maxHeight: 300 }}>
             <Table size="small" stickyHeader>

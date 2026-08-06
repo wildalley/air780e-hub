@@ -17,9 +17,10 @@ import json
 import logging
 import sqlite3
 import threading
-from datetime import datetime, timedelta, timezone
+from collections.abc import Iterable
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -248,7 +249,7 @@ CREATE INDEX IF NOT EXISTS idx_notify_logs_ts ON notify_logs(ts);
 
 
 def utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(UTC).isoformat(timespec="seconds")
 
 
 def to_utc_iso(value: str | None) -> str:
@@ -268,8 +269,8 @@ def to_utc_iso(value: str | None) -> str:
     except ValueError:
         return utcnow()
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc).isoformat(timespec="seconds")
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).isoformat(timespec="seconds")
 
 
 class Database:
@@ -693,21 +694,21 @@ class Database:
         }
         if message_days > 0:
             cutoff = (
-                datetime.now(timezone.utc) - timedelta(days=message_days)
+                datetime.now(UTC) - timedelta(days=message_days)
             ).isoformat()
             removed["messages"] = self.execute(
                 "DELETE FROM messages WHERE ts < ?", (cutoff,)
             ).rowcount
         if status_days > 0:
             cutoff = (
-                datetime.now(timezone.utc) - timedelta(days=status_days)
+                datetime.now(UTC) - timedelta(days=status_days)
             ).isoformat()
             removed["status"] = self.execute(
                 "DELETE FROM device_status WHERE ts < ?", (cutoff,)
             ).rowcount
         if log_days > 0:
             cutoff = (
-                datetime.now(timezone.utc) - timedelta(days=log_days)
+                datetime.now(UTC) - timedelta(days=log_days)
             ).isoformat()
             for table in ("agent_logs", "task_logs", "notify_logs"):
                 removed[table] = self.execute(
@@ -715,7 +716,7 @@ class Database:
                 ).rowcount
         if audit_days > 0:
             cutoff = (
-                datetime.now(timezone.utc) - timedelta(days=audit_days)
+                datetime.now(UTC) - timedelta(days=audit_days)
             ).isoformat()
             removed["audit_events"] = self.execute(
                 "DELETE FROM audit_events WHERE ts < ?", (cutoff,)
@@ -735,7 +736,7 @@ class Database:
             # Only closed incidents age out; an unresolved one stays until it
             # recovers or an admin acts on it, however old it is.
             cutoff = (
-                datetime.now(timezone.utc) - timedelta(days=incident_days)
+                datetime.now(UTC) - timedelta(days=incident_days)
             ).isoformat()
             removed["incidents"] = self.execute(
                 "DELETE FROM incidents "
@@ -744,7 +745,7 @@ class Database:
                 (cutoff,),
             ).rowcount
         # Idempotency records only need to outlive a plausible replay window.
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+        cutoff = (datetime.now(UTC) - timedelta(days=7)).isoformat()
         removed["ingested"] = self.execute(
             "DELETE FROM ingested WHERE at < ?", (cutoff,)
         ).rowcount
@@ -772,8 +773,8 @@ class Database:
         finally:
             target.close()
 
-    @staticmethod
-    def validate_backup(path: str | Path) -> None:
+    @classmethod
+    def validate_backup(cls, path: str | Path) -> None:
         """Raise ValueError unless *path* is a readable hub SQLite database.
 
         Runs an integrity check and confirms the core tables are present, so a
@@ -798,7 +799,7 @@ class Database:
             raise ValueError(f"文件不是有效的 SQLite 数据库: {exc}") from exc
         finally:
             conn.close()
-        missing = self._REQUIRED_TABLES - names
+        missing = cls._REQUIRED_TABLES - names
         if missing:
             raise ValueError(
                 "这不是有效的 Hub 备份(缺少表: "

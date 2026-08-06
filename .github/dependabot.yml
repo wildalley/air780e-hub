@@ -1,27 +1,80 @@
 version: 2
+
+# 分组的目的不是少收 PR，而是让"必须同时移动"的包不会被拆开：
+# 拆开就意味着锁文件在中间状态无法解析（见 @types/react-dom 单独升到 19.x
+# 而 @types/react 留在 18.x 导致的 npm ci ERESOLVE）。
 updates:
   - package-ecosystem: pip
     directory: /agent
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      # pytest 与其插件的兼容性按 pytest 大版本走，分开升容易出现插件不支持。
+      pytest:
+        patterns:
+          - pytest
+          - pytest-*
+
   - package-ecosystem: pip
     directory: /server
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      pytest:
+        patterns:
+          - pytest
+          - pytest-*
+
   - package-ecosystem: npm
     directory: /frontend
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      # runtime、@types 和 router 必须同批：
+      #   - @types/react-dom 的 peer 锁死 @types/react 大版本（PR #8 就死在这）;
+      #   - react-router 8 的 peer 要求 react >=19.2.7。
+      # 三者任意一个单独移动都可能让锁文件落到无法解析的中间状态。
+      react:
+        patterns:
+          - react
+          - react-dom
+          - react-router
+          - "@types/react"
+          - "@types/react-dom"
+      # MUI 各包版本号联动发布，混版会出现重复 emotion 实例和主题类型冲突。
+      mui:
+        patterns:
+          - "@mui/*"
+          - "@emotion/*"
+      # plugin-react 的 peer 声明钉住 vite 大版本（6.x 只接受 vite ^8）。
+      vite:
+        patterns:
+          - vite
+          - "@vitejs/*"
+          - vite-plugin-pwa
+
   - package-ecosystem: docker
     directory: /server
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    ignore:
+      # Node 大版本跟随 LTS，由人工在 LTS 切换时一并更新三处（两个 workflow
+      # 的 node-version 和 Dockerfile 的 FROM）。放开大版本会让 Dependabot
+      # 推到非 LTS 线上 —— node:25-alpine 就是这么进来的。
+      # minor / patch 不受影响，安全更新照常送达。
+      - dependency-name: node
+        update-types: ["version-update:semver-major"]
+
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      github-actions:
+        patterns:
+          - "*"

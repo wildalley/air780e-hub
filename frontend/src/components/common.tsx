@@ -1,6 +1,6 @@
 import { Alert, Box, Chip, CircularProgress, Snackbar, useMediaQuery } from '@mui/material'
 import type { CSSObject } from '@mui/material/styles'
-import CheckIcon from '@mui/icons-material/CheckCircleOutline'
+import CheckIcon from '@mui/icons-material/CheckCircleOutlined'
 import OfflineIcon from '@mui/icons-material/CloudOffOutlined'
 import { useCallback, useState } from 'react'
 import { STATUS } from '../tokens'
