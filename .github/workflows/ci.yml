@@ -26,7 +26,7 @@ jobs:
         working-directory: agent
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:
@@ -51,7 +51,7 @@ jobs:
         working-directory: server
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:
@@ -72,7 +72,7 @@ jobs:
         working-directory: frontend
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
@@ -89,7 +89,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Validate Compose file
         run: docker compose -f deploy/docker-compose.yml config --quiet
 
@@ -98,7 +98,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Check local Markdown links
         uses: lycheeverse/lychee-action@v2
         with:
