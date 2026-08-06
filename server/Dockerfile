@@ -4,7 +4,7 @@
 #   docker build -t air780e-hub -f server/Dockerfile .
 
 # --- frontend ---------------------------------------------------------------
-FROM node:22-alpine AS frontend
+FROM node:25-alpine AS frontend
 
 WORKDIR /build
 COPY frontend/package.json frontend/package-lock.json frontend/.npmrc ./
