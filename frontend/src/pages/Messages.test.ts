@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { detectOtp } from './Messages'
+import type { Conversation } from '../api'
+import { detectOtp, resolveThread } from './Messages'
 
 /**
  * `detectOtp` drives the copy-code button on every received message, so its
@@ -40,5 +41,79 @@ describe('detectOtp', () => {
     // second identical call return something different.
     expect(detectOtp('code: 9999')).toBe('9999')
     expect(detectOtp('code: 9999')).toBe('9999')
+  })
+})
+
+/**
+ * `resolveThread` replaced an effect that copied the clicked row into state and
+ * then re-synced it whenever the list refetched. These cases are the reasons
+ * that effect existed — they have to keep holding without it.
+ */
+describe('resolveThread', () => {
+  const thread = (over: Partial<Conversation> = {}): Conversation => ({
+    sim_id: 1,
+    peer: '10086',
+    device: 'ttyUSB0',
+    last_id: 5,
+    last_body: 'old',
+    last_direction: 'in',
+    last_status: 'received',
+    last_ts: '2026-08-06T00:00:00',
+    message_count: 2,
+    sim_label: '移动主卡',
+    ...over,
+  })
+
+  it('returns nothing when no thread is open', () => {
+    expect(resolveThread(null, [thread()], null)).toBeNull()
+  })
+
+  it('prefers the list row over the one that was clicked', () => {
+    // The point of the whole change: a reply lands, the list refetches, and the
+    // header must show the new preview instead of the snapshot from the click.
+    const clicked = thread({ last_id: 5, last_body: 'old', message_count: 2 })
+    const refetched = thread({ last_id: 9, last_body: 'sent reply', message_count: 3 })
+
+    const resolved = resolveThread({ peer: '10086', sim_id: 1 }, [refetched], clicked)
+
+    expect(resolved?.last_body).toBe('sent reply')
+    expect(resolved?.last_id).toBe(9)
+    expect(resolved?.message_count).toBe(3)
+  })
+
+  it('matches on card as well as number', () => {
+    // Same number on two cards is two conversations. Matching peer alone would
+    // open the wrong one.
+    const onCardOne = thread({ sim_id: 1, last_body: 'card one' })
+    const onCardTwo = thread({ sim_id: 2, last_body: 'card two' })
+
+    const resolved = resolveThread({ peer: '10086', sim_id: 2 }, [onCardOne, onCardTwo], null)
+
+    expect(resolved?.last_body).toBe('card two')
+  })
+
+  it('treats a thread with no card as distinct from one on a card', () => {
+    const unassigned = thread({ sim_id: null, last_body: 'no card' })
+    const assigned = thread({ sim_id: 1, last_body: 'card one' })
+
+    expect(resolveThread({ peer: '10086', sim_id: null }, [assigned, unassigned], null)?.last_body)
+      .toBe('no card')
+  })
+
+  it('falls back to the clicked row when the list does not have it', () => {
+    // Opened from full-text search: the match can be older than the
+    // conversations window, and the thread still has to render.
+    const fromSearch = thread({ peer: '95533', last_body: 'found by search' })
+
+    const resolved = resolveThread({ peer: '95533', sim_id: 1 }, [thread()], fromSearch)
+
+    expect(resolved?.last_body).toBe('found by search')
+  })
+
+  it('falls back while the list is still loading', () => {
+    // `threads` is undefined on first paint. Returning null here would flash
+    // the empty state over a thread the user just clicked.
+    const clicked = thread()
+    expect(resolveThread({ peer: '10086', sim_id: 1 }, undefined, clicked)).toBe(clicked)
   })
 })

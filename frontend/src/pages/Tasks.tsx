@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useState } from 'react'
 import {
   Alert,
   Box,
@@ -30,7 +30,8 @@ import {
 import AddIcon from '@mui/icons-material/Add'
 import EditIcon from '@mui/icons-material/EditOutlined'
 import DeleteIcon from '@mui/icons-material/DeleteOutlined'
-import { api, ApiError, type Device, type Task, type TaskInput, type TaskLog } from '../api'
+import useSWR from 'swr'
+import { api, ApiError, type Device, type Task, type TaskInput } from '../api'
 import { Loading, formatTs, useToast } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
 import { STATUS } from '../tokens'
@@ -76,25 +77,19 @@ function describeSchedule(task: Task): string {
 
 export function TasksPage() {
   const toast = useToast()
-  const [tasks, setTasks] = useState<Task[] | null>(null)
-  const [logs, setLogs] = useState<TaskLog[]>([])
-  const [devices, setDevices] = useState<Device[]>([])
   const [editing, setEditing] = useState<{ id: number | null; input: TaskInput } | null>(null)
 
-  const load = useCallback(async () => {
-    const [taskList, logList, deviceList] = await Promise.all([
-      api.tasks.list(),
-      api.tasks.logs(),
-      api.devices.list(),
-    ])
-    setTasks(taskList)
-    setLogs(logList)
-    setDevices(deviceList)
-  }, [])
+  const { data: tasks, mutate: mutateTasks } = useSWR('/api/tasks', () => api.tasks.list())
+  const { data: logs = [], mutate: mutateLogs } = useSWR('/api/task-logs', () => api.tasks.logs())
+  // Shared cache key with the devices page and the composer — the dropdown of
+  // modules costs nothing here if another view already fetched it.
+  const { data: devices = [] } = useSWR('/api/devices', () => api.devices.list())
 
-  useEffect(() => {
-    void load()
-  }, [load])
+  // A write changes the task list and, once the agent reports back, its log.
+  const load = useCallback(
+    () => Promise.all([mutateTasks(), mutateLogs()]),
+    [mutateTasks, mutateLogs],
+  )
 
   const save = async () => {
     if (!editing) return
@@ -116,7 +111,7 @@ export function TasksPage() {
     await load()
   }
 
-  if (tasks === null) return <Loading />
+  if (!tasks) return <Loading />
 
   return (
     <Stack spacing={3}>

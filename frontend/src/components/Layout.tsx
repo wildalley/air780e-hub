@@ -1,5 +1,6 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { useState, type ReactNode } from 'react'
 import { Link as RouterLink, useLocation } from 'react-router'
+import useSWR from 'swr'
 import {
   alpha,
   AppBar,
@@ -34,6 +35,7 @@ import LightIcon from '@mui/icons-material/LightModeOutlined'
 import DarkIcon from '@mui/icons-material/DarkModeOutlined'
 import LogoutIcon from '@mui/icons-material/LogoutOutlined'
 import { api } from '../api'
+import { LIVE_MS } from '../swr'
 import { VIZ, type Mode } from '../tokens'
 
 const WIDTH = 224
@@ -116,27 +118,20 @@ export function Layout({ children, mode, onToggleMode, onLogout }: Props) {
   const theme = useTheme()
   const location = useLocation()
   const [open, setOpen] = useState(false)
-  const [unread, setUnread] = useState(0)
-  const [incidents, setIncidents] = useState(0)
 
-  // The nav badge: cheap COUNT poll, same cadence as the dashboard refresh.
-  useEffect(() => {
-    let alive = true
-    const refresh = () =>
-      Promise.allSettled([api.messages.unread(), api.operations.incidentCount()]).then(
-        ([unreadResult, incidentResult]) => {
-          if (!alive) return
-          if (unreadResult.status === 'fulfilled') setUnread(unreadResult.value.total)
-          if (incidentResult.status === 'fulfilled') setIncidents(incidentResult.value.total)
-        },
-      )
-    void refresh()
-    const timer = setInterval(refresh, 15_000)
-    return () => {
-      alive = false
-      clearInterval(timer)
-    }
-  }, [])
+  // The nav badge: two cheap COUNT polls, same cadence as the dashboard.
+  // Separate keys on purpose — one endpoint failing must not blank the other
+  // badge, and the messages page shares `/api/messages/unread` from cache.
+  const { data: unreadData } = useSWR('/api/messages/unread', () => api.messages.unread(), {
+    refreshInterval: LIVE_MS,
+  })
+  const { data: incidentData } = useSWR(
+    '/api/operations/incidents/count',
+    () => api.operations.incidentCount(),
+    { refreshInterval: LIVE_MS },
+  )
+  const unread = unreadData?.total ?? 0
+  const incidents = incidentData?.total ?? 0
 
   const selectedTint = alpha(
     theme.palette.primary.main,

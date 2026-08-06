@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useState } from 'react'
 import {
   Card,
   CardContent,
@@ -13,7 +13,8 @@ import {
   Tabs,
   Typography,
 } from '@mui/material'
-import { api, type AgentLog, type NotifyLog } from '../api'
+import useSWR from 'swr'
+import { api } from '../api'
 import { Loading, formatTs } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
 import { STATUS } from '../tokens'
@@ -23,24 +24,21 @@ const LEVEL_COLOR: Record<string, string> = {
   warning: STATUS.warning,
 }
 
+const REFRESH_MS = 20_000
+
 export function LogsPage() {
   const [tab, setTab] = useState(0)
-  const [agentLogs, setAgentLogs] = useState<AgentLog[] | null>(null)
-  const [notifyLogs, setNotifyLogs] = useState<NotifyLog[]>([])
 
-  const load = useCallback(async () => {
-    const [agent, notify] = await Promise.all([api.logs(), api.notifyLogs()])
-    setAgentLogs(agent)
-    setNotifyLogs(notify)
-  }, [])
+  // Two keys, not one composite fetch: the visible tab is the one that has to
+  // be current, and a failure in either list leaves the other still rendering.
+  const { data: agentLogs } = useSWR('/api/logs', () => api.logs(), {
+    refreshInterval: REFRESH_MS,
+  })
+  const { data: notifyLogs = [] } = useSWR('/api/notify-logs', () => api.notifyLogs(), {
+    refreshInterval: REFRESH_MS,
+  })
 
-  useEffect(() => {
-    void load()
-    const timer = setInterval(() => void load(), 20_000)
-    return () => clearInterval(timer)
-  }, [load])
-
-  if (agentLogs === null) return <Loading />
+  if (!agentLogs) return <Loading />
 
   return (
     <Stack spacing={3}>

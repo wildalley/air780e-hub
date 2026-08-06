@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { Link as RouterLink } from 'react-router'
 import {
   Box,
@@ -31,62 +31,44 @@ import RouterIcon from '@mui/icons-material/RouterOutlined'
 import TodayIcon from '@mui/icons-material/MarkEmailUnreadOutlined'
 import AllSmsIcon from '@mui/icons-material/MailOutlined'
 import TaskIcon from '@mui/icons-material/EventRepeatOutlined'
-import { api, type MessageStat, type Overview, type StatusPoint } from '../api'
+import useSWR from 'swr'
+import { api, type MessageStat } from '../api'
 import { StatTile } from '../components/StatTile'
 import { StorageMeter } from '../components/StorageMeter'
 import { SignalChart, type SignalSeries } from '../components/SignalChart'
 import { Loading, OnlineChip, entranceStyle, formatTs, relativeTs } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
+import { LIVE_MS } from '../swr'
 import { STATUS, VIZ, seriesColor } from '../tokens'
 import { useTheme } from '@mui/material/styles'
 import type { Mode } from '../tokens'
 
-const REFRESH_MS = 15_000
+/** The trend chart moves on the scale of days — it does not need 15 s. */
+const TREND_MS = 60_000
 
 export function DashboardPage() {
   const theme = useTheme()
   const mode = theme.palette.mode as Mode
   const viz = VIZ[mode]
-  const [overview, setOverview] = useState<Overview | null>(null)
-  const [history, setHistory] = useState<Record<string, StatusPoint[]>>({})
   const [hours, setHours] = useState(24)
-  const [stats, setStats] = useState<MessageStat[] | null>(null)
   const [statsDays, setStatsDays] = useState(30)
 
-  const load = useCallback(async () => {
-    const [data, statusHistory] = await Promise.all([
-      api.overview(),
-      api.devices.histories(hours).catch(() => ({})),
-    ])
-    setOverview(data)
-    setHistory(statusHistory)
-  }, [hours])
-
-  useEffect(() => {
-    void load()
-    // Refetch holds the previous render rather than flashing a skeleton.
-    const timer = setInterval(() => void load(), REFRESH_MS)
-    return () => clearInterval(timer)
-  }, [load])
-
-  // The trend chart moves on the scale of days, not seconds — a slow poll is
-  // enough, and it must not sit on the dashboard's 15 s refresh.
-  useEffect(() => {
-    let alive = true
-    const refresh = () =>
-      api.stats
-        .messages(statsDays)
-        .then((rows) => {
-          if (alive) setStats(rows)
-        })
-        .catch(() => {})
-    void refresh()
-    const timer = setInterval(refresh, 60_000)
-    return () => {
-      alive = false
-      clearInterval(timer)
-    }
-  }, [statsDays])
+  const { data: overview } = useSWR('/api/overview', () => api.overview(), {
+    // Revalidation holds the previous render rather than flashing a skeleton.
+    refreshInterval: LIVE_MS,
+  })
+  // Separate key per window, so flipping 24h/7d serves an already-fetched
+  // range from cache instead of refetching it.
+  const { data: history = {} } = useSWR(
+    ['/api/devices/history', hours],
+    () => api.devices.histories(hours),
+    { refreshInterval: LIVE_MS, keepPreviousData: true },
+  )
+  const { data: stats } = useSWR(
+    ['/api/stats/messages', statsDays],
+    () => api.stats.messages(statsDays),
+    { refreshInterval: TREND_MS, keepPreviousData: true },
+  )
 
   if (!overview) return <Loading />
 
@@ -150,7 +132,7 @@ export function DashboardPage() {
       </Box>
 
       <Box sx={entranceStyle(240)}>
-        <TrendCard stats={stats} days={statsDays} onDaysChange={setStatsDays} viz={viz} />
+        <TrendCard stats={stats ?? null} days={statsDays} onDaysChange={setStatsDays} viz={viz} />
       </Box>
 
       <Box

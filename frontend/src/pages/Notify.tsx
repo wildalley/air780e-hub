@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useState } from 'react'
 import {
   Alert,
   Box,
@@ -31,12 +31,12 @@ import AddIcon from '@mui/icons-material/Add'
 import DeleteIcon from '@mui/icons-material/DeleteOutlined'
 import EditIcon from '@mui/icons-material/EditOutlined'
 import SendIcon from '@mui/icons-material/SendOutlined'
+import useSWR from 'swr'
 import {
   api,
   ApiError,
   type Channel,
   type ChannelInput,
-  type NotifySettings,
   type Rule,
   type RuleInput,
   type RulePreview,
@@ -136,27 +136,22 @@ function parseConfig(channel: Channel): Record<string, string> {
 
 export function NotifyPage() {
   const toast = useToast()
-  const [channels, setChannels] = useState<Channel[] | null>(null)
-  const [rules, setRules] = useState<Rule[]>([])
-  const [sims, setSims] = useState<Sim[]>([])
   const [channelEdit, setChannelEdit] = useState<Channel | null | undefined>(undefined)
   const [ruleEdit, setRuleEdit] = useState<Rule | null | undefined>(undefined)
   const [testing, setTesting] = useState<number | null>(null)
 
-  const load = useCallback(async () => {
-    const [channelList, ruleList, simList] = await Promise.all([
-      api.channels.list(),
-      api.rules.list(),
-      api.sims.list(),
-    ])
-    setChannels(channelList)
-    setRules(ruleList)
-    setSims(simList)
-  }, [])
+  const { data: channels, mutate: mutateChannels } = useSWR('/api/channels', () =>
+    api.channels.list(),
+  )
+  const { data: rules = [], mutate: mutateRules } = useSWR('/api/rules', () => api.rules.list())
+  const { data: sims = [] } = useSWR('/api/sims', () => api.sims.list())
 
-  useEffect(() => {
-    void load()
-  }, [load])
+  // Rules carry a denormalised `channel_name`, so renaming or deleting a
+  // channel has to refetch both lists, not just the one that was written.
+  const load = useCallback(
+    () => Promise.all([mutateChannels(), mutateRules()]),
+    [mutateChannels, mutateRules],
+  )
 
   const runTest = async (channel: Channel) => {
     setTesting(channel.id)
@@ -188,7 +183,7 @@ export function NotifyPage() {
     await load()
   }
 
-  if (channels === null) return <Loading />
+  if (!channels) return <Loading />
 
   return (
     <Stack spacing={3}>
@@ -581,27 +576,29 @@ function SettingsCard({
   onSaved: () => void
   onError: (message: string) => void
 }) {
-  const [settings, setSettings] = useState<NotifySettings | null>(null)
-  // Kept as a string so the field can be temporarily empty while typing.
-  const [retention, setRetention] = useState('')
-  const [offlineAlerts, setOfflineAlerts] = useState(false)
+  // Two `null` drafts, meaning "not touched yet". Seeding form state from an
+  // effect would fight the fetch: a background revalidation landing mid-edit
+  // would silently overwrite what the user typed.
+  const [retentionDraft, setRetentionDraft] = useState<string | null>(null)
+  const [alertsDraft, setAlertsDraft] = useState<boolean | null>(null)
   const [saving, setSaving] = useState(false)
 
-  useEffect(() => {
-    void api.notifySettings
-      .get()
-      .then((s) => {
-        setSettings(s)
-        setRetention(String(s.message_retention_days))
-        setOfflineAlerts(s.offline_alerts_enabled)
-      })
-      .catch((err) => onError(err instanceof ApiError ? err.message : '加载设置失败'))
-  }, [onError])
+  const { data: settings, mutate } = useSWR(
+    '/api/notify-settings',
+    () => api.notifySettings.get(),
+    { onError: (err) => onError(err instanceof ApiError ? err.message : '加载设置失败') },
+  )
+
+  // Kept as a string so the field can be temporarily empty while typing.
+  const retention = retentionDraft ?? String(settings?.message_retention_days ?? '')
+  const offlineAlerts = alertsDraft ?? settings?.offline_alerts_enabled ?? false
+  const setRetention = setRetentionDraft
+  const setOfflineAlerts = setAlertsDraft
 
   const days = Math.round(Number(retention))
   const daysValid = retention.trim() !== '' && Number.isFinite(days) && days >= 0 && days <= 3650
   const dirty =
-    settings !== null &&
+    settings !== undefined &&
     (days !== settings.message_retention_days || offlineAlerts !== settings.offline_alerts_enabled)
 
   const save = async () => {
@@ -612,9 +609,10 @@ function SettingsCard({
         message_retention_days: days,
         offline_alerts_enabled: offlineAlerts,
       })
-      setSettings(next)
-      setRetention(String(next.message_retention_days))
-      setOfflineAlerts(next.offline_alerts_enabled)
+      await mutate(next, { revalidate: false })
+      // Drop the drafts so the fields track the saved server values again.
+      setRetentionDraft(null)
+      setAlertsDraft(null)
       onSaved()
     } catch (err) {
       onError(err instanceof ApiError ? err.message : '保存失败')
@@ -627,7 +625,7 @@ function SettingsCard({
     <Card>
       <CardHeader title={<Typography variant="h3">短信与告警</Typography>} />
       <CardContent sx={{ pt: 0 }}>
-        {settings === null ? (
+        {settings === undefined ? (
           <CircularProgress size={20} />
         ) : (
           <Stack spacing={2}>

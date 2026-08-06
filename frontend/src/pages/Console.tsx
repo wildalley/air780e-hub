@@ -19,7 +19,8 @@ import {
 import { useTheme } from '@mui/material/styles'
 import SendIcon from '@mui/icons-material/SendOutlined'
 import ClearIcon from '@mui/icons-material/DeleteSweepOutlined'
-import { api, ApiError, type Device } from '../api'
+import useSWR from 'swr'
+import { api, ApiError } from '../api'
 import { Loading } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
 import { STATUS, VIZ } from '../tokens'
@@ -93,7 +94,6 @@ export function ConsolePage() {
   const theme = useTheme()
   const viz = VIZ[theme.palette.mode]
 
-  const [devices, setDevices] = useState<Device[] | null>(null)
   const [device, setDevice] = useState('')
   const [entries, setEntries] = useState<Entry[]>([])
   const [draft, setDraft] = useState('')
@@ -108,14 +108,13 @@ export function ConsolePage() {
   const bottom = useRef<HTMLDivElement | null>(null)
   const inputRef = useRef<HTMLInputElement | null>(null)
 
-  useEffect(() => {
-    void api.devices.list().then((rows) => {
-      setDevices(rows)
-      // 默认选中第一个在线模块;都不在线就退回列表第一个,让用户至少能看清选了谁.
-      const online = rows.find((d) => d.online)
-      setDevice((online ?? rows[0])?.name ?? '')
-    })
-  }, [])
+  const { data: devices } = useSWR('/api/devices', () => api.devices.list(), {
+    // 默认选中第一个在线模块;都不在线就退回列表第一个,让用户至少能看清选了谁.
+    // 只在还没选过时落一次 —— 后台重新校验不该把用户选中的模块换掉.
+    onSuccess: (rows) => {
+      setDevice((current) => current || (rows.find((d) => d.online) ?? rows[0])?.name || '')
+    },
+  })
 
   useEffect(() => {
     bottom.current?.scrollIntoView({ block: 'end' })
@@ -214,7 +213,7 @@ export function ConsolePage() {
   )
   const online = Boolean(selected?.online)
 
-  if (devices === null) return <Loading />
+  if (!devices) return <Loading />
 
   const tooShort = draft.trim().length > 0 && draft.trim().length < CMD_MIN
 

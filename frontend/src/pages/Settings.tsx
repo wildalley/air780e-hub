@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import {
   Alert,
   Box,
@@ -32,10 +32,6 @@ export function SettingsPage({ onPasswordChanged }: { onPasswordChanged: () => v
   const [graceMinutes, setGraceMinutes] = useState(60)
   const [rotating, setRotating] = useState(false)
   const [purged, setPurged] = useState<Record<string, number> | null>(null)
-
-  useEffect(() => {
-    setPurged(null)
-  }, [])
 
   const changePassword = async () => {
     if (next !== confirm) {

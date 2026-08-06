@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useState } from 'react'
 import {
   Alert,
   Button,
@@ -13,6 +13,7 @@ import {
   TableRow,
   TextField,
 } from '@mui/material'
+import useSWR from 'swr'
 import { api, ApiError, type Sim } from '../api'
 import { Loading, formatTs, useToast } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
@@ -26,14 +27,9 @@ import { PageHeader } from '../components/PageHeader'
  */
 export function SimsPage() {
   const toast = useToast()
-  const [sims, setSims] = useState<Sim[] | null>(null)
   const [drafts, setDrafts] = useState<Record<number, Partial<Sim>>>({})
 
-  const load = useCallback(async () => setSims(await api.sims.list()), [])
-
-  useEffect(() => {
-    void load()
-  }, [load])
+  const { data: sims, mutate: load } = useSWR('/api/sims', () => api.sims.list())
 
   const save = async (sim: Sim) => {
     const draft = drafts[sim.id]
@@ -55,7 +51,7 @@ export function SimsPage() {
   const edit = (id: number, field: keyof Sim, value: string) =>
     setDrafts((current) => ({ ...current, [id]: { ...current[id], [field]: value } }))
 
-  if (sims === null) return <Loading />
+  if (!sims) return <Loading />
 
   return (
     <Stack spacing={3}>

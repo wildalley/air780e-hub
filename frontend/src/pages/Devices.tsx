@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useState } from 'react'
 import {
   Alert,
   Box,
@@ -13,6 +13,7 @@ import {
 } from '@mui/material'
 import RefreshIcon from '@mui/icons-material/RefreshOutlined'
 import TerminalIcon from '@mui/icons-material/TerminalOutlined'
+import useSWR from 'swr'
 import { api, ApiError, type Device } from '../api'
 import { Loading, OnlineChip, formatTs, useToast } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
@@ -20,14 +21,9 @@ import { StorageMeter } from '../components/StorageMeter'
 
 export function DevicesPage() {
   const toast = useToast()
-  const [devices, setDevices] = useState<Device[] | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
 
-  const load = useCallback(async () => setDevices(await api.devices.list()), [])
-
-  useEffect(() => {
-    void load()
-  }, [load])
+  const { data: devices, mutate: load } = useSWR('/api/devices', () => api.devices.list())
 
   const refresh = async (device: Device) => {
     setBusy(device.name)
@@ -42,7 +38,7 @@ export function DevicesPage() {
     }
   }
 
-  if (devices === null) return <Loading />
+  if (!devices) return <Loading />
 
   return (
     <Stack spacing={3}>
@@ -150,14 +146,19 @@ function AtConsole({
   devices: Device[]
   onError: (message: string) => void
 }) {
-  const [device, setDevice] = useState(devices[0]?.name ?? '')
+  // `null` means "nothing picked yet", so the first device is a fallback the
+  // render derives rather than state an effect has to write. A device that
+  // disappears from the list falls back the same way.
+  const [picked, setPicked] = useState<string | null>(null)
   const [command, setCommand] = useState('AT+CSQ')
   const [output, setOutput] = useState<string[]>([])
   const [busy, setBusy] = useState(false)
 
-  useEffect(() => {
-    if (!device && devices.length) setDevice(devices[0].name)
-  }, [device, devices])
+  const device =
+    picked !== null && devices.some((d) => d.name === picked)
+      ? picked
+      : (devices[0]?.name ?? '')
+  const setDevice = setPicked
 
   const run = async () => {
     setBusy(true)

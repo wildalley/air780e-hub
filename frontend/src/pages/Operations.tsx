@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useState } from 'react'
+import { Fragment, useCallback, useState } from 'react'
 import {
   Box,
   Button,
@@ -26,20 +26,13 @@ import AcknowledgeIcon from '@mui/icons-material/DoneAllOutlined'
 import IncidentIcon from '@mui/icons-material/ErrorOutlineOutlined'
 import ResolveIcon from '@mui/icons-material/CheckCircleOutlineOutlined'
 import StorageIcon from '@mui/icons-material/StorageOutlined'
-import {
-  api,
-  ApiError,
-  type ActivityWindow,
-  type AuditEvent,
-  type Diagnostics,
-  type Incident,
-} from '../api'
+import useSWR, { mutate as mutateKey } from 'swr'
+import { api, ApiError, type ActivityWindow, type Incident } from '../api'
 import { EmptyRow, Loading, OnlineChip, formatTs, useToast } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
 import { StatTile } from '../components/StatTile'
+import { LIVE_MS } from '../swr'
 import { STATUS } from '../tokens'
-
-const REFRESH_MS = 15_000
 
 const SEVERITY_LABEL: Record<Incident['severity'], string> = {
   critical: '严重',
@@ -143,27 +136,37 @@ export function OperationsPage() {
   const toast = useToast()
   const [tab, setTab] = useState(0)
   const [scope, setScope] = useState<'open' | 'all'>('open')
-  const [diagnostics, setDiagnostics] = useState<Diagnostics | null>(null)
-  const [incidents, setIncidents] = useState<Incident[]>([])
-  const [audit, setAudit] = useState<AuditEvent[]>([])
   const [busyId, setBusyId] = useState<number | null>(null)
 
-  const load = useCallback(async () => {
-    const [nextDiagnostics, nextIncidents, nextAudit] = await Promise.all([
-      api.operations.diagnostics(),
-      api.operations.incidents(scope),
-      api.operations.audit(),
-    ])
-    setDiagnostics(nextDiagnostics)
-    setIncidents(nextIncidents)
-    setAudit(nextAudit)
-  }, [scope])
+  const { data: diagnostics, mutate: mutateDiagnostics } = useSWR(
+    '/api/operations/diagnostics',
+    () => api.operations.diagnostics(),
+    { refreshInterval: LIVE_MS },
+  )
+  // Scope in the key: flipping 未解决/全部 serves the other list from cache and
+  // leaves diagnostics and the audit log untouched.
+  const { data: incidents = [], mutate: mutateIncidents } = useSWR(
+    ['/api/operations/incidents', scope],
+    () => api.operations.incidents(scope),
+    { refreshInterval: LIVE_MS, keepPreviousData: true },
+  )
+  const { data: audit = [] } = useSWR('/api/operations/audit', () => api.operations.audit(), {
+    refreshInterval: LIVE_MS,
+  })
 
-  useEffect(() => {
-    void load().catch(() => {})
-    const timer = setInterval(() => void load().catch(() => {}), REFRESH_MS)
-    return () => clearInterval(timer)
-  }, [load])
+  // Resolving an incident changes the list, the active-incident tile in
+  // diagnostics, and the nav badge that reads the same count endpoint.
+  const load = useCallback(
+    () =>
+      Promise.all([
+        mutateIncidents(),
+        mutateDiagnostics(),
+        // Owned by Layout, which is not in this tree — revalidate by key so the
+        // badge clears with the row instead of lingering for up to 15 s.
+        mutateKey('/api/operations/incidents/count'),
+      ]),
+    [mutateIncidents, mutateDiagnostics],
+  )
 
   const updateIncident = async (id: number, status: Incident['status']) => {
     setBusyId(id)
@@ -178,7 +181,7 @@ export function OperationsPage() {
     }
   }
 
-  if (diagnostics === null) return <Loading />
+  if (!diagnostics) return <Loading />
 
   const diskUsed = diagnostics.storage.disk_total_bytes - diagnostics.storage.disk_free_bytes
   const diskPercent = diagnostics.storage.disk_total_bytes

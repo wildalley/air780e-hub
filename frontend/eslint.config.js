@@ -25,13 +25,11 @@ export default tseslint.config(
       // tsc already reports unused locals/params via noUnusedLocals and
       // noUnusedParameters; a second identical error adds nothing.
       '@typescript-eslint/no-unused-vars': 'off',
-      // Warn, not error. All 16 current hits are the same shape: an async
-      // `load()` whose setState runs *after* an await, not synchronously in the
-      // effect body — the cascading-render case this rule targets. Moving them
-      // to swr (already a dependency, used in Messages.tsx) is the real fix,
-      // but that is an architectural change across 11 files and wants test
-      // coverage first. Kept visible instead of switched off.
-      'react-hooks/set-state-in-effect': 'warn',
+      // Error, not warn: every data fetch now goes through swr (see src/swr.ts),
+      // so a new `useEffect` that sets state from a fetch is a regression back
+      // to hand-rolled caching, not a style preference. Selection defaults are
+      // derived during render instead of seeded by an effect.
+      'react-hooks/set-state-in-effect': 'error',
     },
   },
   {

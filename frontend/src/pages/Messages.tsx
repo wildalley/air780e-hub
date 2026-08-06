@@ -36,6 +36,7 @@ import CheckIcon from '@mui/icons-material/CheckOutlined'
 import { api, ApiError, type Conversation, type Device, type Message } from '../api'
 import { Loading, useToast } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
+import { useDebounced } from '../swr'
 import { STATUS } from '../tokens'
 
 /**
@@ -99,15 +100,43 @@ function highlightOtp(body: string): ReactNode[] {
   return parts
 }
 
+/**
+ * The open thread, resolved against the current list rather than copied into
+ * state when it was clicked.
+ *
+ * The list is the source of truth: after a reply is sent the refetched row
+ * carries the new preview, timestamp and count, and the header has to show
+ * them. Holding a snapshot in state and syncing it from an effect is what this
+ * replaces.
+ *
+ * `fallback` covers a thread that is not in the list — one opened from search
+ * can be older than the conversations window, and it must still render.
+ */
+export function resolveThread(
+  open: Pick<Conversation, 'peer' | 'sim_id'> | null,
+  threads: Conversation[] | undefined,
+  fallback: Conversation | null,
+): Conversation | null {
+  if (!open) return null
+  const fresh = threads?.find((t) => t.peer === open.peer && t.sim_id === open.sim_id)
+  return fresh ?? fallback
+}
+
 export function MessagesPage() {
   const toast = useToast()
   const theme = useTheme()
   const narrow = useMediaQuery(theme.breakpoints.down('md'))
 
-  const [selected, setSelected] = useState<Conversation | null>(null)
+  // Only the identity of the open thread is state; its contents are read back
+  // out of the thread list below, so a reply cannot leave a stale preview
+  // pinned to the header.
+  const [openThread, setOpenThread] = useState<Pick<
+    Conversation,
+    'peer' | 'sim_id'
+  > | null>(null)
+  const [fallback, setFallback] = useState<Conversation | null>(null)
   const [search, setSearch] = useState('')
   const [searchOpen, setSearchOpen] = useState(false)
-  const [devices, setDevices] = useState<Device[]>([])
   const [composeOpen, setComposeOpen] = useState(false)
 
   const { data: threads, mutate: loadThreads } = useSWR(
@@ -115,22 +144,18 @@ export function MessagesPage() {
     () => api.messages.conversations(),
     { refreshInterval: 10_000 }
   )
-  const { data: devicesData } = useSWR('/api/devices', () => api.devices.list(), { refreshInterval: 30_000 })
-  
-  useEffect(() => {
-    if (devicesData) setDevices(devicesData)
-  }, [devicesData])
+  const { data: devices = [] } = useSWR('/api/devices', () => api.devices.list(), {
+    refreshInterval: 30_000,
+  })
 
+  const setSelected = useCallback((thread: Conversation | null) => {
+    setOpenThread(thread && { peer: thread.peer, sim_id: thread.sim_id })
+    // A thread opened from search may not be in the list yet (older than the
+    // conversations window) — keep the row itself as the fallback.
+    setFallback(thread)
+  }, [])
 
-  // Keep the open thread pointed at the freshest row, so its preview and
-  // count stay honest after a reply is sent.
-  useEffect(() => {
-    if (!selected || !threads) return
-    const fresh = threads.find(
-      (t) => t.peer === selected.peer && t.sim_id === selected.sim_id,
-    )
-    if (fresh && fresh.last_id !== selected.last_id) setSelected(fresh)
-  }, [threads, selected])
+  const selected = resolveThread(openThread, threads, fallback)
 
   const filtered = useMemo(() => {
     if (!threads) return null
@@ -202,6 +227,7 @@ export function MessagesPage() {
         {showList && showThread && <Divider orientation="vertical" flexItem />}
         {showThread && (
           <ThreadView
+            key={selected ? `${selected.sim_id}:${selected.peer}` : 'empty'}
             thread={selected}
             devices={devices}
             onBack={narrow ? () => setSelected(null) : undefined}
@@ -215,14 +241,17 @@ export function MessagesPage() {
         )}
       </Card>
 
-      <SearchDialog
-        open={searchOpen}
-        onClose={() => setSearchOpen(false)}
-        onOpenThread={(thread) => {
-          setSearchOpen(false)
-          setSelected(thread)
-        }}
-      />
+      {/* Mounted only while open, so each visit starts with an empty query —
+          the reset an effect used to do. */}
+      {searchOpen && (
+        <SearchDialog
+          onClose={() => setSearchOpen(false)}
+          onOpenThread={(thread) => {
+            setSearchOpen(false)
+            setSelected(thread)
+          }}
+        />
+      )}
 
       <ComposeDialog
         open={composeOpen}
@@ -408,32 +437,36 @@ function ThreadView({
   onSent: () => void | Promise<void>
   onError: (message: string) => void
 }) {
-  const [messages, setMessages] = useState<Message[] | null>(null)
-  const [draft, setDraft] = useState('')
   const [busy, setBusy] = useState(false)
   const bottom = useRef<HTMLDivElement | null>(null)
 
-  const load = useCallback(async () => {
-    if (!thread) return
-    const data = await api.messages.list({
-      peer: thread.peer,
-      sim_id: thread.sim_id ?? undefined,
-      limit: THREAD_PAGE,
-    })
-    // The API returns newest first; a conversation reads oldest first.
-    setMessages([...data.items].reverse())
-    // Opening a conversation is the read receipt.
-    if (data.items.some((m) => m.direction === 'in' && !m.read_at)) {
-      await api.messages.markRead(thread.sim_id, thread.peer)
-      onRead?.()
-    }
-  }, [thread, onRead])
+  // Keyed by the thread, so switching conversations swaps the cache entry
+  // instead of clearing state in an effect — no null flash on a thread that
+  // has already been read once.
+  const { data: messages, mutate } = useSWR(
+    thread ? ['/api/messages', thread.sim_id, thread.peer] : null,
+    async () => {
+      const data = await api.messages.list({
+        peer: thread!.peer,
+        sim_id: thread!.sim_id ?? undefined,
+        limit: THREAD_PAGE,
+      })
+      // Opening a conversation is the read receipt.
+      if (data.items.some((m) => m.direction === 'in' && !m.read_at)) {
+        await api.messages.markRead(thread!.sim_id, thread!.peer)
+        onRead?.()
+      }
+      // The API returns newest first; a conversation reads oldest first.
+      return [...data.items].reverse()
+    },
+  )
 
-  useEffect(() => {
-    setMessages(null)
-    setDraft('')
-    void load()
-  }, [load])
+  const load = mutate
+
+  // Per-thread draft. The parent gives this component a `key` derived from the
+  // thread, so switching conversations remounts and the draft starts empty —
+  // no effect needed to clear it.
+  const [draft, setDraft] = useState('')
 
   useEffect(() => {
     bottom.current?.scrollIntoView({ block: 'end' })
@@ -526,7 +559,7 @@ function ThreadView({
       <Divider />
 
       <Box sx={{ flexGrow: 1, overflowY: 'auto', px: 2, py: 2, minHeight: 0 }}>
-        {messages === null ? (
+        {!messages ? (
           <Loading />
         ) : (
           <Stack spacing={0.5}>
@@ -734,14 +767,18 @@ function ComposeDialog({
   onSent: (peer: string) => void | Promise<void>
   onError: (message: string) => void
 }) {
-  const [device, setDevice] = useState('')
+  // `null` = untouched, so the first module is a render-time fallback rather
+  // than state an effect has to seed once the list arrives.
+  const [picked, setPicked] = useState<string | null>(null)
   const [number, setNumber] = useState('')
   const [body, setBody] = useState('')
   const [busy, setBusy] = useState(false)
 
-  useEffect(() => {
-    if (open && !device && devices.length) setDevice(devices[0].name)
-  }, [open, device, devices])
+  const device =
+    picked !== null && devices.some((d) => d.name === picked)
+      ? picked
+      : (devices[0]?.name ?? '')
+  const setDevice = setPicked
 
   const send = async () => {
     setBusy(true)
@@ -859,52 +896,32 @@ function shortTime(ts: string): string {
 // --------------------------------------------------------------------------
 
 function SearchDialog({
-  open,
   onClose,
   onOpenThread,
 }: {
-  open: boolean
   onClose: () => void
   onOpenThread: (thread: Conversation) => void
 }) {
   const [query, setQuery] = useState('')
-  const [results, setResults] = useState<Message[] | null>(null)
-  const [busy, setBusy] = useState(false)
 
-  useEffect(() => {
-    if (open) {
-      setQuery('')
-      setResults(null)
-    }
-  }, [open])
+  // One request per typing pause, not per keystroke. The debounced term is
+  // part of the key, so SWR also dedupes a term the user backspaces into
+  // again and serves it from cache.
+  const term = useDebounced(query.trim(), 250)
+  const active = term.length >= 2
 
-  useEffect(() => {
-    if (!open || query.trim().length < 2) {
-      setResults(null)
-      setBusy(false)
-      return
-    }
-    let cancelled = false
-    setResults(null)
-    setBusy(true)
-    const timer = setTimeout(() => {
-      void api.messages
-        .list({ search: query.trim(), limit: 50 })
-        .then((data) => {
-          if (!cancelled) setResults(data.items)
-        })
-        .catch(() => {
-          if (!cancelled) setResults([])
-        })
-        .finally(() => {
-          if (!cancelled) setBusy(false)
-        })
-    }, 250)
-    return () => {
-      cancelled = true
-      clearTimeout(timer)
-    }
-  }, [open, query])
+  const { data, error, isLoading } = useSWR(
+    active ? ['/api/messages/search', term] : null,
+    () => api.messages.list({ search: term, limit: 50 }),
+    { keepPreviousData: false },
+  )
+
+  // A failed search reads as "no matches" rather than an empty frame; the
+  // toast path does not reach into this dialog.
+  const results = !active ? null : error ? [] : (data?.items ?? null)
+  // A pending debounce counts as busy too, so a long-enough query never shows
+  // "type a keyword" in the gap between the keystroke and the request.
+  const busy = query.trim().length >= 2 && (term !== query.trim() || isLoading)
 
   const openThread = (message: Message) =>
     onOpenThread({
@@ -922,7 +939,7 @@ function SearchDialog({
     })
 
   return (
-    <Dialog open={open} onClose={onClose} fullWidth maxWidth="sm">
+    <Dialog open onClose={onClose} fullWidth maxWidth="sm">
       <DialogTitle>搜索全部短信</DialogTitle>
       <DialogContent>
         <TextField
