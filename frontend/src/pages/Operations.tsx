@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { Fragment, useCallback, useEffect, useState } from 'react'
 import {
   Box,
   Button,
@@ -26,8 +26,15 @@ import AcknowledgeIcon from '@mui/icons-material/DoneAllOutlined'
 import IncidentIcon from '@mui/icons-material/ErrorOutlineOutlined'
 import ResolveIcon from '@mui/icons-material/CheckCircleOutlineOutlined'
 import StorageIcon from '@mui/icons-material/StorageOutlined'
-import { api, ApiError, type AuditEvent, type Diagnostics, type Incident } from '../api'
-import { Loading, OnlineChip, formatTs, useToast } from '../components/common'
+import {
+  api,
+  ApiError,
+  type ActivityWindow,
+  type AuditEvent,
+  type Diagnostics,
+  type Incident,
+} from '../api'
+import { EmptyRow, Loading, OnlineChip, formatTs, useToast } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
 import { StatTile } from '../components/StatTile'
 import { STATUS } from '../tokens'
@@ -71,6 +78,65 @@ function severityColor(severity: Incident['severity']): string {
   if (severity === 'critical') return STATUS.critical
   if (severity === 'warning') return STATUS.warning
   return 'text.secondary'
+}
+
+/**
+ * Success rate, or an em dash when nothing ran. 0/0 is not 0% — a window with
+ * no attempts says nothing about health, and rendering it as 0% would light up
+ * the accent colour on an idle hub.
+ */
+export function successRate(ok: number, failed: number): { text: string; accent?: string } {
+  const total = ok + failed
+  if (total === 0) return { text: '—' }
+  const percent = (ok / total) * 100
+  // Only a clean sweep prints "100%". With even one failure, `toFixed(1)`
+  // would round 99.95%+ up to "100.0%" and hide it, so floor to the tenth
+  // instead — a rate that is not perfect must never read as if it were.
+  const text = failed === 0
+    ? '100%'
+    : `${(Math.floor(percent * 10) / 10).toFixed(1)}%`
+  return {
+    text,
+    accent: percent >= 99 ? STATUS.good : percent >= 90 ? STATUS.warning : STATUS.critical,
+  }
+}
+
+/** Row counts, biggest first — the interesting one is whichever is growing. */
+const ROW_LABEL: Record<string, string> = {
+  messages: '短信',
+  device_status: '状态采样',
+  notify_logs: '通知日志',
+  task_logs: '任务日志',
+  agent_logs: 'Agent 日志',
+  audit_events: '管理审计',
+  incidents: '事件',
+  ingested: '幂等记录',
+  sims: '卡',
+  devices: '模块',
+  channels: '渠道',
+  rules: '规则',
+  tasks: '任务',
+}
+
+/** One labelled 24h / 7d pair. */
+function WindowStat({ label, window, accent }: {
+  label: string
+  window: ActivityWindow
+  accent?: string
+}) {
+  return (
+    <Box>
+      <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block' }}>
+        {label}
+      </Typography>
+      <Typography variant="body2" sx={{ color: accent ?? 'text.primary', fontWeight: 600 }}>
+        {window.day.toLocaleString()}
+        <Typography component="span" variant="caption" sx={{ color: 'text.secondary', ml: 0.75 }}>
+          / {window.week.toLocaleString()}
+        </Typography>
+      </Typography>
+    </Box>
+  )
 }
 
 export function OperationsPage() {
@@ -118,6 +184,21 @@ export function OperationsPage() {
   const diskPercent = diagnostics.storage.disk_total_bytes
     ? Math.round((diskUsed / diagnostics.storage.disk_total_bytes) * 100)
     : 0
+
+  const activity = diagnostics.activity
+  // Outbound only: a received message has no send outcome to succeed at.
+  const smsRate = successRate(
+    activity.messages.outbound.day - activity.messages.failed.day,
+    activity.messages.failed.day,
+  )
+  const notifyRate = successRate(
+    activity.notifications.ok.day,
+    activity.notifications.failed.day,
+  )
+  // Tasks run on a multi-day cycle by design, so 24h is usually an empty
+  // window — the 7d rate is the one that carries information.
+  const taskRate = successRate(activity.tasks.ok.week, activity.tasks.failed.week)
+  const tableRows = Object.entries(activity.rows).sort((a, b) => b[1] - a[1])
 
   return (
     <Stack spacing={3}>
@@ -200,11 +281,7 @@ export function OperationsPage() {
                 </TableHead>
                 <TableBody>
                   {diagnostics.agents.length === 0 ? (
-                    <TableRow>
-                      <TableCell colSpan={6} align="center" sx={{ py: 4, color: 'text.secondary' }}>
-                        尚无 Agent 记录
-                      </TableCell>
-                    </TableRow>
+                    <EmptyRow colSpan={6}>尚无 Agent 记录</EmptyRow>
                   ) : (
                     diagnostics.agents.map((agent) => (
                       <TableRow key={agent.id}>
@@ -248,6 +325,128 @@ export function OperationsPage() {
       </Card>
 
       <Card>
+        <CardHeader
+          title={<Typography variant="h3">运行统计</Typography>}
+          subheader="每格为「最近 24 小时 / 最近 7 天」"
+        />
+        <CardContent sx={{ pt: 0 }}>
+          <Stack spacing={2.5}>
+            <Box
+              sx={{
+                display: 'grid',
+                gap: 2,
+                gridTemplateColumns: { xs: 'repeat(2, 1fr)', sm: 'repeat(4, 1fr)' },
+              }}
+            >
+              <WindowStat label="收到短信" window={activity.messages.inbound} />
+              <WindowStat label="发出短信" window={activity.messages.outbound} />
+              <WindowStat
+                label="发送失败"
+                window={activity.messages.failed}
+                accent={activity.messages.failed.day ? STATUS.critical : undefined}
+              />
+              <Box>
+                <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block' }}>
+                  短信成功率（24h）
+                </Typography>
+                <Typography
+                  variant="body2"
+                  sx={{ color: smsRate.accent ?? 'text.primary', fontWeight: 600 }}
+                >
+                  {smsRate.text}
+                </Typography>
+              </Box>
+            </Box>
+
+            <Box
+              sx={{
+                display: 'grid',
+                gap: 2,
+                gridTemplateColumns: { xs: 'repeat(2, 1fr)', sm: 'repeat(4, 1fr)' },
+              }}
+            >
+              <WindowStat label="通知成功" window={activity.notifications.ok} />
+              <WindowStat
+                label="通知失败"
+                window={activity.notifications.failed}
+                accent={activity.notifications.failed.day ? STATUS.critical : undefined}
+              />
+              <Box>
+                <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block' }}>
+                  通知成功率（24h）
+                </Typography>
+                <Typography
+                  variant="body2"
+                  sx={{ color: notifyRate.accent ?? 'text.primary', fontWeight: 600 }}
+                >
+                  {notifyRate.text}
+                </Typography>
+              </Box>
+              <Box>
+                <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block' }}>
+                  任务成功率（7d）
+                </Typography>
+                <Typography
+                  variant="body2"
+                  sx={{ color: taskRate.accent ?? 'text.primary', fontWeight: 600 }}
+                >
+                  {taskRate.text}
+                </Typography>
+              </Box>
+            </Box>
+
+            <Box
+              sx={{
+                display: 'grid',
+                gap: 2,
+                gridTemplateColumns: { xs: 'repeat(2, 1fr)', sm: 'repeat(4, 1fr)' },
+              }}
+            >
+              <WindowStat label="任务成功" window={activity.tasks.ok} />
+              <WindowStat
+                label="任务失败"
+                window={activity.tasks.failed}
+                accent={activity.tasks.failed.day ? STATUS.critical : undefined}
+              />
+              <WindowStat label="任务跳过" window={activity.tasks.skipped} />
+            </Box>
+
+            <Box>
+              <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block', mb: 1 }}>
+                数据表行数
+              </Typography>
+              <Box
+                sx={{
+                  display: 'grid',
+                  gap: 0.75,
+                  gridTemplateColumns: {
+                    xs: 'auto 1fr',
+                    sm: 'repeat(2, auto 1fr)',
+                    lg: 'repeat(3, auto 1fr)',
+                  },
+                  columnGap: 2,
+                }}
+              >
+                {tableRows.map(([table, count]) => (
+                  <Fragment key={table}>
+                    <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                      {ROW_LABEL[table] ?? table}
+                    </Typography>
+                    <Typography
+                      variant="caption"
+                      sx={{ fontVariantNumeric: 'tabular-nums', textAlign: 'right' }}
+                    >
+                      {count.toLocaleString()}
+                    </Typography>
+                  </Fragment>
+                ))}
+              </Box>
+            </Box>
+          </Stack>
+        </CardContent>
+      </Card>
+
+      <Card>
         <Tabs value={tab} onChange={(_, next) => setTab(next)} sx={{ px: 2 }}>
           <Tab label={`事件 (${incidents.length})`} />
           <Tab label={`管理审计 (${audit.length})`} />
@@ -282,11 +481,7 @@ export function OperationsPage() {
                   </TableHead>
                   <TableBody>
                     {incidents.length === 0 ? (
-                      <TableRow>
-                        <TableCell colSpan={7} align="center" sx={{ py: 5, color: 'text.secondary' }}>
-                          当前没有事件
-                        </TableCell>
-                      </TableRow>
+                      <EmptyRow colSpan={7} py={5}>当前没有事件</EmptyRow>
                     ) : (
                       incidents.map((incident) => (
                         <TableRow key={incident.id} hover>
@@ -363,11 +558,7 @@ export function OperationsPage() {
                 </TableHead>
                 <TableBody>
                   {audit.length === 0 ? (
-                    <TableRow>
-                      <TableCell colSpan={6} align="center" sx={{ py: 5, color: 'text.secondary' }}>
-                        还没有管理操作记录
-                      </TableCell>
-                    </TableRow>
+                    <EmptyRow colSpan={6} py={5}>还没有管理操作记录</EmptyRow>
                   ) : (
                     audit.map((event) => (
                       <TableRow key={event.id} hover>

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -847,6 +847,87 @@ def test_operations_diagnostics_and_audit_are_available_to_admin(admin):
     events = admin.get("/api/operations/audit").json()
     assert any(event["action"] == "POST /api/system/purge" for event in events)
     assert "hunter2hunter" not in json.dumps(events)
+
+
+def test_activity_stats_split_windows_and_scope_failures_to_outbound(admin):
+    """The 24h window must not leak 7d rows, and inbound must not count as a
+    send failure — the UI subtracts `failed` from `outbound`, so an inbound
+    failure landing in that bucket would render a negative success rate."""
+    db = admin.app.state.hub.db
+    now = datetime.now(UTC)
+
+    def at(hours: float) -> str:
+        return (now - timedelta(hours=hours)).isoformat(timespec="seconds")
+
+    # Inside 24h.
+    db.insert_message(
+        agent_id="a", device="d", direction="in", peer="10086",
+        body="x", ts=at(1),
+    )
+    db.insert_message(
+        agent_id="a", device="d", direction="out", peer="10086",
+        body="x", ts=at(2), status="sent",
+    )
+    db.insert_message(
+        agent_id="a", device="d", direction="out", peer="10086",
+        body="x", ts=at(3), status="failed",
+    )
+    # Older than 24h but inside 7d.
+    db.insert_message(
+        agent_id="a", device="d", direction="in", peer="10086",
+        body="x", ts=at(48),
+    )
+    # An inbound row marked failed: must stay out of the outbound failure bucket.
+    db.insert_message(
+        agent_id="a", device="d", direction="in", peer="10086",
+        body="x", ts=at(4), status="failed",
+    )
+    # Older than 7d: outside both windows.
+    db.insert_message(
+        agent_id="a", device="d", direction="out", peer="10086",
+        body="x", ts=at(24 * 9), status="sent",
+    )
+
+    stats = db.activity_stats()
+    assert stats["messages"]["inbound"] == {"day": 2, "week": 3}
+    assert stats["messages"]["outbound"] == {"day": 2, "week": 2}
+    assert stats["messages"]["failed"] == {"day": 1, "week": 1}
+    # The value the UI divides by must never go negative.
+    assert (
+        stats["messages"]["outbound"]["day"] - stats["messages"]["failed"]["day"] >= 0
+    )
+
+    assert stats["rows"]["messages"] == 6
+    # Every table in the map is reported, so a growing one cannot hide.
+    assert set(stats["rows"]) >= {"messages", "notify_logs", "task_logs", "audit_events"}
+
+    # And it is reachable through the endpoint.
+    body = admin.get("/api/operations/diagnostics").json()
+    assert body["activity"]["messages"]["inbound"]["day"] == 2
+
+
+def test_activity_stats_keep_skipped_tasks_out_of_both_outcomes(admin):
+    """`skipped` means nothing was attempted. Folding it into either bucket
+    would misreport the success rate the operator reads off the card."""
+    db = admin.app.state.hub.db
+    ts = datetime.now(UTC).isoformat(timespec="seconds")
+    task_id = db.execute(
+        "INSERT INTO tasks (name, device, agent_id, created_at) VALUES (?, ?, ?, ?)",
+        ("keepalive", "d", "a", ts),
+    ).lastrowid
+    for status in ("ok", "ok", "failed", "skipped", "skipped", "skipped"):
+        db.execute(
+            "INSERT INTO task_logs (task_id, ts, status, attempts, detail) "
+            "VALUES (?, ?, ?, 1, '')",
+            (task_id, ts, status),
+        )
+
+    tasks = db.activity_stats()["tasks"]
+    assert tasks["ok"]["day"] == 2
+    assert tasks["failed"]["day"] == 1
+    assert tasks["skipped"]["day"] == 3
+    # 2/(2+1), not 2/6 — the three skips are not failures.
+    assert tasks["ok"]["day"] + tasks["failed"]["day"] == 3
 
 
 def test_incidents_can_be_acknowledged_and_resolved(admin):

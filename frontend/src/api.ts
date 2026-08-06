@@ -326,7 +326,26 @@ export interface Diagnostics {
     active_incidents: number
     audit_events: number
   }
+  activity: {
+    messages: {
+      inbound: ActivityWindow
+      outbound: ActivityWindow
+      failed: ActivityWindow
+    }
+    notifications: { ok: ActivityWindow; failed: ActivityWindow }
+    tasks: { ok: ActivityWindow; failed: ActivityWindow; skipped: ActivityWindow }
+    rows: Record<string, number>
+  }
   agents: DiagnosticAgent[]
+}
+
+/**
+ * A count over the trailing 24 hours and the trailing 7 days. Not named
+ * `Window` — that shadows the DOM global and reads as a typo at the use site.
+ */
+export interface ActivityWindow {
+  day: number
+  week: number
 }
 
 export interface Incident {

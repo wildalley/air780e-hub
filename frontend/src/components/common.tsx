@@ -1,4 +1,13 @@
-import { Alert, Box, Chip, CircularProgress, Snackbar, useMediaQuery } from '@mui/material'
+import {
+  Alert,
+  Box,
+  Chip,
+  CircularProgress,
+  Snackbar,
+  TableCell,
+  TableRow,
+  useMediaQuery,
+} from '@mui/material'
 import type { CSSObject } from '@mui/material/styles'
 import CheckIcon from '@mui/icons-material/CheckCircleOutlined'
 import OfflineIcon from '@mui/icons-material/CloudOffOutlined'
@@ -43,6 +52,32 @@ export function OnlineChip({ online }: { online: boolean }) {
       }}
       variant="outlined"
     />
+  )
+}
+
+/**
+ * Empty state for a table that scrolls horizontally.
+ *
+ * `align="center"` on a `colSpan` cell centres against the *table's* width,
+ * not the viewport's. Once `minWidth` exceeds the screen the container
+ * scrolls, and the centred label is parked somewhere off to the right — on a
+ * phone you see a few clipped characters at the edge, or nothing at all.
+ *
+ * So the label is left-aligned and pinned with `position: sticky`, which keeps
+ * it against the left edge of the scrollport no matter where the user has
+ * scrolled to. Centring is what breaks; visibility is what matters.
+ */
+export function EmptyRow({ colSpan, children, py = 4 }: {
+  colSpan: number
+  children: React.ReactNode
+  py?: number
+}) {
+  return (
+    <TableRow>
+      <TableCell colSpan={colSpan} sx={{ py, color: 'text.secondary' }}>
+        <Box sx={{ position: 'sticky', left: 0, display: 'inline-block' }}>{children}</Box>
+      </TableCell>
+    </TableRow>
   )
 }
 

@@ -6,7 +6,15 @@
 
 ### Added
 
-- 项目以 MIT License 发布。
+- 运维中心「运行统计」卡：24h / 7d 短信收发量、出站发送失败数、通知成功/失败数、任务成功/失败/跳过数，以及各数据表行数分布（按大小降序）。
+- 运维中心空状态行改用 `EmptyRow`（内嵌 `position:sticky; left:0` 包裹）：窄屏横向滚动时标签不再偏移到视口外。
+
+### Fixed
+
+- `successRate` 工具函数：输入存在失败时，用 `Math.floor` 代替 `toFixed(1)` 格式化，防止 99.95%+ 四舍五入后显示为 100% 遮盖实际失败记录。
+- `Database.activity_stats()` 中出站短信失败只统计 `direction='out'` 行，防止入站失败行混入使分母出现负值。
+
+
 - Agent 与 Server 接入 ruff 静态检查，并加入 CI。
 - 前端接入 ESLint 与 Vitest，覆盖 API 错误处理、时间戳格式化、验证码识别和 MUI 路由链接约定，并加入 CI。
 - Python 与 JavaScript/TypeScript 的 CodeQL 代码扫描工作流。

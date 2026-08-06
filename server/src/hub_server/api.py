@@ -718,6 +718,7 @@ def build_router(state: AppState) -> APIRouter:
                 "disk_free_bytes": disk.free,
             },
             "counts": counts,
+            "activity": state.db.activity_stats(),
             "agents": state.db.query(
                 "SELECT a.*, COUNT(d.id) AS device_count "
                 "FROM agents a LEFT JOIN devices d ON d.agent_id = a.id "

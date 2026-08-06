@@ -668,6 +668,92 @@ class Database:
         )
         return int(row["n"]) if row else 0
 
+    # -- operations ---------------------------------------------------------
+
+    # Every append-only table, so the operator can see which one is actually
+    # growing before the disk gauge moves.  Ordered biggest-first at the API
+    # boundary, not here.
+    _ROW_COUNT_TABLES = (
+        "messages", "device_status", "notify_logs", "task_logs",
+        "agent_logs", "audit_events", "incidents", "ingested",
+        "sims", "devices", "channels", "rules", "tasks",
+    )
+
+    def activity_stats(self) -> dict[str, Any]:
+        """Throughput and success rates over 24h / 7d, plus per-table rows.
+
+        Rates come out as counts rather than percentages: a channel with 1/1
+        success reads as 100% but says far less than 900/1000, and the caller
+        cannot recover the denominator from a percentage.  Windows are
+        half-open on the recent side (`ts >= cutoff`), so the two never
+        double-count a row at the boundary.
+        """
+        now = datetime.now(UTC)
+        day = (now - timedelta(days=1)).isoformat(timespec="seconds")
+        week = (now - timedelta(days=7)).isoformat(timespec="seconds")
+
+        def window(sql: str) -> dict[str, int]:
+            return {
+                "day": int(self.one(sql, (day,))["n"]),
+                "week": int(self.one(sql, (week,))["n"]),
+            }
+
+        messages = {
+            "inbound": window(
+                "SELECT COUNT(*) AS n FROM messages "
+                "WHERE direction = 'in' AND ts >= ?"
+            ),
+            "outbound": window(
+                "SELECT COUNT(*) AS n FROM messages "
+                "WHERE direction = 'out' AND ts >= ?"
+            ),
+            # Scoped to outbound: a received message has no send outcome, and
+            # leaving it unscoped would let an inbound row make
+            # outbound - failed go negative at the caller.
+            "failed": window(
+                "SELECT COUNT(*) AS n FROM messages "
+                "WHERE direction = 'out' AND status = 'failed' AND ts >= ?"
+            ),
+        }
+        notifications = {
+            "ok": window(
+                "SELECT COUNT(*) AS n FROM notify_logs "
+                "WHERE status = 'ok' AND ts >= ?"
+            ),
+            "failed": window(
+                "SELECT COUNT(*) AS n FROM notify_logs "
+                "WHERE status = 'failed' AND ts >= ?"
+            ),
+        }
+        # 'skipped' is not a run — the scheduler emits it when the module was
+        # unavailable and nothing was attempted.  Counting it as either outcome
+        # would misreport the success rate, so it gets its own bucket.
+        tasks = {
+            "ok": window(
+                "SELECT COUNT(*) AS n FROM task_logs "
+                "WHERE status = 'ok' AND ts >= ?"
+            ),
+            "failed": window(
+                "SELECT COUNT(*) AS n FROM task_logs "
+                "WHERE status = 'failed' AND ts >= ?"
+            ),
+            "skipped": window(
+                "SELECT COUNT(*) AS n FROM task_logs "
+                "WHERE status = 'skipped' AND ts >= ?"
+            ),
+        }
+        # Table names are a fixed private tuple, never caller input.
+        rows = {
+            table: int(self.one(f"SELECT COUNT(*) AS n FROM {table}")["n"])
+            for table in self._ROW_COUNT_TABLES
+        }
+        return {
+            "messages": messages,
+            "notifications": notifications,
+            "tasks": tasks,
+            "rows": rows,
+        }
+
     # -- retention ---------------------------------------------------------
 
     def purge(
