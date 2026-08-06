@@ -30,6 +30,7 @@ import json
 import logging
 import re
 import smtplib
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -389,7 +390,24 @@ async def _send_smtp(
     # smtplib is blocking, and a slow relay would otherwise freeze the whole
     # server — the WebSocket gateway shares this event loop.
     timeout = client.timeout.connect or 10.0
-    return await asyncio.to_thread(_send_smtp_blocking, config, payload, timeout)
+    completed = threading.Event()
+    result: list[str] = []
+    errors: list[Exception] = []
+
+    def send() -> None:
+        try:
+            result.append(_send_smtp_blocking(config, payload, timeout))
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            completed.set()
+
+    threading.Thread(target=send, name="smtp-notify", daemon=True).start()
+    while not completed.is_set():
+        await asyncio.sleep(0.01)
+    if errors:
+        raise errors[0]
+    return result[0]
 
 
 SENDERS = {
