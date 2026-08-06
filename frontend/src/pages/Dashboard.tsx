@@ -375,9 +375,9 @@ function TrendCard({
                   borderRadius: 12,
                   fontSize: 13,
                 }}
-                labelFormatter={shortDay}
-                formatter={(value: number | string, name: string) => [
-                  String(value),
+                labelFormatter={(label) => (typeof label === 'string' ? shortDay(label) : '')}
+                formatter={(value, name) => [
+                  String(value ?? ''),
                   name === 'received' ? '收到' : '发出',
                 ]}
               />

@@ -258,7 +258,7 @@ export function SignalChart({ series, hours, onHoursChange }: Props) {
                                 }}
                               />
                               <Typography variant="body2">
-                                {s?.label ?? entry.dataKey}
+                                {s?.label ?? String(entry.dataKey)}
                               </Typography>
                               <Typography
                                 variant="body2"
