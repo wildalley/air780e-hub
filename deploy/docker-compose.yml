@@ -5,10 +5,18 @@
 
 services:
   hub:
+    # Source build is the reference path and the default here, so a clone
+    # deploys with no registry access at all.
+    #
+    # To run a published image instead, set HUB_IMAGE to a *digest* and drop
+    # the build block — `docker compose` ignores build when image is pinned:
+    #   HUB_IMAGE=ghcr.io/<owner>/air780e-hub@sha256:<digest>
+    # Pin the digest, not the tag: rollback has to name an exact artefact, and
+    # `X.Y` moves with every patch release. See docs/release.md.
     build:
       context: ..
       dockerfile: server/Dockerfile
-    # A published image can replace build when one is available.
+    image: "${HUB_IMAGE:-air780e-hub:local}"
     container_name: air780e-hub
     restart: unless-stopped
 

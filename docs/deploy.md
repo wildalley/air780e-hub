@@ -18,10 +18,26 @@ air780e-hub 分为两个独立进程：
 
 ### 1.2 构建并启动
 
+两条路径都受支持。**源码构建是参考路径** —— 不需要访问任何 registry：
+
 ```bash
 git clone https://github.com/wildalley/air780e-hub.git /opt/air780e-hub
 cd /opt/air780e-hub
 docker compose -f deploy/docker-compose.yml up -d --build
+```
+
+也可以用已发布的镜像（amd64 / arm64）。**按摘要固定，不要用 tag**：摘要唯一对应一份字节，而 `X.Y` 会随补丁版本移动，回滚时无法指明恢复到哪一版。摘要在对应 [Release](https://github.com/wildalley/air780e-hub/releases) 正文里：
+
+```bash
+export HUB_IMAGE=ghcr.io/wildalley/air780e-hub@sha256:<摘要>
+docker compose -f deploy/docker-compose.yml up -d
+```
+
+每个 Release 附带 SPDX SBOM 和构建来源证明，可校验镜像确由本仓库的 tag 构建：
+
+```bash
+gh attestation verify oci://ghcr.io/wildalley/air780e-hub@sha256:<摘要> \
+  --repo wildalley/air780e-hub
 ```
 
 默认监听：

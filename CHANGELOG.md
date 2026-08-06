@@ -6,6 +6,8 @@
 
 ### Added
 
+- 发行方式确定为**源码构建 + GHCR 多架构镜像**。`Release` 工作流由 `v*` tag 触发：在 tag 指向的树上复跑全部质量门、校验 tag 与三处版本号及 CHANGELOG 小节一致、构建并推送 amd64 / arm64 镜像、对已推送摘要执行漏洞扫描、生成 SPDX SBOM 与构建来源证明，最后按 CHANGELOG 起草 Release。只发 `X.Y.Z` 与 `X.Y` tag，不发可变 `latest`。
+- Compose 支持 `HUB_IMAGE` 覆盖为已发布镜像摘要；未设置时仍走源码构建，克隆后无需访问 registry 即可部署。
 - 运维中心「运行统计」卡：24h / 7d 短信收发量、出站发送失败数、通知成功/失败数、任务成功/失败/跳过数，以及各数据表行数分布（按大小降序）。
 - 运维中心空状态行改用 `EmptyRow`（内嵌 `position:sticky; left:0` 包裹）：窄屏横向滚动时标签不再偏移到视口外。
 
