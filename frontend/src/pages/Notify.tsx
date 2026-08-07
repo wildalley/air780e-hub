@@ -497,120 +497,185 @@ function RuleTesterCard({
         }
       />
       <CardContent>
-        <Box
-          sx={{
-            display: 'grid',
-            gridTemplateColumns: { xs: '1fr', lg: 'minmax(0, 1fr) 340px' },
-            gap: 3,
-            alignItems: 'start',
-          }}
-        >
-          <Stack spacing={2}>
-          <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
-            <TextField
-              select
-              size="small"
-              label="卡(留空 = 全部卡)"
-              value={simId}
-              onChange={(e) => setSimId(e.target.value)}
-              sx={{ minWidth: 160 }}
-            >
-              <MenuItem value="">全部卡</MenuItem>
-              {sims.map((sim) => (
-                <MenuItem key={sim.id} value={sim.id}>
-                  {sim.label || sim.iccid.slice(-6)}
-                </MenuItem>
-              ))}
-            </TextField>
-            <TextField
-              size="small"
-              label="发件号码(可选)"
-              value={peer}
-              onChange={(e) => setPeer(e.target.value)}
-              placeholder="10086"
-              sx={{ minWidth: 160 }}
-            />
-            <TextField
-              size="small"
-              label="短信内容"
-              value={body}
-              onChange={(e) => setBody(e.target.value)}
-              placeholder="【移动】验证码 123456,请勿泄露"
-              multiline
-              minRows={1}
-              maxRows={4}
-              sx={{ flexGrow: 1 }}
-            />
-            <Button
-              variant="outlined"
-              onClick={() => void preview()}
-              disabled={busy || body.trim().length === 0}
-              sx={{ alignSelf: 'flex-start', height: 40, whiteSpace: 'nowrap' }}
-            >
-              预览命中
-            </Button>
-          </Stack>
+        <Stack spacing={3}>
+          {/* Input: one compact panel across the full width, so the two output
+              regions below get the whole card to themselves. */}
+          <Box
+            sx={{
+              p: 2,
+              borderRadius: 1.5,
+              border: 1,
+              borderColor: 'divider',
+              bgcolor: 'background.default',
+            }}
+          >
+            <Stack spacing={2}>
+              <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
+                <TextField
+                  select
+                  size="small"
+                  label="卡(留空 = 全部卡)"
+                  value={simId}
+                  onChange={(e) => setSimId(e.target.value)}
+                  sx={{ minWidth: 160, flex: 1 }}
+                >
+                  <MenuItem value="">全部卡</MenuItem>
+                  {sims.map((sim) => (
+                    <MenuItem key={sim.id} value={sim.id}>
+                      {sim.label || sim.iccid.slice(-6)}
+                    </MenuItem>
+                  ))}
+                </TextField>
+                <TextField
+                  size="small"
+                  label="发件号码(可选)"
+                  value={peer}
+                  onChange={(e) => setPeer(e.target.value)}
+                  placeholder="10086"
+                  sx={{ minWidth: 160, flex: 1 }}
+                />
+              </Stack>
+              <TextField
+                size="small"
+                label="短信内容"
+                value={body}
+                onChange={(e) => setBody(e.target.value)}
+                placeholder="【移动】验证码 123456,请勿泄露"
+                multiline
+                minRows={2}
+                maxRows={6}
+                fullWidth
+              />
+              <Box sx={{ display: 'flex', justifyContent: 'flex-end' }}>
+                <Button
+                  variant="contained"
+                  onClick={() => void preview()}
+                  disabled={busy || body.trim().length === 0}
+                  sx={{ whiteSpace: 'nowrap' }}
+                >
+                  预览命中
+                </Button>
+              </Box>
+            </Stack>
+          </Box>
 
-          {busy ? (
-            <Box sx={{ display: 'flex', justifyContent: 'center', py: 2 }}>
-              <CircularProgress size={24} />
-            </Box>
-          ) : result !== null ? (
-            result.length === 0 ? (
-              <Typography variant="body2" sx={{
-                color: 'text.secondary'
-              }}>
-                没有规则命中。想收到这条短信的话,先建一条匹配它的规则。
+          {/* Results and the card preview sit side by side on wide screens and
+              stack on narrow ones — the preview is no longer a fixed 340px rail. */}
+          <Box
+            sx={{
+              display: 'grid',
+              gridTemplateColumns: { xs: '1fr', lg: 'minmax(0, 1fr) minmax(0, 0.8fr)' },
+              gap: 3,
+              alignItems: 'start',
+            }}
+          >
+            <Stack spacing={1.5}>
+              <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                命中规则{result && result.length > 0 ? `(${result.length})` : ''}
               </Typography>
-            ) : (
-              <Stack divider={<Divider />} spacing={1.5}>
-                {result.map((hit) => (
-                  <Box key={hit.rule_id}>
+              {busy ? (
+                <Box sx={{ display: 'flex', justifyContent: 'center', py: 4 }}>
+                  <CircularProgress size={24} />
+                </Box>
+              ) : result === null ? (
+                <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+                  填好上面的内容,点「预览命中」看结果。
+                </Typography>
+              ) : result.length === 0 ? (
+                <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+                  没有规则命中。想收到这条短信的话,先建一条匹配它的规则。
+                </Typography>
+              ) : (
+                result.map((hit) => (
+                  <Box
+                    key={hit.rule_id}
+                    sx={{
+                      border: 1,
+                      borderColor: 'divider',
+                      borderRadius: 1.5,
+                      overflow: 'hidden',
+                    }}
+                  >
                     <Stack
                       direction="row"
                       spacing={1}
                       sx={{
                         alignItems: 'center',
-                        mb: 0.5
-                      }}>
-                      <Chip size="small" label={hit.rule_name} color="primary" variant="outlined" />
-                      <Typography variant="body2" sx={{
-                        color: 'text.secondary'
-                      }}>
-                        → {hit.channel_name}(优先级 {hit.priority})
-                      </Typography>
-                    </Stack>
-                    <Box
-                      component="pre"
-                      sx={{
-                        m: 0,
-                        p: 1.5,
-                        borderRadius: 1.5,
+                        flexWrap: 'wrap',
+                        rowGap: 0.5,
+                        px: 1.5,
+                        py: 1,
                         bgcolor: 'background.default',
-                        border: 1,
-                        borderColor: 'divider',
-                        fontSize: 13,
-                        whiteSpace: 'pre-wrap',
-                        wordBreak: 'break-word',
-                        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
                       }}
                     >
-                      {hit.title ? `标题:${hit.title}\n` : ''}
-                      {hit.text}
-                    </Box>
+                      <Chip
+                        size="small"
+                        label={hit.rule_name || `规则 ${hit.rule_id}`}
+                        color="primary"
+                        variant="outlined"
+                      />
+                      <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+                        → {hit.channel_name}
+                      </Typography>
+                      <Box sx={{ flexGrow: 1 }} />
+                      <Typography
+                        variant="caption"
+                        sx={{ color: 'text.secondary', whiteSpace: 'nowrap' }}
+                      >
+                        优先级 {hit.priority}
+                      </Typography>
+                    </Stack>
+                    <Divider />
+                    <Stack spacing={1.5} sx={{ p: 1.5 }}>
+                      <Box>
+                        <Typography
+                          variant="caption"
+                          sx={{ color: 'text.secondary', display: 'block' }}
+                        >
+                          标题
+                        </Typography>
+                        <Typography variant="body2" sx={{ overflowWrap: 'anywhere' }}>
+                          {hit.title || '—'}
+                        </Typography>
+                      </Box>
+                      <Box>
+                        <Typography
+                          variant="caption"
+                          sx={{ color: 'text.secondary', display: 'block', mb: 0.5 }}
+                        >
+                          正文
+                        </Typography>
+                        <Box
+                          component="pre"
+                          sx={{
+                            m: 0,
+                            p: 1.5,
+                            borderRadius: 1.5,
+                            bgcolor: 'background.default',
+                            border: 1,
+                            borderColor: 'divider',
+                            fontSize: 13,
+                            whiteSpace: 'pre-wrap',
+                            wordBreak: 'break-word',
+                            fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                          }}
+                        >
+                          {hit.text}
+                        </Box>
+                      </Box>
+                    </Stack>
                   </Box>
-                ))}
-              </Stack>
-            )
-          ) : null}
-          </Stack>
-          <FeishuPreview
-            title={previewTitle}
-            card={cardLabel}
-            sender={sender}
-            text={previewText}
-          />
-        </Box>
+                ))
+              )}
+            </Stack>
+            <FeishuPreview
+              title={previewTitle}
+              card={cardLabel}
+              sender={sender}
+              text={previewText}
+            />
+          </Box>
+        </Stack>
       </CardContent>
     </Card>
   )
