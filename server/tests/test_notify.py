@@ -29,6 +29,8 @@ from hub_server.main import create_app
 from hub_server.notify import (
     DEFAULT_TEMPLATE,
     Notifier,
+    Payload,
+    _feishu_card,
     match_rules,
     render,
     scrub,
@@ -388,8 +390,25 @@ async def test_feishu_payload_without_a_secret_is_unsigned(db, settings):
         db, settings, type="feishu", config={"webhook": "https://open.feishu.cn/x"}
     )
     body = recorder.bodies[0]
-    assert body["msg_type"] == "text"
-    assert body["content"]["text"] == "验证码 123456"
+    assert body["msg_type"] == "interactive"
+    card = body["card"]
+    assert card["config"] == {"wide_screen_mode": True, "enable_forward": False}
+    assert card["header"]["title"]["content"] == "…5670 · 10086"
+    assert card["header"]["template"] == "blue"
+    assert card["elements"][0]["fields"] == [
+        {
+            "is_short": True,
+            "text": {"tag": "plain_text", "content": "卡片\n…5670"},
+        },
+        {
+            "is_short": True,
+            "text": {"tag": "plain_text", "content": "发件人\n10086"},
+        },
+    ]
+    assert card["elements"][2]["text"] == {
+        "tag": "plain_text", "content": "验证码 123456",
+    }
+    assert card["elements"][-1]["tag"] == "note"
     assert "sign" not in body
 
 
@@ -400,6 +419,41 @@ async def test_feishu_signs_when_a_secret_is_configured(db, settings):
     )
     body = recorder.bodies[0]
     assert body["sign"] and body["timestamp"]
+
+
+def test_feishu_card_keeps_a_custom_template_and_sms_markdown_literal():
+    context = {
+        "card": "主卡", "sender": "95588", "message": "[验证码](https://example.test)",
+        "timestamp": "2026-08-07 12:00:00", "device": "a", "iccid": "",
+    }
+    card = _feishu_card(Payload(
+        text="提醒:[验证码](https://example.test)",
+        title="银行短信",
+        context=context,
+    ))
+
+    body = card["elements"][2]["text"]
+    assert body == {
+        "tag": "plain_text", "content": "提醒:[验证码](https://example.test)",
+    }
+
+
+async def test_feishu_system_notification_has_no_fake_sample_metadata(db, settings):
+    add_channel(
+        db, type="feishu", config={"webhook": "https://open.feishu.cn/x"}
+    )
+    recorder = Recorder(httpx.Response(200, json={"code": 0}))
+    notifier = make_notifier(db, settings, recorder, retries=0)
+
+    results = await notifier.notify_text("保号任务执行成功", title="保号任务")
+
+    assert results[0]["status"] == "ok"
+    card = recorder.bodies[0]["card"]
+    encoded = json.dumps(card, ensure_ascii=False)
+    assert "测试卡" not in encoded
+    assert "10086" not in encoded
+    assert card["header"]["title"]["content"] == "保号任务"
+    assert card["elements"][0]["text"]["content"] == "保号任务执行成功"
 
 
 async def test_dingtalk_signs_in_the_query_only_with_a_secret(db, settings):

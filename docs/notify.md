@@ -82,6 +82,10 @@
 加签算法:以 `"{timestamp}\n{secret}"` 为 key、对**空字符串**做 HMAC-SHA256,base64 后连同
 `timestamp` 一起放进请求体。填了 `secret` 才带,不填就是纯 webhook。
 
+飞书使用 `interactive` 消息卡片：标题栏显示通知标题，短信通知把卡片名称与发件人
+分列展示，正文和时间独立排版；保号任务及运维告警使用同一张卡片但不伪造短信元数据。
+正文使用 `plain_text`，短信中的 Markdown、链接或 HTML 不会被解释为卡片指令。
+
 ### wecom(企业微信群机器人)
 
 | 键 | 必填 | 说明 |

@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS devices (
     sim_id       INTEGER REFERENCES sims(id) ON DELETE SET NULL,
     online       INTEGER NOT NULL DEFAULT 0,
     registered   INTEGER NOT NULL DEFAULT 0,
+    radio_enabled INTEGER,
     model        TEXT NOT NULL DEFAULT '',
     imei         TEXT NOT NULL DEFAULT '',
     operator     TEXT NOT NULL DEFAULT '',
@@ -285,11 +286,20 @@ class Database:
         self._lock = threading.RLock()
         with self._lock:
             self._db.executescript(SCHEMA)
-            # Additive migration: databases created before a column existed
-            # keep working without a schema-version dance.
-            cols = {row[1] for row in self._db.execute("PRAGMA table_info(messages)")}
-            if "read_at" not in cols:
-                self._db.execute("ALTER TABLE messages ADD COLUMN read_at TEXT")
+            self._apply_additive_migrations()
+
+    def _apply_additive_migrations(self) -> None:
+        """Bring pre-versioned databases up to the current additive schema."""
+        columns = {
+            table: {
+                row[1] for row in self._db.execute(f"PRAGMA table_info({table})")
+            }
+            for table in ("messages", "devices")
+        }
+        if "read_at" not in columns["messages"]:
+            self._db.execute("ALTER TABLE messages ADD COLUMN read_at TEXT")
+        if "radio_enabled" not in columns["devices"]:
+            self._db.execute("ALTER TABLE devices ADD COLUMN radio_enabled INTEGER")
 
     def close(self) -> None:
         with self._lock:
@@ -386,7 +396,14 @@ class Database:
     # Fields a status event may legitimately set to a falsy value (0 signal,
     # offline, empty store) — absence of the key is what means "unchanged".
     _DEVICE_STATE_FIELDS = (
-        "online", "registered", "rssi", "dbm", "bars", "rsrp", "rsrq",
+        "online",
+        "registered",
+        "radio_enabled",
+        "rssi",
+        "dbm",
+        "bars",
+        "rsrp",
+        "rsrq",
     )
     # Identity fields.  A blank here always means "this frame didn't carry it",
     # never "the module lost its IMEI" — status frames are a subset of hello,
@@ -402,9 +419,12 @@ class Database:
         for field in self._DEVICE_STATE_FIELDS:
             if field in payload:
                 value = payload[field]
-                columns[field] = (
-                    int(bool(value)) if field in ("online", "registered") else value
-                )
+                if field == "radio_enabled":
+                    columns[field] = None if value is None else int(bool(value))
+                elif field in ("online", "registered"):
+                    columns[field] = int(bool(value))
+                else:
+                    columns[field] = value
         if "bars" in payload:
             columns["bars"] = payload.get("bars") or 0
         if "storage_used" in payload:
@@ -909,12 +929,7 @@ class Database:
                 # Reapplying the idempotent schema keeps the live process usable
                 # immediately after restore without requiring a restart.
                 self._db.executescript(SCHEMA)
-                cols = {
-                    row[1]
-                    for row in self._db.execute("PRAGMA table_info(messages)")
-                }
-                if "read_at" not in cols:
-                    self._db.execute("ALTER TABLE messages ADD COLUMN read_at TEXT")
+                self._apply_additive_migrations()
         finally:
             source.close()
 

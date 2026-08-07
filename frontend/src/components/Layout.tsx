@@ -6,6 +6,7 @@ import {
   AppBar,
   Badge,
   Box,
+  Collapse,
   Drawer,
   IconButton,
   List,
@@ -30,17 +31,23 @@ import OperationsIcon from '@mui/icons-material/MonitorHeartOutlined'
 import LogsIcon from '@mui/icons-material/ReceiptLongOutlined'
 import BackupIcon from '@mui/icons-material/BackupOutlined'
 import SettingsIcon from '@mui/icons-material/SettingsOutlined'
+import SystemIcon from '@mui/icons-material/AdminPanelSettingsOutlined'
+import ExpandLessIcon from '@mui/icons-material/ExpandLess'
+import ExpandMoreIcon from '@mui/icons-material/ExpandMore'
 import MenuIcon from '@mui/icons-material/Menu'
 import LightIcon from '@mui/icons-material/LightModeOutlined'
 import DarkIcon from '@mui/icons-material/DarkModeOutlined'
+import GitHubIcon from '@mui/icons-material/GitHub'
 import LogoutIcon from '@mui/icons-material/LogoutOutlined'
 import { api } from '../api'
 import { LIVE_MS } from '../swr'
-import { VIZ, type Mode } from '../tokens'
+import type { Mode } from '../tokens'
 
 const WIDTH = 224
+const HEADER_HEIGHT = 64
+const GITHUB_URL = 'https://github.com/wildalley/air780e-hub'
 
-const NAV = [
+const PRIMARY_NAV = [
   { to: '/', label: '仪表盘', icon: <DashboardIcon /> },
   { to: '/messages', label: '短信', icon: <SmsIcon /> },
   { to: '/devices', label: '设备', icon: <DevicesIcon /> },
@@ -49,16 +56,19 @@ const NAV = [
   { to: '/console', label: 'AT 调试', icon: <ConsoleIcon /> },
   { to: '/notify', label: '通知', icon: <NotifyIcon /> },
   { to: '/operations', label: '运维中心', icon: <OperationsIcon /> },
+]
+
+const ADMIN_NAV = [
   { to: '/logs', label: '日志', icon: <LogsIcon /> },
   { to: '/backup', label: '备份恢复', icon: <BackupIcon /> },
   { to: '/settings', label: '设置', icon: <SettingsIcon /> },
 ]
 
 // Grouped so the scan path is 总览 → 通讯 → 系统, not ten equal rows.
-const GROUPS: { label: string; items: typeof NAV }[] = [
-  { label: '总览', items: NAV.slice(0, 1) },
-  { label: '通讯', items: NAV.slice(1, 6) },
-  { label: '系统', items: NAV.slice(6) },
+const GROUPS: { label: string; items: typeof PRIMARY_NAV }[] = [
+  { label: '总览', items: PRIMARY_NAV.slice(0, 1) },
+  { label: '通讯', items: PRIMARY_NAV.slice(1, 6) },
+  { label: '系统', items: PRIMARY_NAV.slice(6) },
 ]
 
 interface Props {
@@ -75,17 +85,20 @@ function Brand() {
       spacing={1.5}
       sx={{
         alignItems: 'center',
-        minHeight: 48,
+        height: HEADER_HEIGHT,
+        minHeight: HEADER_HEIGHT,
         px: 2,
+        boxSizing: 'border-box',
         borderBottom: 1,
-        borderColor: 'divider'
-      }}>
+        borderColor: 'divider',
+      }}
+    >
       <Box
         aria-hidden
         sx={{
           width: 32,
           height: 32,
-          borderRadius: 2,
+          borderRadius: 1,
           flexShrink: 0,
           display: 'grid',
           placeItems: 'center',
@@ -95,9 +108,15 @@ function Brand() {
       >
         <HubIcon sx={{ fontSize: 18 }} />
       </Box>
-      <Box sx={{ minWidth: 0, lineHeight: 1.15 }}>
+      <Box sx={{ minWidth: 0 }}>
         <Typography
-          sx={{ fontSize: '0.95rem', fontWeight: 700, letterSpacing: '-0.01em', whiteSpace: 'nowrap' }}
+          sx={{
+            fontSize: '0.95rem',
+            fontWeight: 700,
+            lineHeight: 1.2,
+            letterSpacing: 0,
+            whiteSpace: 'nowrap',
+          }}
         >
           air780e hub
         </Typography>
@@ -105,8 +124,12 @@ function Brand() {
           variant="caption"
           sx={{
             color: 'text.secondary',
-            fontSize: '0.66rem'
-          }}>
+            display: 'block',
+            mt: 0.25,
+            fontSize: '0.66rem',
+            lineHeight: 1.3,
+          }}
+        >
           SMS 自托管网关
         </Typography>
       </Box>
@@ -118,6 +141,9 @@ export function Layout({ children, mode, onToggleMode, onLogout }: Props) {
   const theme = useTheme()
   const location = useLocation()
   const [open, setOpen] = useState(false)
+  const [adminOpen, setAdminOpen] = useState(
+    ADMIN_NAV.some((item) => location.pathname.startsWith(item.to)),
+  )
 
   // The nav badge: two cheap COUNT polls, same cadence as the dashboard.
   // Separate keys on purpose — one endpoint failing must not blank the other
@@ -151,7 +177,7 @@ export function Layout({ children, mode, onToggleMode, onLogout }: Props) {
               pb: 0.5,
               color: 'text.secondary',
               fontSize: '0.64rem',
-              letterSpacing: '0.1em',
+              letterSpacing: 0,
             }}
           >
             {group.label}
@@ -168,7 +194,7 @@ export function Layout({ children, mode, onToggleMode, onLogout }: Props) {
                   selected={selected}
                   onClick={() => setOpen(false)}
                   sx={{
-                    borderRadius: 2,
+                    borderRadius: 1,
                     mb: 0.25,
                     minHeight: 40,
                     '&.Mui-selected': {
@@ -206,31 +232,91 @@ export function Layout({ children, mode, onToggleMode, onLogout }: Props) {
               )
             })}
           </List>
+          {group.label === '系统' && (
+            <List disablePadding>
+              <ListItemButton
+                onClick={() => setAdminOpen((value) => !value)}
+                aria-expanded={adminOpen}
+                sx={{ borderRadius: 1, mb: 0.25, minHeight: 40 }}
+              >
+                <ListItemIcon sx={{ minWidth: 36, color: 'text.secondary' }}>
+                  <SystemIcon />
+                </ListItemIcon>
+                <ListItemText
+                  primary="系统管理"
+                  slotProps={{ primary: { sx: { fontSize: 14, fontWeight: 500 } } }}
+                />
+                {adminOpen ? <ExpandLessIcon fontSize="small" /> : <ExpandMoreIcon fontSize="small" />}
+              </ListItemButton>
+              <Collapse in={adminOpen} timeout="auto" unmountOnExit>
+                <List disablePadding>
+                  {ADMIN_NAV.map((item) => {
+                    const selected = location.pathname.startsWith(item.to)
+                    return (
+                      <ListItemButton
+                        key={item.to}
+                        component={RouterLink}
+                        to={item.to}
+                        selected={selected}
+                        onClick={() => setOpen(false)}
+                        sx={{
+                          borderRadius: 1,
+                          mb: 0.25,
+                          minHeight: 38,
+                          pl: 3,
+                          '&.Mui-selected': {
+                            bgcolor: selectedTint,
+                            '& .MuiListItemIcon-root': { color: 'primary.main' },
+                          },
+                          '&.Mui-selected:hover': { bgcolor: selectedTint },
+                        }}
+                      >
+                        <ListItemIcon sx={{ minWidth: 36, color: 'text.secondary' }}>
+                          {item.icon}
+                        </ListItemIcon>
+                        <ListItemText
+                          primary={item.label}
+                          slotProps={{
+                            primary: { sx: { fontSize: 13.5, fontWeight: selected ? 700 : 500 } },
+                          }}
+                        />
+                      </ListItemButton>
+                    )
+                  })}
+                </List>
+              </Collapse>
+            </List>
+          )}
         </Box>
       ))}
     </Box>
   )
 
   return (
-    <Box sx={{ display: 'flex', minHeight: '100dvh' }}>
-      {/* Translucent chrome: content scrolls under, the blur keeps text
-          legible, and the surface reads as material rather than a bar
-          (Apple §12). */}
+    <Box
+      sx={{
+        display: 'flex',
+        width: '100%',
+        minHeight: '100dvh',
+        flex: '1 0 auto',
+        bgcolor: 'background.default',
+      }}
+    >
       <AppBar
         position="fixed"
         color="default"
         elevation={0}
         sx={{
-          zIndex: (t) => t.zIndex.drawer + 1,
-          bgcolor: VIZ[mode].chrome,
-          backdropFilter: 'blur(16px) saturate(160%)',
-          WebkitBackdropFilter: 'blur(16px) saturate(160%)',
+          bgcolor: 'background.paper',
           borderBottom: 1,
           borderColor: 'divider',
           color: 'text.primary',
         }}
       >
-        <Toolbar variant="dense">
+        <Toolbar
+          variant="dense"
+          sx={{ minHeight: { xs: '56px !important', sm: `${HEADER_HEIGHT}px !important` } }}
+        >
           <IconButton
             edge="start"
             onClick={() => setOpen(!open)}
@@ -246,6 +332,17 @@ export function Layout({ children, mode, onToggleMode, onLogout }: Props) {
             air780e hub
           </Typography>
           <Box sx={{ flexGrow: 1, display: { xs: 'none', sm: 'block' } }} />
+          <Tooltip title="GitHub 项目">
+            <IconButton
+              component="a"
+              href={GITHUB_URL}
+              target="_blank"
+              rel="noreferrer"
+              aria-label="打开 GitHub 项目"
+            >
+              <GitHubIcon />
+            </IconButton>
+          </Tooltip>
           <Tooltip title={mode === 'dark' ? '切换到浅色' : '切换到深色'}>
             <IconButton onClick={onToggleMode} aria-label="切换主题">
               {mode === 'dark' ? <LightIcon /> : <DarkIcon />}
@@ -297,11 +394,16 @@ export function Layout({ children, mode, onToggleMode, onLogout }: Props) {
           flexGrow: 1,
           p: { xs: 2, md: 3 },
           width: 0,
+          minHeight: '100dvh',
           display: 'flex',
           flexDirection: 'column',
+          bgcolor: 'background.default',
         }}
       >
-        <Toolbar variant="dense" />
+        <Toolbar
+          variant="dense"
+          sx={{ minHeight: { xs: '56px !important', sm: `${HEADER_HEIGHT}px !important` } }}
+        />
         {children}
       </Box>
     </Box>

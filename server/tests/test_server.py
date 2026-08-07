@@ -125,10 +125,12 @@ HELLO = {
     "devices": [
         {"name": "a", "label": "移动卡", "port": "/dev/air780e-a", "online": True,
          "iccid": "89860622180012345670", "imei": "111", "model": "AirM2M_780E",
-         "operator": "CHINA MOBILE", "smsc": "+8613800210500", "registered": True},
+         "operator": "CHINA MOBILE", "smsc": "+8613800210500", "registered": True,
+         "radio_enabled": True},
         {"name": "b", "label": "联通卡", "port": "/dev/air780e-b", "online": True,
          "iccid": "89860622180012345671", "imei": "222", "model": "AirM2M_780E",
-         "operator": "CHINA UNICOM", "smsc": "+8613010200500", "registered": True},
+         "operator": "CHINA UNICOM", "smsc": "+8613010200500", "registered": True,
+         "radio_enabled": True},
     ],
 }
 
@@ -565,6 +567,36 @@ def test_send_to_unknown_device_is_404(admin):
     assert response.status_code == 404
 
 
+def test_set_radio_routes_a_typed_command_to_the_owning_agent(admin, monkeypatch):
+    gateway = admin.app.state.hub.gateway
+    seen = {}
+
+    monkeypatch.setattr(gateway, "agent_for_device", lambda name: "test-agent")
+
+    async def fake_call(agent_id, frame, **_kwargs):
+        seen.update(agent_id=agent_id, frame=frame)
+        return {"radio_enabled": False, "registered": False}
+
+    monkeypatch.setattr(gateway, "call", fake_call)
+
+    response = admin.post("/api/devices/a/radio", json={"enabled": False})
+    assert response.status_code == 200
+    assert response.json()["radio_enabled"] is False
+    assert seen == {
+        "agent_id": "test-agent",
+        "frame": {"type": "set_radio", "device": "a", "enabled": False},
+    }
+
+
+def test_set_radio_rejects_unknown_devices_and_non_booleans(admin):
+    assert admin.post("/api/devices/nope/radio", json={"enabled": True}).status_code == 404
+    assert admin.post("/api/devices/a/radio", json={"enabled": []}).status_code == 422
+
+
+def test_set_radio_requires_an_admin_session(client):
+    assert client.post("/api/devices/a/radio", json={"enabled": False}).status_code == 401
+
+
 # --------------------------------------------------------------------------
 # CRUD used by the web UI
 # --------------------------------------------------------------------------
@@ -638,6 +670,35 @@ def test_task_can_be_customised(admin):
 
     admin.delete(f"/api/tasks/{task['id']}")
     assert admin.get("/api/tasks").json() == []
+
+
+def test_task_can_be_triggered_manually(admin, monkeypatch):
+    task = admin.post("/api/tasks", json={"device": "a", "name": "手动保号"}).json()
+    gateway = admin.app.state.hub.gateway
+    seen = []
+
+    async def fake_push(agent_id):
+        seen.append(("sync", agent_id))
+
+    async def fake_call(agent_id, frame, **_kwargs):
+        seen.append(("call", agent_id, frame))
+        return {"task_id": task["id"], "status": "started"}
+
+    monkeypatch.setattr(gateway, "agent_for_device", lambda _name: "test-agent")
+    monkeypatch.setattr(gateway, "push_tasks", fake_push)
+    monkeypatch.setattr(gateway, "call", fake_call)
+
+    response = admin.post(f"/api/tasks/{task['id']}/run")
+    assert response.status_code == 200
+    assert response.json() == {"task_id": task["id"], "status": "started"}
+    assert seen == [
+        ("sync", "test-agent"),
+        ("call", "test-agent", {"type": "run_task", "task_id": task["id"]}),
+    ]
+
+
+def test_running_an_unknown_task_is_404(admin):
+    assert admin.post("/api/tasks/999/run").status_code == 404
 
 
 def test_a_connecting_agent_is_given_its_tasks(admin):
@@ -754,6 +815,34 @@ def test_status_can_still_set_falsy_state(admin):
         device = next(d for d in admin.get("/api/devices").json() if d["name"] == "a")
         assert device["registered"] == 0
         assert device["rssi"] == 0
+
+
+def test_deliberate_flight_mode_is_stored_without_a_network_incident(admin):
+    with _connect(admin) as ws:
+        _greet(ws)
+        ws.send_json({
+            "type": "status", "seq": 1, "device": "a", "online": True,
+            "registered": False, "radio_enabled": False, "ts": _minutes_ago(1),
+        })
+        assert ws.receive_json() == {"type": "ack", "seq": 1}
+
+    device = next(d for d in admin.get("/api/devices").json() if d["name"] == "a")
+    assert device["radio_enabled"] == 0
+    incidents = admin.get("/api/operations/incidents?status=open").json()
+    assert not any(i["kind"] == "network_unregistered" for i in incidents)
+
+
+def test_radio_on_but_unregistered_still_opens_a_network_incident(admin):
+    with _connect(admin) as ws:
+        _greet(ws)
+        ws.send_json({
+            "type": "status", "seq": 1, "device": "a", "online": True,
+            "registered": False, "radio_enabled": True, "ts": _minutes_ago(1),
+        })
+        ws.receive_json()
+
+    incidents = admin.get("/api/operations/incidents?status=open").json()
+    assert any(i["kind"] == "network_unregistered" for i in incidents)
 
 
 def test_overview_carries_the_sim_label(admin):

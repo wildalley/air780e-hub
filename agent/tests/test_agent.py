@@ -409,6 +409,30 @@ async def test_the_connect_time_task_push_needs_no_cmd_id(agent):
     assert agent.app.store.all_tasks() == []
 
 
+async def test_run_task_command_starts_the_local_scheduler(agent):
+    await agent.wait_online()
+    await agent.app.handle_command({
+        "type": "sync_tasks",
+        "tasks": [{
+            "id": 9, "device": "a", "name": "手动测试", "enabled": False,
+            "action": "send_sms", "target_number": "10086", "content": "1",
+            "schedule_type": "interval", "schedule_expr": "25",
+            "jitter_seconds": 0, "random_suffix": False,
+            "retry_max": 0, "notify_on_result": True,
+        }],
+    })
+
+    await agent.app.handle_command({
+        "type": "run_task", "cmd_id": "c-run", "task_id": 9,
+    })
+    result = agent.events("cmd_result")[-1].payload
+    assert result["ok"] is True
+    assert result["data"] == {"task_id": 9, "status": "started"}
+
+    await agent.app.scheduler.drain()
+    assert agent.events("task_result")[-1].payload["task_id"] == 9
+
+
 async def test_query_returns_device_state(agent):
     await agent.wait_online()
     await agent.app.handle_command({
@@ -428,6 +452,38 @@ async def test_raw_at_command(agent):
     result = agent.events("cmd_result")[-1].payload
     assert result["ok"] is True
     assert any("+CSQ:" in line for line in result["data"]["lines"])
+
+
+async def test_set_radio_command_updates_state_and_can_turn_it_back_on(agent):
+    await agent.wait_online()
+
+    await agent.app.handle_command({
+        "type": "set_radio", "cmd_id": "c-radio-off", "device": "a", "enabled": False,
+    })
+    result = agent.events("cmd_result")[-1].payload
+    assert result["ok"] is True
+    assert result["data"]["radio_enabled"] is False
+    assert result["data"]["registered"] is False
+    assert agent.mocks["a"].radio_enabled is False
+
+    await agent.app.handle_command({
+        "type": "set_radio", "cmd_id": "c-radio-on", "device": "a", "enabled": True,
+    })
+    result = agent.events("cmd_result")[-1].payload
+    assert result["ok"] is True
+    assert result["data"]["radio_enabled"] is True
+    assert result["data"]["registered"] is True
+    assert agent.mocks["a"].radio_enabled is True
+
+
+async def test_set_radio_requires_a_boolean(agent):
+    await agent.wait_online()
+    await agent.app.handle_command({
+        "type": "set_radio", "cmd_id": "c-radio-bad", "device": "a", "enabled": "false",
+    })
+    result = agent.events("cmd_result")[-1].payload
+    assert result["ok"] is False
+    assert "boolean" in result["error"]
 
 
 async def test_unknown_command_is_reported_not_ignored(agent):

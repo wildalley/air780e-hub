@@ -83,6 +83,7 @@ class ModemInfo:
     smsc: str = ""
     operator: str = ""
     registered: bool = False
+    radio_enabled: bool | None = None
 
 
 @dataclass
@@ -216,9 +217,42 @@ class Air780E:
         if cops and (match := re.search(r'"([^"]+)"', cops)):
             info.operator = match.group(1)
 
-        info.registered = await self.read_registration()
+        info.radio_enabled = await self.read_radio_enabled()
+        info.registered = (
+            False if info.radio_enabled is False else await self.read_registration()
+        )
 
         return info
+
+    async def read_radio_enabled(self) -> bool | None:
+        """Return whether RF is enabled, or ``None`` if the firmware cannot say.
+
+        Air780E reports ``1`` for full functionality and ``0`` for minimum
+        functionality.  Some modem families also use ``4`` for flight mode;
+        anything other than ``1`` therefore means that cellular RF is off.
+        """
+        try:
+            response = await self.client.execute("AT+CFUN?")
+        except ATError as exc:
+            log.debug("AT+CFUN? failed: %s", exc)
+            return None
+        value = response.first("+CFUN:") or ""
+        match = re.match(r"\s*(\d+)", value)
+        return None if match is None else match.group(1) == "1"
+
+    async def set_radio_enabled(self, enabled: bool) -> tuple[bool, bool]:
+        """Enable or disable cellular RF and return ``(enabled, registered)``.
+
+        ``AT+CFUN=0`` leaves the AT port alive, which is essential: the same
+        connection must remain available to turn RF back on.  Reattachment is
+        asynchronous after ``AT+CFUN=1``; the immediate registration read is
+        reported honestly and the worker's regular status poll follows it to
+        the eventual registered state.
+        """
+        await self.client.execute(f"AT+CFUN={1 if enabled else 0}", timeout=30.0)
+        self.info.radio_enabled = enabled
+        self.info.registered = await self.read_registration() if enabled else False
+        return enabled, self.info.registered
 
     async def read_registration(self) -> bool:
         """True if the module is registered on *either* the CS or EPS domain.
@@ -251,6 +285,14 @@ class Air780E:
         should reserve this for a module that has stayed unregistered rather
         than firing it on the first missed sample.
         """
+        radio_enabled = await self.read_radio_enabled()
+        if radio_enabled is False:
+            # A deliberate flight-mode choice must never be undone by an
+            # automatic registration recovery.
+            self.info.radio_enabled = False
+            self.info.registered = False
+            return False
+
         try:
             await self.client.execute("AT+COPS=0", timeout=30.0)
         except ATError as exc:

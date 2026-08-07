@@ -1,6 +1,8 @@
 import { useMemo, useState } from 'react'
 import { Link as RouterLink } from 'react-router'
 import {
+  Alert,
+  AlertTitle,
   Box,
   Button,
   Card,
@@ -32,7 +34,7 @@ import TodayIcon from '@mui/icons-material/MarkEmailUnreadOutlined'
 import AllSmsIcon from '@mui/icons-material/MailOutlined'
 import TaskIcon from '@mui/icons-material/EventRepeatOutlined'
 import useSWR from 'swr'
-import { api, type MessageStat } from '../api'
+import { api, type Incident, type MessageStat } from '../api'
 import { StatTile } from '../components/StatTile'
 import { StorageMeter } from '../components/StorageMeter'
 import { SignalChart, type SignalSeries } from '../components/SignalChart'
@@ -69,6 +71,11 @@ export function DashboardPage() {
     () => api.stats.messages(statsDays),
     { refreshInterval: TREND_MS, keepPreviousData: true },
   )
+  const { data: incidents = [] } = useSWR(
+    '/api/operations/incidents?status=open',
+    () => api.operations.incidents('open'),
+    { refreshInterval: LIVE_MS },
+  )
 
   if (!overview) return <Loading />
 
@@ -87,6 +94,8 @@ export function DashboardPage() {
   return (
     <Stack spacing={3}>
       <PageHeader title="仪表盘" subtitle="模块、短信与存储,一目了然" />
+
+      <AttentionPanel incidents={incidents} />
 
       <Box
         sx={{
@@ -139,7 +148,11 @@ export function DashboardPage() {
         sx={{
           display: 'grid',
           gap: 2,
-          gridTemplateColumns: { xs: '1fr', md: 'repeat(2, 1fr)' },
+          gridTemplateColumns: {
+            xs: '1fr',
+            md: 'repeat(2, minmax(0, 1fr))',
+            lg: 'repeat(3, minmax(0, 1fr))',
+          },
         }}
       >
         {devices.map((device, index) => (
@@ -286,6 +299,57 @@ export function DashboardPage() {
         </Card>
       </Box>
     </Stack>
+  )
+}
+
+function AttentionPanel({ incidents }: { incidents: Incident[] }) {
+  if (incidents.length === 0) {
+    return (
+      <Alert
+        severity="success"
+        variant="outlined"
+        action={
+          <Button component={RouterLink} to="/operations" size="small" color="inherit">
+            运维中心
+          </Button>
+        }
+      >
+        当前没有待处理事件
+      </Alert>
+    )
+  }
+
+  const critical = incidents.some((incident) => incident.severity === 'critical')
+  return (
+    <Alert
+      severity={critical ? 'error' : 'warning'}
+      variant="outlined"
+      action={
+        <Button component={RouterLink} to="/operations" size="small" color="inherit">
+          处理事件
+        </Button>
+      }
+      sx={{ alignItems: 'flex-start' }}
+    >
+      <AlertTitle sx={{ mb: 0.75 }}>{incidents.length} 个事件需要处理</AlertTitle>
+      <Stack spacing={0.75}>
+        {incidents.slice(0, 3).map((incident) => (
+          <Box key={incident.id}>
+            <Typography variant="body2" sx={{ fontWeight: 600 }}>
+              {incident.title}
+            </Typography>
+            <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+              {incident.source} · {relativeTs(incident.last_seen_at)}
+            </Typography>
+          </Box>
+        ))}
+        {incidents.length > 3 && (
+          <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+            另有 {incidents.length - 3} 个事件
+          </Typography>
+        )}
+      </Stack>
+    </Alert>
   )
 }
 

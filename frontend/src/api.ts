@@ -88,6 +88,7 @@ export interface Device {
   sim_id: number | null
   online: number
   registered: number
+  radio_enabled: number | null
   model: string
   imei: string
   operator: string
@@ -420,6 +421,11 @@ export const api = {
       get<StatusPoint[]>(`/api/devices/${encodeURIComponent(name)}/history?hours=${hours}`),
     refresh: (name: string) =>
       post<Device>(`/api/devices/${encodeURIComponent(name)}/refresh`),
+    setRadio: (name: string, enabled: boolean) =>
+      post<{ radio_enabled: boolean; registered: boolean }>(
+        `/api/devices/${encodeURIComponent(name)}/radio`,
+        { enabled },
+      ),
   },
   sims: {
     list: () => get<Sim[]>('/api/sims'),
@@ -476,6 +482,7 @@ export const api = {
     create: (body: TaskInput) => post<Task>('/api/tasks', body),
     update: (id: number, body: TaskInput) => put<Task>(`/api/tasks/${id}`, body),
     remove: (id: number) => del<{ ok: boolean }>(`/api/tasks/${id}`),
+    run: (id: number) => post<{ task_id: number; status: 'started' }>(`/api/tasks/${id}/run`),
     logs: () => get<TaskLog[]>('/api/task-logs'),
   },
   notifyLogs: () => get<NotifyLog[]>('/api/notify-logs'),

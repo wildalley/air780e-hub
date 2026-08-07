@@ -17,12 +17,14 @@ import {
   MenuItem,
   Stack,
   Switch,
+  Tab,
   Table,
   TableBody,
   TableCell,
   TableContainer,
   TableHead,
   TableRow,
+  Tabs,
   TextField,
   Tooltip,
   Typography,
@@ -37,13 +39,15 @@ import {
   ApiError,
   type Channel,
   type ChannelInput,
+  type NotifyLog,
   type Rule,
   type RuleInput,
   type RulePreview,
   type Sim,
 } from '../api'
-import { Loading, useToast } from '../components/common'
+import { Loading, formatTs, useToast } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
+import { LIVE_MS } from '../swr'
 import { STATUS } from '../tokens'
 
 interface FieldSpec {
@@ -139,12 +143,16 @@ export function NotifyPage() {
   const [channelEdit, setChannelEdit] = useState<Channel | null | undefined>(undefined)
   const [ruleEdit, setRuleEdit] = useState<Rule | null | undefined>(undefined)
   const [testing, setTesting] = useState<number | null>(null)
+  const [tab, setTab] = useState(0)
 
   const { data: channels, mutate: mutateChannels } = useSWR('/api/channels', () =>
     api.channels.list(),
   )
   const { data: rules = [], mutate: mutateRules } = useSWR('/api/rules', () => api.rules.list())
   const { data: sims = [] } = useSWR('/api/sims', () => api.sims.list())
+  const { data: notifyLogs = [] } = useSWR('/api/notify-logs', () => api.notifyLogs(), {
+    refreshInterval: LIVE_MS,
+  })
 
   // Rules carry a denormalised `channel_name`, so renaming or deleting a
   // channel has to refetch both lists, not just the one that was written.
@@ -193,9 +201,16 @@ export function NotifyPage() {
         推送由 <strong>服务器</strong> 发出,走机房网络 —— 不消耗 SIM 卡流量,所以纯保号卡也能用。
       </Alert>
 
-      <SettingsCard onError={(m) => toast.show(m, 'error')} onSaved={() => toast.show('设置已保存', 'success')} />
+      <Box sx={{ borderBottom: 1, borderColor: 'divider' }}>
+        <Tabs value={tab} onChange={(_, next) => setTab(next)} variant="scrollable" scrollButtons="auto">
+          <Tab label={`渠道 (${channels.length})`} />
+          <Tab label={`转发规则 (${rules.length})`} />
+          <Tab label="模板测试" />
+          <Tab label="投递记录" />
+        </Tabs>
+      </Box>
 
-      <Card>
+      {tab === 0 && <Card>
         <CardHeader
           title={<Typography variant="h3">推送渠道</Typography>}
           action={
@@ -282,9 +297,9 @@ export function NotifyPage() {
             </TableContainer>
           )}
         </CardContent>
-      </Card>
+      </Card>}
 
-      <Card>
+      {tab === 1 && <Card>
         <CardHeader
           title={<Typography variant="h3">转发规则</Typography>}
           action={
@@ -384,16 +399,26 @@ export function NotifyPage() {
             </TableContainer>
           )}
         </CardContent>
-      </Card>
+      </Card>}
 
-      <Typography variant="caption" sx={{
+      {tab === 1 && <Typography variant="caption" sx={{
         color: 'text.secondary'
       }}>
         一条短信命中多条规则时,同一个渠道只推一次(取优先级最高的模板)。推送结果见「日志 →
         推送日志」。
-      </Typography>
+      </Typography>}
 
-      <RuleTesterCard sims={sims} onError={(m) => toast.show(m, 'error')} />
+      {tab === 2 && <RuleTesterCard sims={sims} onError={(m) => toast.show(m, 'error')} />}
+
+      {tab === 3 && (
+        <Stack spacing={2}>
+          <DeliveryLogCard logs={notifyLogs} />
+          <SettingsCard
+            onError={(m) => toast.show(m, 'error')}
+            onSaved={() => toast.show('设置已保存', 'success')}
+          />
+        </Stack>
+      )}
 
       {channelEdit !== undefined && (
         <ChannelDialog
@@ -438,6 +463,13 @@ function RuleTesterCard({
   const [body, setBody] = useState('')
   const [result, setResult] = useState<RulePreview[] | null>(null)
   const [busy, setBusy] = useState(false)
+  const selectedSim = sims.find((sim) => sim.id === Number(simId))
+  const cardLabel = selectedSim?.label || (selectedSim?.iccid ? `…${selectedSim.iccid.slice(-6)}` : '卡片')
+  const sender = peer.trim() || '发件人'
+  const rendered = result?.[0]
+  const defaultText = `【${cardLabel}】${sender}\n${body}`
+  const previewText = rendered?.text === defaultText ? body : rendered?.text || body || '短信正文'
+  const previewTitle = rendered?.title || `${cardLabel} · ${sender}`
 
   const preview = async () => {
     setBusy(true)
@@ -465,7 +497,15 @@ function RuleTesterCard({
         }
       />
       <CardContent>
-        <Stack spacing={2}>
+        <Box
+          sx={{
+            display: 'grid',
+            gridTemplateColumns: { xs: '1fr', lg: 'minmax(0, 1fr) 340px' },
+            gap: 3,
+            alignItems: 'start',
+          }}
+        >
+          <Stack spacing={2}>
           <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
             <TextField
               select
@@ -563,7 +603,111 @@ function RuleTesterCard({
               </Stack>
             )
           ) : null}
+          </Stack>
+          <FeishuPreview
+            title={previewTitle}
+            card={cardLabel}
+            sender={sender}
+            text={previewText}
+          />
+        </Box>
+      </CardContent>
+    </Card>
+  )
+}
+
+function FeishuPreview({
+  title,
+  card,
+  sender,
+  text,
+}: {
+  title: string
+  card: string
+  sender: string
+  text: string
+}) {
+  return (
+    <Box>
+      <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block', mb: 1 }}>
+        飞书消息卡片
+      </Typography>
+      <Box sx={{ border: 1, borderColor: 'divider', borderRadius: 1, overflow: 'hidden' }}>
+        <Box sx={{ bgcolor: 'primary.main', color: 'primary.contrastText', px: 2, py: 1.5 }}>
+          <Typography variant="h3" sx={{ overflowWrap: 'anywhere' }}>
+            {title}
+          </Typography>
+        </Box>
+        <Stack spacing={1.5} sx={{ p: 2 }}>
+          <Box sx={{ display: 'grid', gridTemplateColumns: 'repeat(2, minmax(0, 1fr))', gap: 2 }}>
+            <Box>
+              <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block' }}>
+                卡片
+              </Typography>
+              <Typography variant="body2" sx={{ overflowWrap: 'anywhere' }}>
+                {card}
+              </Typography>
+            </Box>
+            <Box>
+              <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block' }}>
+                发件人
+              </Typography>
+              <Typography variant="body2" sx={{ overflowWrap: 'anywhere' }}>
+                {sender}
+              </Typography>
+            </Box>
+          </Box>
+          <Divider />
+          <Typography variant="body2" sx={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }}>
+            {text}
+          </Typography>
+          <Divider />
+          <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+            {new Date().toLocaleString('zh-CN', { hour12: false })}
+          </Typography>
         </Stack>
+      </Box>
+    </Box>
+  )
+}
+
+function DeliveryLogCard({ logs }: { logs: NotifyLog[] }) {
+  return (
+    <Card>
+      <CardHeader title={<Typography variant="h3">最近投递</Typography>} />
+      <CardContent sx={{ p: 0, '&:last-child': { pb: 0 } }}>
+        {logs.length === 0 ? (
+          <Typography variant="body2" sx={{ color: 'text.secondary', px: 2, pb: 2 }}>
+            还没有投递记录
+          </Typography>
+        ) : (
+          <TableContainer>
+            <Table size="small" sx={{ minWidth: 560 }}>
+              <TableHead>
+                <TableRow>
+                  <TableCell>时间</TableCell>
+                  <TableCell>渠道</TableCell>
+                  <TableCell>结果</TableCell>
+                  <TableCell>尝试</TableCell>
+                  <TableCell>详情</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {logs.slice(0, 50).map((log) => (
+                  <TableRow key={log.id}>
+                    <TableCell sx={{ whiteSpace: 'nowrap' }}>{formatTs(log.ts)}</TableCell>
+                    <TableCell>{log.channel_name || log.channel_id || '系统通知'}</TableCell>
+                    <TableCell sx={{ color: log.status === 'ok' ? STATUS.good : STATUS.critical }}>
+                      {log.status === 'ok' ? '成功' : '失败'}
+                    </TableCell>
+                    <TableCell>{log.attempts}</TableCell>
+                    <TableCell>{log.detail || '—'}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </TableContainer>
+        )}
       </CardContent>
     </Card>
   )

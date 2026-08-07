@@ -1,10 +1,12 @@
 import { Fragment, useCallback, useState } from 'react'
 import {
+  Accordion,
+  AccordionDetails,
+  AccordionSummary,
   Box,
   Button,
   Card,
   CardContent,
-  CardHeader,
   Chip,
   LinearProgress,
   Stack,
@@ -25,6 +27,7 @@ import AgentIcon from '@mui/icons-material/HubOutlined'
 import AcknowledgeIcon from '@mui/icons-material/DoneAllOutlined'
 import IncidentIcon from '@mui/icons-material/ErrorOutlineOutlined'
 import ResolveIcon from '@mui/icons-material/CheckCircleOutlineOutlined'
+import ExpandMoreIcon from '@mui/icons-material/ExpandMore'
 import StorageIcon from '@mui/icons-material/StorageOutlined'
 import useSWR, { mutate as mutateKey } from 'swr'
 import { api, ApiError, type ActivityWindow, type Incident } from '../api'
@@ -244,12 +247,18 @@ export function OperationsPage() {
         />
       </Box>
 
-      <Card>
-        <CardHeader
-          title={<Typography variant="h3">主机与 Agent</Typography>}
-          action={<Chip size="small" label={`磁盘已用 ${diskPercent}%`} variant="outlined" />}
-        />
-        <CardContent sx={{ pt: 0 }}>
+      <Accordion disableGutters sx={{ order: 2 }}>
+        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+          <Stack
+            direction="row"
+            spacing={2}
+            sx={{ alignItems: 'center', justifyContent: 'space-between', width: '100%', pr: 1 }}
+          >
+            <Typography variant="h3">主机与 Agent</Typography>
+            <Chip size="small" label={`磁盘已用 ${diskPercent}%`} variant="outlined" />
+          </Stack>
+        </AccordionSummary>
+        <AccordionDetails sx={{ pt: 0 }}>
           <Stack spacing={2}>
             <Box>
               <LinearProgress
@@ -324,15 +333,19 @@ export function OperationsPage() {
               </Typography>
             </Stack>
           </Stack>
-        </CardContent>
-      </Card>
+        </AccordionDetails>
+      </Accordion>
 
-      <Card>
-        <CardHeader
-          title={<Typography variant="h3">运行统计</Typography>}
-          subheader="每格为「最近 24 小时 / 最近 7 天」"
-        />
-        <CardContent sx={{ pt: 0 }}>
+      <Accordion disableGutters sx={{ order: 2 }}>
+        <AccordionSummary expandIcon={<ExpandMoreIcon />}>
+          <Box>
+            <Typography variant="h3">运行统计</Typography>
+            <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+              每格为「最近 24 小时 / 最近 7 天」
+            </Typography>
+          </Box>
+        </AccordionSummary>
+        <AccordionDetails sx={{ pt: 0 }}>
           <Stack spacing={2.5}>
             <Box
               sx={{
@@ -446,10 +459,10 @@ export function OperationsPage() {
               </Box>
             </Box>
           </Stack>
-        </CardContent>
-      </Card>
+        </AccordionDetails>
+      </Accordion>
 
-      <Card>
+      <Card sx={{ order: 1 }}>
         <Tabs value={tab} onChange={(_, next) => setTab(next)} sx={{ px: 2 }}>
           <Tab label={`事件 (${incidents.length})`} />
           <Tab label={`管理审计 (${audit.length})`} />

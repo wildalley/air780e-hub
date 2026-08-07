@@ -106,6 +106,7 @@ Agent 或修改业务数据。该参数只用于连通性检查,正式 Agent 不
   "ts": "2026-08-02T18:00:00+08:00",
   "online": true,
   "registered": true,
+  "radio_enabled": true,
   "operator": "CHINA MOBILE",
   "rssi": 24,
   "dbm": -65,
@@ -220,18 +221,40 @@ agent 回 `sms_out`(带同一 `cmd_id`),再回 `cmd_result`。
 - `interval` —— `schedule_expr` 是天数,从上次执行时间起算
 - `cron` —— `schedule_expr` 是 5 段 cron 表达式,本地时区
 
+### `run_task` —— 手动执行保号任务
+
+```json
+{"type":"run_task","cmd_id":"c-9a03","task_id":3}
+```
+
+Agent 校验本地任务后立即启动异步执行，并返回
+`{"task_id":3,"status":"started"}`。任务停用只影响定时调度，管理员仍可手动执行；
+同一任务已经运行时会拒绝重复启动。最终结果仍通过常规 `task_result` 上报，因此重试、
+任务日志和结果通知与定时执行完全一致。
+
 ### `query`
 
 ```json
-{"type": "query", "cmd_id": "c-9a03", "device": "a", "what": "status"}
+{"type": "query", "cmd_id": "c-9a04", "device": "a", "what": "status"}
 ```
 
 `what`:`status` | `info` | `storage`。
 
+### `set_radio` —— 飞行模式 / 射频开关
+
+```json
+{"type": "set_radio", "cmd_id": "c-9a05", "device": "a", "enabled": false}
+```
+
+Agent 通过 `AT+CFUN=0/1` 切换并在 `cmd_result.data` 返回当前
+`radio_enabled` 与 `registered`。关闭射频不关闭 AT 串口，因此同一连接仍可重新开启。
+飞行模式是管理员主动状态，不产生“网络未注册”事件；期间到期的保号任务记为
+`skipped`，不消耗重试次数，也不推进 `last_run_at`。
+
 ### `raw_at` —— Web AT 调试台
 
 ```json
-{"type": "raw_at", "cmd_id": "c-9a04", "device": "a", "command": "AT+CSQ"}
+{"type": "raw_at", "cmd_id": "c-9a06", "device": "a", "command": "AT+CSQ"}
 ```
 
 危险操作,server 端必须限制在已认证的管理员会话。

@@ -51,6 +51,7 @@ def _now() -> str:
 class DeviceState:
     online: bool = False
     registered: bool = False
+    radio_enabled: bool | None = None
     operator: str = ""
     iccid: str = ""
     imei: str = ""
@@ -65,6 +66,7 @@ class DeviceState:
         return {
             "online": self.online,
             "registered": self.registered,
+            "radio_enabled": self.radio_enabled,
             "operator": self.operator,
             "iccid": self.iccid,
             "imei": self.imei,
@@ -123,6 +125,10 @@ class DeviceWorker:
     @property
     def online(self) -> bool:
         return self.state.online
+
+    @property
+    def radio_enabled(self) -> bool | None:
+        return self.state.radio_enabled
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -197,6 +203,7 @@ class DeviceWorker:
         self.state.smsc = info.smsc
         self.state.operator = info.operator
         self.state.registered = info.registered
+        self.state.radio_enabled = info.radio_enabled
         self._ready.set()
 
         log.info(
@@ -280,6 +287,14 @@ class DeviceWorker:
         modem = self._modem
         if modem is None:
             return
+        radio_enabled = await modem.read_radio_enabled()
+        if radio_enabled is not None:
+            self.state.radio_enabled = radio_enabled
+        self.state.registered = (
+            False
+            if self.state.radio_enabled is False
+            else await modem.read_registration()
+        )
         self.state.signal = await modem.read_signal()
         used, capacity = await modem.storage_usage()
         self.state.storage_used = used
@@ -320,7 +335,9 @@ class DeviceWorker:
         if loop_time - self._last_status_sent >= STATUS_HEARTBEAT:
             return True
 
-        for key in ("online", "registered", "operator", "storage_used", "port"):
+        for key in (
+            "online", "registered", "radio_enabled", "operator", "storage_used", "port"
+        ):
             if previous.get(key) != payload.get(key):
                 return True
 
@@ -372,10 +389,16 @@ class DeviceWorker:
             )
         return self._modem
 
+    def _require_radio(self) -> Air780E:
+        modem = self._require_modem()
+        if self.state.radio_enabled is False:
+            raise DeviceOffline(f"device {self.name} radio is disabled")
+        return modem
+
     async def send_sms(
         self, number: str, body: str, *, cmd_id: str | None = None
     ) -> list[int]:
-        modem = self._require_modem()
+        modem = self._require_radio()
         ts = _now()
         try:
             refs = await modem.send_sms(number, body)
@@ -405,7 +428,17 @@ class DeviceWorker:
         return refs
 
     async def ping(self, host: str = "www.baidu.com") -> bool:
-        return await self._require_modem().ping(host)
+        return await self._require_radio().ping(host)
+
+    async def set_radio_enabled(self, enabled: bool) -> dict[str, Any]:
+        modem = self._require_modem()
+        radio_enabled, registered = await modem.set_radio_enabled(enabled)
+        self.state.radio_enabled = radio_enabled
+        self.state.registered = registered
+        if not radio_enabled:
+            self.state.signal = Signal()
+        self._emit_status(force=True)
+        return self.describe()
 
     async def raw_at(self, command: str) -> list[str]:
         client = self._client

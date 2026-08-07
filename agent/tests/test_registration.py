@@ -50,6 +50,47 @@ def _modem(responses: dict[str, object]) -> Air780E:
 
 
 # --------------------------------------------------------------------------
+# radio state
+# --------------------------------------------------------------------------
+
+
+async def test_read_radio_enabled_understands_full_and_minimum_functionality():
+    enabled = _modem({
+        "AT+CFUN?": ATResponse("AT+CFUN?", ["+CFUN: 1"], "OK"),
+    })
+    disabled = _modem({
+        "AT+CFUN?": ATResponse("AT+CFUN?", ["+CFUN: 0"], "OK"),
+    })
+
+    assert await enabled.read_radio_enabled() is True
+    assert await disabled.read_radio_enabled() is False
+
+
+async def test_unknown_radio_response_is_not_guessed():
+    modem = _modem({"AT+CFUN?": ATResponse("AT+CFUN?", [], "OK")})
+    assert await modem.read_radio_enabled() is None
+
+
+async def test_set_radio_off_updates_driver_state_without_registration_poll():
+    modem = _modem({"AT+CFUN=0": ATResponse("AT+CFUN=0", [], "OK")})
+    modem.info.registered = True
+
+    assert await modem.set_radio_enabled(False) == (False, False)
+    assert modem.info.radio_enabled is False
+    assert "AT+CEREG?" not in modem.client.calls
+
+
+async def test_set_radio_on_reports_the_immediate_registration_state():
+    modem = _modem({
+        "AT+CFUN=1": ATResponse("AT+CFUN=1", [], "OK"),
+        "AT+CEREG?": _reg_response("AT+CEREG?", "+CEREG", 1),
+    })
+
+    assert await modem.set_radio_enabled(True) == (True, True)
+    assert modem.info.radio_enabled is True
+
+
+# --------------------------------------------------------------------------
 # read_registration: CS/EPS fallback
 # --------------------------------------------------------------------------
 
@@ -190,3 +231,13 @@ async def test_recover_reports_failure_when_still_down(monkeypatch):
     )
     assert await modem.recover_registration() is False
     assert modem.info.registered is False
+
+
+async def test_recovery_never_undoes_deliberate_flight_mode():
+    modem = _modem({
+        "AT+CFUN?": ATResponse("AT+CFUN?", ["+CFUN: 0"], "OK"),
+    })
+
+    assert await modem.recover_registration() is False
+    assert "AT+COPS=0" not in modem.client.calls
+    assert "AT+CFUN=1" not in modem.client.calls

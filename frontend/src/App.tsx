@@ -50,6 +50,11 @@ export default function App() {
   const theme = useMemo(() => buildTheme(mode), [mode])
   const viz = useMemo(() => VIZ[mode], [mode])
 
+  useEffect(() => {
+    document.documentElement.style.backgroundColor = theme.palette.background.default
+    document.documentElement.style.colorScheme = mode
+  }, [mode, theme.palette.background.default])
+
   const toggleMode = useCallback(() => {
     setMode((current) => {
       const next = current === 'dark' ? 'light' : 'dark'
@@ -137,11 +142,23 @@ export default function App() {
       <CssBaseline />
       <GlobalStyles
         styles={{
-          'html, body, #root': { height: '100%', display: 'flex', flexDirection: 'column' },
+          html: {
+            minHeight: '100%',
+            backgroundColor: theme.palette.background.default,
+          },
           body: {
+            minHeight: '100dvh',
+            backgroundColor: theme.palette.background.default,
             WebkitFontSmoothing: 'antialiased',
             MozOsxFontSmoothing: 'grayscale',
             textRendering: 'optimizeLegibility',
+          },
+          '#root': {
+            width: '100%',
+            minHeight: '100dvh',
+            display: 'flex',
+            flexDirection: 'column',
+            backgroundColor: theme.palette.background.default,
           },
           // Shared entrance used by dashboard tiles — `entranceStyle()` in common.
           '@keyframes hub-rise': {

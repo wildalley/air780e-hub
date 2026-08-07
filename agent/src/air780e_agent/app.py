@@ -135,7 +135,9 @@ class AgentApp:
         handlers = {
             "send_sms": self._cmd_send_sms,
             "sync_tasks": self._cmd_sync_tasks,
+            "run_task": self._cmd_run_task,
             "query": self._cmd_query,
+            "set_radio": self._cmd_set_radio,
             "raw_at": self._cmd_raw_at,
         }
         handler = handlers.get(kind or "")
@@ -195,6 +197,12 @@ class AgentApp:
         log.info("synced %d keep-alive task(s)", count)
         return {"count": count}
 
+    async def _cmd_run_task(self, frame: dict[str, Any]) -> dict[str, Any]:
+        task_id = frame.get("task_id")
+        if not isinstance(task_id, int) or isinstance(task_id, bool):
+            raise ValueError("run_task needs an integer task_id")
+        return self.scheduler.run_now(task_id)
+
     async def _cmd_query(self, frame: dict[str, Any]) -> dict[str, Any]:
         worker = self._worker(frame)
         what = frame.get("what", "status")
@@ -215,3 +223,10 @@ class AgentApp:
             raise ValueError("raw_at needs a command")
         lines = await worker.raw_at(command)
         return {"lines": lines}
+
+    async def _cmd_set_radio(self, frame: dict[str, Any]) -> dict[str, Any]:
+        worker = self._worker(frame)
+        enabled = frame.get("enabled")
+        if not isinstance(enabled, bool):
+            raise ValueError("set_radio needs a boolean enabled value")
+        return await worker.set_radio_enabled(enabled)

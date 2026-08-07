@@ -68,6 +68,7 @@ class MockAir780E:
     rsrp: int = 55  # +CESQ encoding
     rsrq: int = 20
     registered: bool = True
+    radio_enabled: bool = True
     pin_ready: bool = True
 
     # Failure injection for tests.
@@ -215,7 +216,7 @@ class MockAir780E:
                 return self._error(cme=11)
             return self._reply(["+CPIN: READY"])
         if upper == "AT+CSQ":
-            return self._reply([f"+CSQ: {self.rssi},99"])
+            return self._reply([f"+CSQ: {self.rssi if self.radio_enabled else 99},99"])
         if upper == "AT+CESQ":
             return self._reply([f"+CESQ: 99,99,255,255,{self.rsrq},{self.rsrp}"])
         if upper == "AT+COPS?":
@@ -224,7 +225,14 @@ class MockAir780E:
             return self._reply([f'+COPS: 0,0,"{self.operator}",7'])
         if upper in ("AT+CEREG?", "AT+CREG?"):
             name = "+CEREG" if "CEREG" in upper else "+CREG"
-            return self._reply([f"{name}: 0,{1 if self.registered else 2}"])
+            attached = self.radio_enabled and self.registered
+            return self._reply([f"{name}: 0,{1 if attached else 2}"])
+        if upper == "AT+CFUN?":
+            return self._reply([f"+CFUN: {1 if self.radio_enabled else 0}"])
+        if upper in ("AT+CFUN=0", "AT+CFUN=1"):
+            self.radio_enabled = upper.endswith("1")
+            self.registered = self.radio_enabled
+            return self._reply()
         if upper in ("AT+ICCID", "AT+CCID"):
             return self._reply([f"+ICCID: {self.iccid}"])
         if upper == "AT+CGSN":

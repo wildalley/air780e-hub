@@ -18,14 +18,13 @@ export function buildTheme(mode: Mode): Theme {
     },
     typography: {
       fontFamily: FONT,
-      // Display scale: tight leading + negative tracking as it grows (Apple §15).
-      h1: { fontSize: '1.75rem', fontWeight: 650, letterSpacing: '-0.02em', lineHeight: 1.15 },
-      h2: { fontSize: '1.25rem', fontWeight: 650, letterSpacing: '-0.01em', lineHeight: 1.3 },
-      h3: { fontSize: '0.95rem', fontWeight: 600, letterSpacing: '-0.01em', lineHeight: 1.4 },
-      button: { textTransform: 'none', fontWeight: 600, letterSpacing: '0.01em' },
-      caption: { letterSpacing: '0.01em' },
+      h1: { fontSize: '1.75rem', fontWeight: 650, letterSpacing: 0, lineHeight: 1.15 },
+      h2: { fontSize: '1.25rem', fontWeight: 650, letterSpacing: 0, lineHeight: 1.3 },
+      h3: { fontSize: '0.95rem', fontWeight: 600, letterSpacing: 0, lineHeight: 1.4 },
+      button: { textTransform: 'none', fontWeight: 600, letterSpacing: 0 },
+      caption: { letterSpacing: 0 },
     },
-    shape: { borderRadius: 12 },
+    shape: { borderRadius: 8 },
     components: {
       MuiPaper: {
         styleOverrides: {
@@ -37,11 +36,42 @@ export function buildTheme(mode: Mode): Theme {
         },
       },
       MuiCard: { defaultProps: { elevation: 0 } },
+      MuiAccordion: {
+        defaultProps: { elevation: 0 },
+        styleOverrides: {
+          root: {
+            borderRadius: 8,
+            overflow: 'hidden',
+            '&::before': { display: 'none' },
+            '&:first-of-type': {
+              borderTopLeftRadius: 8,
+              borderTopRightRadius: 8,
+            },
+            '&:last-of-type': {
+              borderBottomLeftRadius: 8,
+              borderBottomRightRadius: 8,
+            },
+            '&.Mui-expanded': { margin: 0 },
+          },
+        },
+      },
+      MuiAccordionSummary: {
+        styleOverrides: {
+          root: {
+            minHeight: 56,
+            '&.Mui-expanded': { minHeight: 56 },
+          },
+          content: {
+            margin: '12px 0',
+            '&.Mui-expanded': { margin: '12px 0' },
+          },
+        },
+      },
       MuiButton: {
         defaultProps: { disableElevation: true },
         styleOverrides: {
           root: {
-            borderRadius: 10,
+            borderRadius: 8,
             // Feedback lives on the press (Apple §1): a physical push, instant.
             transition: `transform 140ms ${EASE}, background-color 160ms ${EASE}, border-color 160ms ${EASE}, color 160ms ${EASE}`,
             '&:active': { transform: 'scale(0.97)' },
@@ -81,7 +111,7 @@ export function buildTheme(mode: Mode): Theme {
             fontSize: '0.72rem',
             fontWeight: 600,
             color: viz.muted,
-            letterSpacing: '0.02em',
+            letterSpacing: 0,
             lineHeight: 1.4,
           },
         },

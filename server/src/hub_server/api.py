@@ -67,6 +67,10 @@ class RawAtBody(BaseModel):
     command: str = Field(min_length=2, max_length=200)
 
 
+class RadioBody(BaseModel):
+    enabled: bool
+
+
 class SimPatch(BaseModel):
     label: str | None = None
     phone_number: str | None = None
@@ -303,6 +307,16 @@ def build_router(state: AppState) -> APIRouter:
         if agent_id is None:
             raise HTTPException(status_code=404, detail="no such device")
         return await _call(agent_id, {"type": "query", "device": name, "what": "status"})
+
+    @router.post("/devices/{name}/radio", dependencies=guard)
+    async def set_device_radio(name: str, body: RadioBody) -> dict[str, Any]:
+        agent_id = state.gateway.agent_for_device(name)
+        if agent_id is None:
+            raise HTTPException(status_code=404, detail="no such device")
+        return await _call(
+            agent_id,
+            {"type": "set_radio", "device": name, "enabled": body.enabled},
+        )
 
     @router.get("/sims", dependencies=guard)
     def list_sims() -> list[dict[str, Any]]:
@@ -662,6 +676,20 @@ def build_router(state: AppState) -> APIRouter:
         state.db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         await _sync_tasks()
         return {"ok": True}
+
+    @router.post("/tasks/{task_id}/run", dependencies=guard)
+    async def run_task(task_id: int) -> dict[str, Any]:
+        task = state.db.one("SELECT * FROM tasks WHERE id = ?", (task_id,))
+        if task is None:
+            raise HTTPException(status_code=404, detail="no such task")
+        agent_id = task.get("agent_id") or state.gateway.agent_for_device(task["device"])
+        if not agent_id:
+            raise HTTPException(status_code=503, detail="task device has no agent")
+
+        # Re-send the authoritative definition first. This keeps an immediate
+        # run correct even when it follows an edit before the agent reconnects.
+        await state.gateway.push_tasks(agent_id)
+        return await _call(agent_id, {"type": "run_task", "task_id": task_id})
 
     @router.get("/task-logs", dependencies=guard)
     def task_logs(limit: int = Query(100, ge=1, le=1000)) -> list[dict[str, Any]]:

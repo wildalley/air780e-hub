@@ -43,6 +43,7 @@ class FakeWorker:
         self.fail_times = fail_times
         self.attempts = 0
         self.ping_ok = ping_ok
+        self.radio_enabled: bool | None = True
         self.gate: asyncio.Event | None = None
 
     async def send_sms(self, number: str, body: str) -> list[int]:
@@ -157,6 +158,30 @@ async def test_a_disabled_task_never_runs(store):
     assert worker.sent == []
 
 
+async def test_a_disabled_task_can_be_started_manually(store):
+    worker = FakeWorker()
+    scheduler, events = build(store, worker, tasks=[make_task(enabled=False)])
+
+    assert scheduler.run_now(1) == {"task_id": 1, "status": "started"}
+    await scheduler.drain()
+
+    assert worker.sent == [("10086", "1")]
+    assert results(events)[0]["status"] == "ok"
+
+
+async def test_a_running_task_rejects_a_second_manual_start(store):
+    worker = FakeWorker()
+    worker.gate = asyncio.Event()
+    scheduler, _ = build(store, worker)
+
+    scheduler.run_now(1)
+    with pytest.raises(RuntimeError, match="already running"):
+        scheduler.run_now(1)
+
+    worker.gate.set()
+    await scheduler.drain()
+
+
 async def test_a_fresh_task_waits_a_full_interval(store):
     """Creating a keep-alive task must not immediately send an SMS."""
     worker = FakeWorker()
@@ -246,6 +271,23 @@ async def test_an_unknown_device_is_skipped_without_retrying(store):
     assert receipt["status"] == "skipped"
     assert receipt["attempts"] == 1
     assert store.all_tasks()[0]["last_run_at"] is None, "nothing was attempted"
+
+
+async def test_flight_mode_skips_without_retrying_or_advancing_last_run(store):
+    worker = FakeWorker()
+    worker.radio_enabled = False
+    scheduler, events = build(store, worker, tasks=[make_task(retry_max=5)])
+    due_now(store)
+
+    await scheduler.tick_once()
+    await scheduler.drain()
+
+    receipt = results(events)[0]
+    assert receipt["status"] == "skipped"
+    assert receipt["attempts"] == 1
+    assert "radio is disabled" in receipt["error"]
+    assert worker.sent == []
+    assert store.all_tasks()[0]["last_run_at"] is None
 
 
 async def test_a_broken_schedule_is_reported_and_not_retried_every_tick(store):

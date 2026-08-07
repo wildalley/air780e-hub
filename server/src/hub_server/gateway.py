@@ -328,6 +328,13 @@ class Gateway:
                     f"sms-send:{agent_id}:{frame.get('device', '')}",
                     detail="模块已离线，发送状态由掉线事件跟踪",
                 )
+            elif frame.get("radio_enabled") is False:
+                # Flight mode is an explicit operator choice, not a network
+                # failure.  It must not open an incident that can only resolve
+                # after the same operator turns RF back on.
+                self.db.resolve_incident(
+                    fingerprint, detail="射频已由管理员关闭"
+                )
             elif not frame.get("registered"):
                 self.db.open_incident(
                     fingerprint,

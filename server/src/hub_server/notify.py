@@ -265,10 +265,60 @@ async def _send_telegram(
     return _ok(response)
 
 
+def _feishu_card(payload: Payload) -> dict[str, Any]:
+    """Build a compact Feishu card without interpreting SMS text as Markdown."""
+    context = payload.context
+    # The shared default template already includes card and sender.  Once the
+    # card gives those values dedicated fields, repeating that first line in
+    # the body looks like a rendering bug.  Custom templates remain verbatim.
+    default_text = render(DEFAULT_TEMPLATE, context)
+    content = (
+        context.get("message", "")
+        if payload.text == default_text and context.get("message")
+        else payload.text
+    )
+
+    elements: list[dict[str, Any]] = []
+    fields = []
+    for label, key in (("卡片", "card"), ("发件人", "sender")):
+        value = str(context.get(key) or "").strip()
+        if value:
+            fields.append({
+                "is_short": True,
+                "text": {"tag": "plain_text", "content": f"{label}\n{value}"},
+            })
+    if fields:
+        elements.extend(({"tag": "div", "fields": fields}, {"tag": "hr"}))
+
+    elements.append({
+        "tag": "div",
+        "text": {"tag": "plain_text", "content": content or " "},
+    })
+
+    timestamp = str(context.get("timestamp") or "").strip()
+    if timestamp:
+        elements.extend((
+            {"tag": "hr"},
+            {
+                "tag": "note",
+                "elements": [{"tag": "plain_text", "content": timestamp}],
+            },
+        ))
+
+    return {
+        "config": {"wide_screen_mode": True, "enable_forward": False},
+        "header": {
+            "template": "blue",
+            "title": {"tag": "plain_text", "content": payload.title or "air780e-hub"},
+        },
+        "elements": elements,
+    }
+
+
 async def _send_feishu(
     client: httpx.AsyncClient, config: dict[str, Any], payload: Payload
 ) -> str:
-    body: dict[str, Any] = {"msg_type": "text", "content": {"text": payload.text}}
+    body: dict[str, Any] = {"msg_type": "interactive", "card": _feishu_card(payload)}
     secret = str(config.get("secret") or "").strip()
     if secret:
         # Feishu signs an *empty* message with "<timestamp>\n<secret>" as the key.
@@ -600,7 +650,13 @@ class Notifier:
         if not channels:
             return []
 
-        context = {**SAMPLE_CONTEXT, "message": text, "timestamp": self._local(utcnow())}
+        # This is a system/task notification, not the sample SMS shown by the
+        # test button.  Fake sample card/sender values here would leak into a
+        # structured provider payload and look like real metadata.
+        context = {
+            "sender": "", "card": "", "device": "", "iccid": "",
+            "message": text, "timestamp": self._local(utcnow()),
+        }
         payload = Payload(text=text, title=title, context=context)
         results = await asyncio.gather(*[
             self._attempt(channel, payload, message_id=None, rule_id=None,

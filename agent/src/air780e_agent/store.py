@@ -285,6 +285,10 @@ class LocalStore:
         rows = self._db.execute("SELECT * FROM tasks ORDER BY id").fetchall()
         return [dict(row) for row in rows]
 
+    def task(self, task_id: int) -> dict[str, Any] | None:
+        row = self._db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        return dict(row) if row else None
+
     def mark_task_run(self, task_id: int, *, last_run: str, next_run: str | None) -> None:
         self._db.execute(
             "UPDATE tasks SET last_run_at = ?, next_run_at = ? WHERE id = ?",

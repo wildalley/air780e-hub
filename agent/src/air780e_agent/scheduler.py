@@ -107,6 +107,21 @@ class KeepAliveScheduler:
         while self._running:
             await asyncio.gather(*list(self._running.values()), return_exceptions=True)
 
+    def run_now(self, task_id: int) -> dict[str, Any]:
+        """Start one stored task immediately, without changing its enabled flag."""
+        task = self.store.task(task_id)
+        if task is None:
+            raise ValueError(f"no such task: {task_id}")
+        if task_id in self._running:
+            raise RuntimeError(f"task {task_id} is already running")
+
+        handle = asyncio.create_task(
+            self._execute(task), name=f"keepalive-manual-{task_id}"
+        )
+        self._running[task_id] = handle
+        handle.add_done_callback(lambda _, key=task_id: self._running.pop(key, None))
+        return {"task_id": task_id, "status": "started"}
+
     # -- the tick ----------------------------------------------------------
 
     async def tick_once(self) -> int:
@@ -225,6 +240,9 @@ class KeepAliveScheduler:
         worker = self.workers.get(task["device"])
         if worker is None:
             raise TaskSkipped(f"no device named {task['device']!r} on this agent")
+
+        if worker.radio_enabled is False:
+            raise TaskSkipped(f"device {task['device']!r} radio is disabled")
 
         action = task["action"] or "send_sms"
         if action == "send_sms":

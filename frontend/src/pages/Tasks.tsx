@@ -6,6 +6,7 @@ import {
   Card,
   CardContent,
   Chip,
+  CircularProgress,
   Dialog,
   DialogActions,
   DialogContent,
@@ -30,10 +31,12 @@ import {
 import AddIcon from '@mui/icons-material/Add'
 import EditIcon from '@mui/icons-material/EditOutlined'
 import DeleteIcon from '@mui/icons-material/DeleteOutlined'
+import RunIcon from '@mui/icons-material/PlayArrowOutlined'
 import useSWR from 'swr'
 import { api, ApiError, type Device, type Task, type TaskInput } from '../api'
 import { Loading, formatTs, useToast } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
+import { LIVE_MS } from '../swr'
 import { STATUS } from '../tokens'
 
 /** Every field the plan promised would be editable, with its default. */
@@ -75,12 +78,25 @@ function describeSchedule(task: Task): string {
   return `cron ${task.schedule_expr}`
 }
 
+function describeAction(task: Task): string {
+  if (task.action === 'send_sms') return `发送到 ${task.target_number}:「${task.content}」`
+  if (task.action === 'ping') return `Ping ${task.content || 'www.baidu.com'}`
+  return task.content
+}
+
 export function TasksPage() {
   const toast = useToast()
   const [editing, setEditing] = useState<{ id: number | null; input: TaskInput } | null>(null)
+  const [runningId, setRunningId] = useState<number | null>(null)
 
-  const { data: tasks, mutate: mutateTasks } = useSWR('/api/tasks', () => api.tasks.list())
-  const { data: logs = [], mutate: mutateLogs } = useSWR('/api/task-logs', () => api.tasks.logs())
+  const { data: tasks, mutate: mutateTasks } = useSWR('/api/tasks', () => api.tasks.list(), {
+    refreshInterval: LIVE_MS,
+  })
+  const { data: logs = [], mutate: mutateLogs } = useSWR(
+    '/api/task-logs',
+    () => api.tasks.logs(),
+    { refreshInterval: LIVE_MS },
+  )
   // Shared cache key with the devices page and the composer — the dropdown of
   // modules costs nothing here if another view already fetched it.
   const { data: devices = [] } = useSWR('/api/devices', () => api.devices.list())
@@ -111,6 +127,19 @@ export function TasksPage() {
     await load()
   }
 
+  const runNow = async (task: Task) => {
+    setRunningId(task.id)
+    try {
+      await api.tasks.run(task.id)
+      toast.show(`已触发「${task.name || `任务 ${task.id}`}」`, 'success')
+      window.setTimeout(() => void load(), 1000)
+    } catch (err) {
+      toast.show(err instanceof ApiError ? err.message : '触发失败', 'error')
+    } finally {
+      setRunningId(null)
+    }
+  }
+
   if (!tasks) return <Loading />
 
   return (
@@ -137,7 +166,7 @@ export function TasksPage() {
         服务器只负责编辑规则并下发。
       </Alert>
 
-      <Card>
+      <Card sx={{ display: { xs: 'none', sm: 'block' } }}>
         <CardContent sx={{ p: 0, '&:last-child': { pb: 0 } }}>
           {tasks.length === 0 ? (
             <Box sx={{ p: 4, textAlign: 'center' }}>
@@ -165,7 +194,10 @@ export function TasksPage() {
                       下次执行
                     </TableCell>
                     <TableCell>状态</TableCell>
-                    <TableCell align="right" />
+                    <TableCell
+                      align="right"
+                      sx={{ position: 'sticky', right: 0, zIndex: 2, bgcolor: 'background.paper' }}
+                    />
                   </TableRow>
                 </TableHead>
               <TableBody>
@@ -174,11 +206,7 @@ export function TasksPage() {
                     <TableCell>{task.name || `任务 ${task.id}`}</TableCell>
                     <TableCell>{task.sim_label || task.device}</TableCell>
                     <TableCell>
-                      {task.action === 'send_sms'
-                        ? `发送到 ${task.target_number}:「${task.content}」`
-                        : task.action === 'ping'
-                          ? 'Ping 消耗流量'
-                          : task.content}
+                      {describeAction(task)}
                     </TableCell>
                     <TableCell sx={{ whiteSpace: 'nowrap', display: { xs: 'none', sm: 'table-cell' } }}>
                       {describeSchedule(task)}
@@ -199,7 +227,32 @@ export function TasksPage() {
                         sx={{ color: task.enabled ? STATUS.good : 'text.secondary' }}
                       />
                     </TableCell>
-                    <TableCell align="right" sx={{ whiteSpace: 'nowrap' }}>
+                    <TableCell
+                      align="right"
+                      sx={{
+                        whiteSpace: 'nowrap',
+                        position: 'sticky',
+                        right: 0,
+                        zIndex: 1,
+                        bgcolor: 'background.paper',
+                      }}
+                    >
+                      <Tooltip title="立即执行">
+                        <span>
+                          <IconButton
+                            size="small"
+                            onClick={() => void runNow(task)}
+                            disabled={runningId !== null}
+                            aria-label={`立即执行 ${task.name || `任务 ${task.id}`}`}
+                          >
+                            {runningId === task.id ? (
+                              <CircularProgress size={18} />
+                            ) : (
+                              <RunIcon fontSize="small" />
+                            )}
+                          </IconButton>
+                        </span>
+                      </Tooltip>
                       <IconButton
                         size="small"
                         onClick={() => setEditing({ id: task.id, input: toInput(task) })}
@@ -219,6 +272,104 @@ export function TasksPage() {
           )}
         </CardContent>
       </Card>
+
+      <Stack spacing={1.5} sx={{ display: { xs: 'flex', sm: 'none' } }}>
+        {tasks.length === 0 ? (
+          <Card>
+            <CardContent>
+              <Typography variant="body2" sx={{ color: 'text.secondary' }}>
+                还没有保号任务。默认建议:每 25 天给运营商号码发一条短信。
+              </Typography>
+            </CardContent>
+          </Card>
+        ) : (
+          tasks.map((task) => (
+            <Card key={task.id}>
+              <CardContent>
+                <Stack spacing={1.75}>
+                  <Stack direction="row" spacing={1.5} sx={{ justifyContent: 'space-between' }}>
+                    <Box sx={{ minWidth: 0 }}>
+                      <Typography variant="h3">{task.name || `任务 ${task.id}`}</Typography>
+                      <Typography
+                        variant="caption"
+                        sx={{ color: 'text.secondary', overflowWrap: 'anywhere' }}
+                      >
+                        {task.sim_label || task.device}
+                      </Typography>
+                    </Box>
+                    <Chip
+                      size="small"
+                      variant="outlined"
+                      label={task.enabled ? '启用' : '停用'}
+                      sx={{ color: task.enabled ? STATUS.good : 'text.secondary', flexShrink: 0 }}
+                    />
+                  </Stack>
+
+                  <Box
+                    sx={{
+                      display: 'grid',
+                      gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+                      gap: 1.5,
+                    }}
+                  >
+                    <Box sx={{ gridColumn: '1 / -1', minWidth: 0 }}>
+                      <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block' }}>
+                        动作
+                      </Typography>
+                      <Typography variant="body2" sx={{ overflowWrap: 'anywhere' }}>
+                        {describeAction(task)}
+                      </Typography>
+                    </Box>
+                    <TaskValue label="周期" value={describeSchedule(task)} />
+                    <TaskValue
+                      label="下次执行"
+                      value={task.enabled ? formatTs(task.next_run_at) : '—'}
+                    />
+                  </Box>
+
+                  <Divider />
+                  <Stack direction="row" spacing={0.5} sx={{ justifyContent: 'flex-end' }}>
+                    <Tooltip title="立即执行">
+                      <span>
+                        <IconButton
+                          size="small"
+                          onClick={() => void runNow(task)}
+                          disabled={runningId !== null}
+                          aria-label={`立即执行 ${task.name || `任务 ${task.id}`}`}
+                        >
+                          {runningId === task.id ? (
+                            <CircularProgress size={18} />
+                          ) : (
+                            <RunIcon fontSize="small" />
+                          )}
+                        </IconButton>
+                      </span>
+                    </Tooltip>
+                    <Tooltip title="编辑">
+                      <IconButton
+                        size="small"
+                        onClick={() => setEditing({ id: task.id, input: toInput(task) })}
+                        aria-label={`编辑 ${task.name || `任务 ${task.id}`}`}
+                      >
+                        <EditIcon fontSize="small" />
+                      </IconButton>
+                    </Tooltip>
+                    <Tooltip title="删除">
+                      <IconButton
+                        size="small"
+                        onClick={() => remove(task)}
+                        aria-label={`删除 ${task.name || `任务 ${task.id}`}`}
+                      >
+                        <DeleteIcon fontSize="small" />
+                      </IconButton>
+                    </Tooltip>
+                  </Stack>
+                </Stack>
+              </CardContent>
+            </Card>
+          ))
+        )}
+      </Stack>
 
       <Card>
         <CardContent>
@@ -277,6 +428,19 @@ export function TasksPage() {
   )
 }
 
+function TaskValue({ label, value }: { label: string; value: string }) {
+  return (
+    <Box sx={{ minWidth: 0 }}>
+      <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block' }}>
+        {label}
+      </Typography>
+      <Typography variant="body2" sx={{ overflowWrap: 'anywhere' }}>
+        {value}
+      </Typography>
+    </Box>
+  )
+}
+
 function TaskDialog({
   value,
   isNew,
@@ -302,6 +466,9 @@ function TaskDialog({
       <DialogTitle>{isNew ? '新建保号任务' : '编辑保号任务'}</DialogTitle>
       <DialogContent>
         <Stack spacing={2.5} sx={{ mt: 1 }}>
+          <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
+            基本信息
+          </Typography>
           <TextField
             label="任务名称"
             value={value.name}
@@ -362,10 +529,25 @@ function TaskDialog({
               placeholder="AT+CIPPING=&quot;www.baidu.com&quot;"
             />
           )}
+          {value.action === 'ping' && (
+            <TextField
+              label="Ping 目标"
+              value={value.content}
+              onChange={(e) => set('content', e.target.value)}
+              fullWidth
+              placeholder="www.baidu.com"
+            />
+          )}
 
-          <Divider />
+          <Divider textAlign="left">执行计划</Divider>
 
-          <Box sx={{ display: 'grid', gap: 2, gridTemplateColumns: '5fr 7fr' }}>
+          <Box
+            sx={{
+              display: 'grid',
+              gap: 2,
+              gridTemplateColumns: { xs: '1fr', sm: '5fr 7fr' },
+            }}
+          >
             <TextField
               select
               label="调度方式"
@@ -397,6 +579,13 @@ function TaskDialog({
             />
           </Box>
 
+          <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+            {value.schedule_type === 'interval'
+              ? `每 ${value.schedule_expr || '—'} 天执行一次`
+              : `按 cron ${value.schedule_expr || '—'} 执行`}
+            {jitterMinutes > 0 ? `，实际时间随机偏移 ±${jitterMinutes} 分钟` : ''}
+          </Typography>
+
           <Box>
             <Typography variant="body2" gutterBottom>
               随机延迟:±{jitterMinutes} 分钟
@@ -417,6 +606,8 @@ function TaskDialog({
             </Typography>
           </Box>
 
+          <Divider textAlign="left">失败与通知</Divider>
+
           <TextField
             label="失败重试次数"
             type="number"
@@ -428,17 +619,19 @@ function TaskDialog({
             }}
           />
 
-          <Tooltip title="在内容尾部附加几个随机字符。运营商对完全重复的短信可能拦截。">
-            <FormControlLabel
-              control={
-                <Switch
-                  checked={value.random_suffix}
-                  onChange={(e) => set('random_suffix', e.target.checked)}
-                />
-              }
-              label="内容附加随机字符(防拦截)"
-            />
-          </Tooltip>
+          {value.action === 'send_sms' && (
+            <Tooltip title="在内容尾部附加几个随机字符。运营商对完全重复的短信可能拦截。">
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={value.random_suffix}
+                    onChange={(e) => set('random_suffix', e.target.checked)}
+                  />
+                }
+                label="内容附加随机字符(防拦截)"
+              />
+            </Tooltip>
+          )}
 
           <FormControlLabel
             control={

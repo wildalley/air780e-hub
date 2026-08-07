@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { Link as RouterLink } from 'react-router'
 import {
   Alert,
   Box,
@@ -6,22 +7,42 @@ import {
   Card,
   CardContent,
   CardHeader,
-  MenuItem,
+  Divider,
+  Drawer,
+  IconButton,
   Stack,
-  TextField,
+  Switch,
+  Table,
+  TableBody,
+  TableCell,
+  TableContainer,
+  TableHead,
+  TableRow,
+  Tooltip,
   Typography,
 } from '@mui/material'
+import FlightModeIcon from '@mui/icons-material/AirplanemodeActiveOutlined'
+import UnknownRadioIcon from '@mui/icons-material/HelpOutlineOutlined'
 import RefreshIcon from '@mui/icons-material/RefreshOutlined'
+import RadioIcon from '@mui/icons-material/CellTowerOutlined'
+import InfoIcon from '@mui/icons-material/InfoOutlined'
 import TerminalIcon from '@mui/icons-material/TerminalOutlined'
+import CloseIcon from '@mui/icons-material/Close'
 import useSWR from 'swr'
 import { api, ApiError, type Device } from '../api'
-import { Loading, OnlineChip, formatTs, useToast } from '../components/common'
+import { Loading, OnlineChip, formatTs, relativeTs, useToast } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
 import { StorageMeter } from '../components/StorageMeter'
+import { radioStatus } from '../deviceStatus'
+
+function deviceLabel(device: Device): string {
+  return device.sim_label || device.label || device.name
+}
 
 export function DevicesPage() {
   const toast = useToast()
   const [busy, setBusy] = useState<string | null>(null)
+  const [selected, setSelected] = useState<Device | null>(null)
 
   const { data: devices, mutate: load } = useSWR('/api/devices', () => api.devices.list())
 
@@ -38,11 +59,38 @@ export function DevicesPage() {
     }
   }
 
+  const setRadio = async (device: Device, enabled: boolean) => {
+    if (
+      !enabled &&
+      !window.confirm('关闭射频后，这张卡将无法收发短信，保号任务会暂停。继续？')
+    ) {
+      return
+    }
+    setBusy(device.name)
+    try {
+      await api.devices.setRadio(device.name, enabled)
+      await load()
+      toast.show(enabled ? '射频已开启' : '已进入飞行模式', 'success')
+    } catch (err) {
+      toast.show(err instanceof ApiError ? err.message : '射频切换失败', 'error')
+    } finally {
+      setBusy(null)
+    }
+  }
+
   if (!devices) return <Loading />
 
   return (
     <Stack spacing={3}>
-      <PageHeader title="设备" subtitle="各模块的实时状态与工程参数" />
+      <PageHeader
+        title="设备"
+        subtitle="模块状态、信号与射频控制"
+        actions={
+          <Button component={RouterLink} to="/console" startIcon={<TerminalIcon />}>
+            AT 调试
+          </Button>
+        }
+      />
 
       {devices.length === 0 && (
         <Alert severity="info">
@@ -50,201 +98,285 @@ export function DevicesPage() {
         </Alert>
       )}
 
-      <Box
-        sx={{
-          display: 'grid',
-          gap: 2,
-          gridTemplateColumns: { xs: '1fr', md: 'repeat(2, 1fr)' },
-        }}
-      >
-        {devices.map((device) => (
-          <Card key={device.id}>
-              <CardHeader
-                title={
-                  <Typography variant="h3">
-                    {device.sim_label || device.label || device.name}
-                  </Typography>
-                }
-                subheader={
-                  <Typography variant="caption" sx={{
-                    color: 'text.secondary'
-                  }}>
-                    {device.port} · agent {device.agent_id}
-                  </Typography>
-                }
-                action={<OnlineChip online={Boolean(device.online)} />}
-              />
-              <CardContent>
-                <Stack spacing={2}>
-                  <Box
-                    sx={{
-                      display: 'grid',
-                      gap: 1.5,
-                      gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
-                    }}
-                  >
-                    {[
-                      ['型号', device.model || '—'],
-                      ['IMEI', device.imei || '—'],
-                      ['ICCID', device.iccid || '无卡'],
-                      ['运营商', device.operator || '未注册'],
-                      ['信号', device.dbm != null ? `${device.dbm} dBm (${device.bars}/5)` : '—'],
-                      ['RSRP / RSRQ', device.rsrp != null ? `${device.rsrp} / ${device.rsrq}` : '—'],
-                      ['注册状态', device.registered ? '已注册' : '未注册'],
-                      ['最后上报', formatTs(device.last_seen_at)],
-                    ].map(([label, value]) => (
-                      <Box key={label}>
-                        <Typography
-                          variant="caption"
-                          sx={{
-                            color: 'text.secondary',
-                            display: 'block'
-                          }}>
-                          {label}
+      {devices.length > 0 && (
+        <>
+          <Card sx={{ display: { xs: 'none', md: 'block' } }}>
+            <TableContainer>
+              <Table size="small" sx={{ minWidth: 960 }}>
+                <TableHead>
+                  <TableRow>
+                    <TableCell>卡 / 模块</TableCell>
+                    <TableCell>连接</TableCell>
+                    <TableCell>信号</TableCell>
+                    <TableCell sx={{ width: 190 }}>存储</TableCell>
+                    <TableCell sx={{ width: 220 }}>移动网络射频</TableCell>
+                    <TableCell>最后上报</TableCell>
+                    <TableCell align="right" />
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {devices.map((device) => (
+                    <TableRow key={device.id} hover>
+                      <TableCell>
+                        <Typography variant="body2" sx={{ fontWeight: 650 }}>
+                          {deviceLabel(device)}
                         </Typography>
-                        <Typography variant="body2" sx={{ wordBreak: 'break-all' }}>
-                          {value}
+                        <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                          {device.name} · {device.operator || '未知运营商'}
                         </Typography>
-                      </Box>
-                    ))}
-                  </Box>
+                      </TableCell>
+                      <TableCell>
+                        <Stack spacing={0.5} sx={{ alignItems: 'flex-start' }}>
+                          <OnlineChip online={Boolean(device.online)} />
+                          <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                            {device.registered ? '已注册' : '未注册'}
+                          </Typography>
+                        </Stack>
+                      </TableCell>
+                      <TableCell>
+                        <Typography variant="body2" sx={{ whiteSpace: 'nowrap' }}>
+                          {device.dbm != null ? `${device.dbm} dBm` : '—'}
+                        </Typography>
+                        <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                          {device.dbm != null ? `${device.bars}/5 格` : '无数据'}
+                        </Typography>
+                      </TableCell>
+                      <TableCell>
+                        <StorageMeter
+                          used={device.storage_used}
+                          capacity={device.storage_cap}
+                          label="短信存储"
+                        />
+                      </TableCell>
+                      <TableCell>
+                        <RadioControl
+                          device={device}
+                          busy={busy === device.name}
+                          onChange={(enabled) => void setRadio(device, enabled)}
+                          compact
+                        />
+                      </TableCell>
+                      <TableCell sx={{ whiteSpace: 'nowrap' }}>
+                        <Typography variant="body2">{relativeTs(device.last_seen_at)}</Typography>
+                        <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                          {formatTs(device.last_seen_at)}
+                        </Typography>
+                      </TableCell>
+                      <TableCell align="right" sx={{ whiteSpace: 'nowrap' }}>
+                        <Tooltip title="刷新状态">
+                          <span>
+                            <IconButton
+                              size="small"
+                              onClick={() => void refresh(device)}
+                              disabled={!device.online || busy === device.name}
+                              aria-label={`刷新 ${deviceLabel(device)}`}
+                            >
+                              <RefreshIcon fontSize="small" />
+                            </IconButton>
+                          </span>
+                        </Tooltip>
+                        <Tooltip title="设备详情">
+                          <IconButton
+                            size="small"
+                            onClick={() => setSelected(device)}
+                            aria-label={`查看 ${deviceLabel(device)} 详情`}
+                          >
+                            <InfoIcon fontSize="small" />
+                          </IconButton>
+                        </Tooltip>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </TableContainer>
+          </Card>
 
-                  <StorageMeter used={device.storage_used} capacity={device.storage_cap} />
+          <Stack spacing={2} sx={{ display: { xs: 'flex', md: 'none' } }}>
+            {devices.map((device) => (
+              <Card key={device.id}>
+                <CardHeader
+                  title={<Typography variant="h3">{deviceLabel(device)}</Typography>}
+                  subheader={
+                    <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                      {device.name} · {device.operator || '未知运营商'}
+                    </Typography>
+                  }
+                  action={<OnlineChip online={Boolean(device.online)} />}
+                />
+                <CardContent sx={{ pt: 0 }}>
+                  <Stack spacing={2}>
+                    <Box
+                      sx={{
+                        display: 'grid',
+                        gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+                        gap: 1.5,
+                      }}
+                    >
+                      <SummaryValue label="注册" value={device.registered ? '已注册' : '未注册'} />
+                      <SummaryValue
+                        label="信号"
+                        value={device.dbm != null ? `${device.dbm} dBm (${device.bars}/5)` : '—'}
+                      />
+                      <SummaryValue label="最后上报" value={relativeTs(device.last_seen_at)} />
+                      <SummaryValue label="端口" value={device.port || '—'} />
+                    </Box>
+                    <StorageMeter used={device.storage_used} capacity={device.storage_cap} />
+                    <RadioControl
+                      device={device}
+                      busy={busy === device.name}
+                      onChange={(enabled) => void setRadio(device, enabled)}
+                    />
+                    <Stack direction="row" spacing={1} sx={{ justifyContent: 'space-between' }}>
+                      <Button
+                        size="small"
+                        startIcon={<RefreshIcon />}
+                        onClick={() => void refresh(device)}
+                        disabled={!device.online || busy === device.name}
+                      >
+                        刷新
+                      </Button>
+                      <Button size="small" startIcon={<InfoIcon />} onClick={() => setSelected(device)}>
+                        详情
+                      </Button>
+                    </Stack>
+                  </Stack>
+                </CardContent>
+              </Card>
+            ))}
+          </Stack>
+        </>
+      )}
 
-                  <Button
-                    size="small"
-                    startIcon={<RefreshIcon />}
-                    onClick={() => refresh(device)}
-                    disabled={!device.online || busy === device.name}
-                    sx={{ alignSelf: 'flex-start' }}
-                  >
-                    立即刷新
-                  </Button>
-                </Stack>
-              </CardContent>
-            </Card>
-        ))}
-      </Box>
-
-      <AtConsole devices={devices} onError={(m) => toast.show(m, 'error')} />
+      <DeviceDrawer device={selected} onClose={() => setSelected(null)} />
       {toast.element}
     </Stack>
   )
 }
 
-/**
- * Raw AT console.
- *
- * Sharp edge on purpose: this reaches the modem directly. It exists because
- * bring-up and field debugging need it, and it is behind the admin session
- * like everything else.
- */
-function AtConsole({
-  devices,
-  onError,
+function RadioControl({
+  device,
+  busy,
+  onChange,
+  compact = false,
 }: {
-  devices: Device[]
-  onError: (message: string) => void
+  device: Device
+  busy: boolean
+  onChange: (enabled: boolean) => void
+  compact?: boolean
 }) {
-  // `null` means "nothing picked yet", so the first device is a fallback the
-  // render derives rather than state an effect has to write. A device that
-  // disappears from the list falls back the same way.
-  const [picked, setPicked] = useState<string | null>(null)
-  const [command, setCommand] = useState('AT+CSQ')
-  const [output, setOutput] = useState<string[]>([])
-  const [busy, setBusy] = useState(false)
-
-  const device =
-    picked !== null && devices.some((d) => d.name === picked)
-      ? picked
-      : (devices[0]?.name ?? '')
-  const setDevice = setPicked
-
-  const run = async () => {
-    setBusy(true)
-    try {
-      const result = await api.at(device, command)
-      setOutput((previous) => [
-        ...previous,
-        `> ${command}`,
-        ...(result.lines.length ? result.lines : ['OK']),
-        '',
-      ])
-    } catch (err) {
-      const message = err instanceof ApiError ? err.message : '执行失败'
-      setOutput((previous) => [...previous, `> ${command}`, `!! ${message}`, ''])
-      onError(message)
-    } finally {
-      setBusy(false)
-    }
-  }
+  const icon =
+    device.radio_enabled == null ? (
+      <UnknownRadioIcon color="action" fontSize="small" />
+    ) : device.radio_enabled ? (
+      <RadioIcon color="action" fontSize="small" />
+    ) : (
+      <FlightModeIcon color="action" fontSize="small" />
+    )
 
   return (
-    <Card>
-      <CardHeader
-        avatar={<TerminalIcon />}
-        title={<Typography variant="h3">AT 调试台</Typography>}
-        subheader={
-          <Typography variant="caption" sx={{
-            color: 'text.secondary'
-          }}>
-            直接下发 AT 指令到模块。参考 docs.openluat.com/air780e/at
-          </Typography>
-        }
-      />
-      <CardContent>
-        <Stack spacing={2}>
-          <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
-            <TextField
-              select
-              size="small"
-              label="设备"
-              value={device}
-              onChange={(e) => setDevice(e.target.value)}
-              sx={{ minWidth: 180 }}
-            >
-              {devices.map((d) => (
-                <MenuItem key={d.name} value={d.name} disabled={!d.online}>
-                  {d.sim_label || d.label || d.name}
-                </MenuItem>
-              ))}
-            </TextField>
-            <TextField
-              size="small"
-              label="指令"
-              value={command}
-              onChange={(e) => setCommand(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !busy) void run()
-              }}
-              sx={{ flexGrow: 1 }}
-            />
-            <Button variant="outlined" onClick={run} disabled={busy || !device || !command}>
-              执行
-            </Button>
-          </Stack>
-
-          {output.length > 0 && (
-            <Box
-              component="pre"
-              sx={{
-                m: 0,
-                p: 2,
-                borderRadius: 2,
-                bgcolor: 'background.default',
-                border: 1,
-                borderColor: 'divider',
-                fontSize: 13,
-                maxHeight: 260,
-                overflow: 'auto',
-                fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-              }}
-            >
-              {output.join('\n')}
-            </Box>
+    <Stack
+      direction="row"
+      spacing={1}
+      sx={{ alignItems: 'center', justifyContent: 'space-between', minHeight: compact ? 36 : 42 }}
+    >
+      <Stack direction="row" spacing={1} sx={{ alignItems: 'center', minWidth: 0 }}>
+        {icon}
+        <Box sx={{ minWidth: 0 }}>
+          {!compact && (
+            <Typography variant="body2" sx={{ fontWeight: 600 }}>
+              移动网络射频
+            </Typography>
           )}
-        </Stack>
-      </CardContent>
-    </Card>
+          <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block' }}>
+            {busy ? '切换中' : radioStatus(device)}
+          </Typography>
+        </Box>
+      </Stack>
+      <Switch
+        size={compact ? 'small' : 'medium'}
+        checked={Boolean(device.radio_enabled)}
+        onChange={(_, enabled) => onChange(enabled)}
+        disabled={!device.online || device.radio_enabled == null || busy}
+        slotProps={{ input: { 'aria-label': `${device.name} 移动网络射频` } }}
+      />
+    </Stack>
+  )
+}
+
+function SummaryValue({ label, value }: { label: string; value: string }) {
+  return (
+    <Box sx={{ minWidth: 0 }}>
+      <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block' }}>
+        {label}
+      </Typography>
+      <Typography variant="body2" sx={{ overflowWrap: 'anywhere' }}>
+        {value}
+      </Typography>
+    </Box>
+  )
+}
+
+function DeviceDrawer({ device, onClose }: { device: Device | null; onClose: () => void }) {
+  const fields = device
+    ? [
+        ['模块名称', device.name],
+        ['Agent', device.agent_id],
+        ['设备端口', device.port || '—'],
+        ['型号', device.model || '—'],
+        ['IMEI', device.imei || '—'],
+        ['ICCID', device.iccid || '无卡'],
+        ['电话号码', device.phone_number || '—'],
+        ['运营商', device.operator || '—'],
+        ['RSRP / RSRQ', device.rsrp != null ? `${device.rsrp} / ${device.rsrq ?? '—'}` : '—'],
+        ['最后上报', formatTs(device.last_seen_at)],
+      ]
+    : []
+
+  return (
+    <Drawer
+      anchor="right"
+      open={device !== null}
+      onClose={onClose}
+      slotProps={{ paper: { sx: { width: { xs: '100%', sm: 420 }, maxWidth: '100%' } } }}
+    >
+      {device && (
+        <Box sx={{ p: 3 }}>
+          <Stack direction="row" sx={{ alignItems: 'center', justifyContent: 'space-between' }}>
+            <Box sx={{ minWidth: 0 }}>
+              <Typography variant="h2">{deviceLabel(device)}</Typography>
+              <Typography variant="body2" sx={{ color: 'text.secondary', mt: 0.5 }}>
+                {device.online ? '模块在线' : '模块离线'} · {radioStatus(device)}
+              </Typography>
+            </Box>
+            <IconButton onClick={onClose} aria-label="关闭设备详情">
+              <CloseIcon />
+            </IconButton>
+          </Stack>
+          <Divider sx={{ my: 2.5 }} />
+          <Box
+            component="dl"
+            sx={{
+              m: 0,
+              display: 'grid',
+              gridTemplateColumns: '110px minmax(0, 1fr)',
+              rowGap: 2,
+              columnGap: 2,
+            }}
+          >
+            {fields.map(([label, value]) => (
+              <Box key={label} sx={{ display: 'contents' }}>
+                <Typography component="dt" variant="body2" sx={{ color: 'text.secondary' }}>
+                  {label}
+                </Typography>
+                <Typography component="dd" variant="body2" sx={{ m: 0, overflowWrap: 'anywhere' }}>
+                  {value}
+                </Typography>
+              </Box>
+            ))}
+          </Box>
+        </Box>
+      )}
+    </Drawer>
   )
 }
