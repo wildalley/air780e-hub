@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { Conversation } from '../api'
-import { detectOtp, resolveThread } from './Messages'
+import { detectOtp, hasOlderMessages, resolveThread } from './Messages'
 
 /**
  * `detectOtp` drives the copy-code button on every received message, so its
@@ -115,5 +115,36 @@ describe('resolveThread', () => {
     // the empty state over a thread the user just clicked.
     const clicked = thread()
     expect(resolveThread({ peer: '10086', sim_id: 1 }, undefined, clicked)).toBe(clicked)
+  })
+})
+
+/**
+ * `hasOlderMessages` decides whether the thread view offers "加载更早的消息".
+ *
+ * The thread grows its window instead of paging, so this is the only thing
+ * standing between the operator and a button that either never appears on a
+ * long history or never goes away on a short one.
+ */
+describe('hasOlderMessages', () => {
+  it('offers more when the window is full and the thread is longer', () => {
+    expect(hasOlderMessages(640, 200)).toBe(true)
+  })
+
+  it('stops offering once every message has been fetched', () => {
+    // The exact-fit case: a thread of precisely one window. Comparing the total
+    // against the *requested* limit instead of the fetched count would leave
+    // the button up with nothing behind it.
+    expect(hasOlderMessages(200, 200)).toBe(false)
+    expect(hasOlderMessages(37, 37)).toBe(false)
+  })
+
+  it('says no for an empty thread', () => {
+    expect(hasOlderMessages(0, 0)).toBe(false)
+  })
+
+  it('does not offer more when the count somehow trails the rows', () => {
+    // A total that lags the page (a delete landing between the two queries)
+    // must not render a button that would fetch nothing.
+    expect(hasOlderMessages(5, 10)).toBe(false)
   })
 })

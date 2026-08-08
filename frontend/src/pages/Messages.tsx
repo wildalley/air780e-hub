@@ -112,6 +112,18 @@ function highlightOtp(body: string): ReactNode[] {
  * `fallback` covers a thread that is not in the list — one opened from search
  * can be older than the conversations window, and it must still render.
  */
+/**
+ * Whether a thread has messages older than the ones already fetched.
+ *
+ * Compares against how many actually came back, not against the requested
+ * window: the two differ on the last window, and comparing to the request
+ * would leave "加载更早的消息" showing forever at the top of a fully-read
+ * conversation.
+ */
+export function hasOlderMessages(total: number, fetched: number): boolean {
+  return total > fetched
+}
+
 export function resolveThread(
   open: Pick<Conversation, 'peer' | 'sim_id'> | null,
   threads: Conversation[] | undefined,
@@ -443,13 +455,19 @@ function ThreadView({
   // Keyed by the thread, so switching conversations swaps the cache entry
   // instead of clearing state in an effect — no null flash on a thread that
   // has already been read once.
-  const { data: messages, mutate } = useSWR(
-    thread ? ['/api/messages', thread.sim_id, thread.peer] : null,
+  // How far back this thread has been read. Grows a whole window rather than
+  // paging: a transcript has no page boundaries to land on, and an offset one
+  // could gap or repeat if an SMS arrives mid-scroll. Remounting on a thread
+  // switch resets it, so a new conversation starts at one window again.
+  const [reach, setReach] = useState(THREAD_PAGE)
+
+  const { data, mutate } = useSWR(
+    thread ? ['/api/messages', thread.sim_id, thread.peer, reach] : null,
     async () => {
       const data = await api.messages.list({
         peer: thread!.peer,
         sim_id: thread!.sim_id ?? undefined,
-        limit: THREAD_PAGE,
+        limit: reach,
       })
       // Opening a conversation is the read receipt.
       if (data.items.some((m) => m.direction === 'in' && !m.read_at)) {
@@ -457,9 +475,13 @@ function ThreadView({
         onRead?.()
       }
       // The API returns newest first; a conversation reads oldest first.
-      return [...data.items].reverse()
+      return { messages: [...data.items].reverse(), total: data.total }
     },
+    { keepPreviousData: true },
   )
+
+  const messages = data?.messages
+  const hasOlder = data ? hasOlderMessages(data.total, data.messages.length) : false
 
   const load = mutate
 
@@ -468,9 +490,13 @@ function ThreadView({
   // no effect needed to clear it.
   const [draft, setDraft] = useState('')
 
+  // Keyed on the newest message, not the whole list: prepending older messages
+  // must leave the scroll where it is. Depending on `messages` would jump the
+  // operator back to the bottom on every "load older" — the opposite of the ask.
+  const newestId = messages?.length ? messages[messages.length - 1].id : undefined
   useEffect(() => {
     bottom.current?.scrollIntoView({ block: 'end' })
-  }, [messages])
+  }, [newestId])
 
   // Hooks stay unconditional while the empty-state render has no thread.
   const device = thread
@@ -563,6 +589,16 @@ function ThreadView({
           <Loading />
         ) : (
           <Stack spacing={0.5}>
+            {hasOlder && (
+              <Box sx={{ alignSelf: 'center', pb: 1 }}>
+                <Button
+                  size="small"
+                  onClick={() => setReach((current) => current + THREAD_PAGE)}
+                >
+                  加载更早的消息
+                </Button>
+              </Box>
+            )}
             {messages.map((message, index) => (
               <Bubble
                 key={message.id}

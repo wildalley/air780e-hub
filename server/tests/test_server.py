@@ -438,6 +438,52 @@ def test_a_thread_can_be_read_back_in_full(admin):
     assert [m["body"] for m in items] == ["验证码 123456"]
 
 
+def test_a_thread_window_can_grow_to_reach_older_messages(admin):
+    """The thread view reads history back by asking for a bigger window.
+
+    It grows one window rather than paging: a transcript has no page boundary
+    to land on, and an offset page could gap or repeat if an SMS arrives while
+    the operator is scrolling back.
+    """
+    db = admin.app.state.hub.db
+    seen = _minutes_ago(60)
+    sim = db.execute(
+        "INSERT INTO sims (iccid, label, first_seen_at, last_seen_at) "
+        "VALUES ('8986062218001234567', 'card', ?, ?)",
+        (seen, seen),
+    ).lastrowid
+    for index in range(30):
+        stamp = _minutes_ago(30 - index)
+        db.execute(
+            "INSERT INTO messages "
+            "(agent_id, device, sim_id, direction, peer, body, ts, status, created_at) "
+            "VALUES ('agent-a', 'a', ?, 'in', '10086', ?, ?, 'received', ?)",
+            (sim, f"msg-{index:02d}", stamp, stamp),
+        )
+
+    base = f"/api/messages?peer=10086&sim_id={sim}"
+    first = admin.get(f"{base}&limit=10").json()
+    # total describes the thread, not the window — it is what tells the UI
+    # there is more to reach for.
+    assert first["total"] == 30
+    assert [m["body"] for m in first["items"]] == [
+        f"msg-{index:02d}" for index in reversed(range(20, 30))
+    ]
+
+    # A bigger window reaches further back and still ends at the newest.
+    grown = admin.get(f"{base}&limit=25").json()
+    assert grown["total"] == 30
+    assert len(grown["items"]) == 25
+    assert grown["items"][0]["body"] == "msg-29"
+    assert grown["items"][-1]["body"] == "msg-05"
+
+
+def test_the_thread_window_cap_allows_a_long_conversation(admin):
+    """2000 is the bound the thread view grows into; past it must still fail."""
+    assert admin.get("/api/messages?limit=2000").status_code == 200
+    assert admin.get("/api/messages?limit=2001").status_code == 422
+
+
 def test_status_is_recorded_for_the_history_graph(admin):
     with _connect(admin) as ws:
         _greet(ws)

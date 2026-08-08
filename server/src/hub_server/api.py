@@ -465,7 +465,11 @@ def build_router(state: AppState) -> APIRouter:
 
     @router.get("/messages", dependencies=guard)
     def list_messages(
-        limit: int = Query(50, ge=1, le=500),
+        # 2000, not 500: the thread view reads a conversation back by growing
+        # this window on demand.  Growing one window beats paging a transcript —
+        # an offset page boundary can gap or repeat when an SMS lands mid-scroll.
+        # Only an explicit "load older" raises it; nothing here polls.
+        limit: int = Query(50, ge=1, le=2000),
         offset: int = Query(0, ge=0),
         sim_id: int | None = None,
         direction: Literal["in", "out"] | None = None,
