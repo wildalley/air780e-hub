@@ -1,8 +1,18 @@
 # Changelog
 
-本文件记录用户可见的变更。版本号在首个正式 Release 前保持为未发布状态。
+本文件记录用户可见的变更，遵循 [SemVer](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+`0.x` 阶段不承诺向后兼容：minor 升级可能改动数据库 schema 与协议帧，届时在对应
+小节显式标注并给出升级步骤。**Agent 与 Server 必须同版本部署**，跨版本混用不受
+支持。详见 [deploy.md](docs/deploy.md) §0。
+
+## [0.1.0] — 2026-08-08
+
+首个公开发布版本。此前所有开发内容合入本版，不单独追溯历史小节。
+
+支持范围：Python 3.11 – 3.14、Node 24（仅构建期）、amd64 / arm64 镜像。实机验证
+仅覆盖 Arch Linux + Air780E 固件 `V1011` 一套环境；Debian / Ubuntu 按文档适配但
+未实测。完整矩阵见 [deploy.md](docs/deploy.md) §0。
 
 ### Added
 
@@ -55,4 +65,12 @@
 
 ## 发布说明
 
-正式版本、许可证、镜像发行方式和支持矩阵尚未由仓库所有者确认；在这些决策完成前不要把 `Unreleased` 改名为带承诺的公开版本。
+许可证为 [MIT](LICENSE)，发行方式为源码构建 + GHCR 多架构镜像，支持矩阵与版本策略
+见 [deploy.md](docs/deploy.md) §0。
+
+发布由 `v*` tag 触发 [release.yml](.github/workflows/release.yml)。打 tag 前确认
+`server/pyproject.toml`、`agent/pyproject.toml`、`frontend/package.json` 三处版本号
+与 tag 一致，且本文件存在对应小节 —— 工作流会校验这四项，不一致直接失败。
+
+镜像只发 `X.Y.Z` 与 `X.Y` tag，不发可变 `latest`：回滚需要摘要，而可变 tag 让
+「当时部署的是哪一版」事后无法回答。生产环境按摘要部署。

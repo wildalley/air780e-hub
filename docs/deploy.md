@@ -7,6 +7,39 @@ air780e-hub 分为两个独立进程：
 
 本文所有域名、Token、IMEI 和 ICCID 都是占位符。不要把真实配置、数据库、日志或凭据保存到仓库中。
 
+## 0. 支持矩阵
+
+分两级陈述：**CI 覆盖**由每个 Pull Request 自动验证；**实机验证**只能靠真实硬件
+记录，范围小得多。矩阵之外的组合不承诺可用。
+
+| 维度 | 范围 | 依据 |
+| --- | --- | --- |
+| Python | 3.11 – 3.14 | CI 对 Agent 与 Server 在四个版本上各跑全量测试 |
+| Server 运行时 | 镜像内固定 `python:3.12-slim` | 源码部署可用 3.11 – 3.14 任一 |
+| Agent 运行时 | 发行版自带 `python3` | 按 §2.1 用系统解释器建 venv，故上限跟随最新稳定版 |
+| Node | 24（active LTS，仅构建期） | 前端运行时是静态文件，部署主机不需要 Node |
+| 架构 | amd64 / arm64 | GHCR 多架构镜像 |
+
+**实机验证状态（0.1.0）**：仅一套环境跑通端到端 —— Arch Linux、Python 3.14、
+两个 Air780E（固件 `AirM2M_780EPV_V1011_LTE_AT`）、两张漫游 SIM。
+
+未实测但已按文档适配的部分：
+
+- **Debian / Ubuntu**：串口属组是 `dialout` 而非 Arch 的 `uucp`，systemd 单元里
+  需要相应调整（见 §2.5），但没有实机记录；
+- **arm64 镜像**：能构建并推送，没有在真机上运行过；
+- **其他 Air780E 固件版本**：只验证过 `V1011`。
+
+### 版本与兼容性
+
+遵循 SemVer。`0.x` 阶段**不承诺向后兼容**：minor 升级（`0.1` → `0.2`）可能改动
+数据库 schema 与协议帧，每次都会在 [CHANGELOG](../CHANGELOG.md) 显式标注并给出
+升级步骤；patch 升级（`0.1.0` → `0.1.1`）只含修复。
+
+**Agent 与 Server 必须同版本部署。** 跨版本混用不受支持 —— 两端版本不一致时，
+新增字段在界面上只显示为「未知」，而「Server 缺列」与「Agent 不上报」完全同形，
+无法从界面区分。升级步骤见 §1.5（Server）和 §2.6（Agent）。
+
 ## 1. 部署 Server
 
 ### 1.1 前置条件
@@ -230,17 +263,28 @@ Web 管理端的“运维中心”每 15 秒刷新一次，集中展示 Server �
 
 ### 2.1 安装
 
-以下示例把 Agent 安装到 `/opt/air780e-agent`：
+以下示例把 Agent 安装到 `/opt/air780e-agent`。运行时依赖只有 pyserial 和
+websockets，都是纯 Python 包，系统自带的 `python3`（`>=3.11`）足够，无需额外
+工具链：
 
 ```bash
 sudo mkdir -p /opt/air780e-agent
-sudo cp -r agent/. /opt/air780e-agent/
-cd /opt/air780e-agent
-sudo uv venv .venv
-sudo uv pip install --python .venv .
+sudo rsync -a --delete \
+  --exclude '.venv' --exclude 'tests' --exclude '.tmp' \
+  --exclude '__pycache__' --exclude '.*_cache' \
+  agent/ /opt/air780e-agent/
+sudo python3 -m venv /opt/air780e-agent/.venv
+sudo /opt/air780e-agent/.venv/bin/pip install /opt/air780e-agent
 ```
 
-也可以在仓库的 `agent/` 目录中直接使用 `uv run` 运行。
+必须排除 `.venv`：仓库 `agent/` 目录里可能有一个开发用虚拟环境，它的
+`bin/python3` 指向 `$HOME` 下的解释器。拷进部署目录会覆盖掉部署环境，而
+systemd 单元设了 `ProtectHome=true`，服务随后只会以 `203/EXEC`
+（Permission denied）反复重启。同理不要用 `uv venv` 创建这个环境 —— uv 自带的
+解释器也装在 `$HOME` 下，会踩到同一个坑。
+
+也可以在仓库的 `agent/` 目录中直接使用 `uv run` 运行，这条路径不经过 systemd，
+不受上述限制。
 
 ### 2.2 串口权限
 
@@ -323,6 +367,36 @@ sudo systemctl enable --now air780e-agent
 journalctl -u air780e-agent -f
 ```
 
+### 2.6 升级
+
+Agent 和 Server 各自独立升级，跨版本的新字段通常需要两端都更新。升级 Agent：
+
+```bash
+cd /path/to/air780e-hub
+git pull --ff-only
+sudo rsync -a --delete \
+  --exclude '.venv' --exclude 'tests' --exclude '.tmp' \
+  --exclude '__pycache__' --exclude '.*_cache' \
+  agent/ /opt/air780e-agent/
+sudo /opt/air780e-agent/.venv/bin/pip install /opt/air780e-agent
+sudo systemctl restart air780e-agent
+```
+
+`pip install` 这一步不能省。服务运行的是 `.venv/.../site-packages/` 里的副本，
+不是 `/opt/air780e-agent/src/`；只同步源码不重装，跑的仍是旧代码，而且两者的
+文件时间戳会让人误以为已经升级过了。确认实际生效的版本：
+
+```bash
+sudo /opt/air780e-agent/.venv/bin/python3 -c \
+  'import air780e_agent, os; print(os.path.dirname(air780e_agent.__file__))'
+```
+
+重启会断开串口和 WebSocket 数秒。已入队但未上报的事件保存在 Agent 本地
+SQLite（`[agent].db`）中，重连后补传，不会因重启丢失。
+
+升级后如果 Web 界面某个字段显示"未知"或空白，先确认两端都已更新：Server 缺列会
+丢弃该字段，Agent 不上报则该列一直是 NULL，两种情况在界面上看起来完全一样。
+
 ## 3. 验收
 
 按以下顺序验证：
@@ -358,6 +432,36 @@ journalctl -u air780e-agent -f
 - 确认 ModemManager 未占用端口；
 - 使用 `probe --scan` 验证 AT 口；
 - 检查配置中的 IMEI / ICCID 是否与模块一致。
+
+### Agent 反复以 203/EXEC 重启
+
+```
+Failed to execute /opt/air780e-agent/.venv/bin/air780e-agent: Permission denied
+air780e-agent.service: Failed at step EXEC ... status=203/EXEC
+```
+
+虚拟环境的解释器指向了 `$HOME` 之下，而单元设有 `ProtectHome=true`，服务读不到
+它。几乎总是因为把仓库 `agent/.venv` 拷进了部署目录，或用 `uv venv` 创建了环境。
+检查符号链接指向哪里：
+
+```bash
+ls -l /opt/air780e-agent/.venv/bin/python3
+```
+
+若指向 `/home/...`，用系统解释器重建：
+
+```bash
+sudo rm -rf /opt/air780e-agent/.venv
+sudo python3 -m venv /opt/air780e-agent/.venv
+sudo /opt/air780e-agent/.venv/bin/pip install /opt/air780e-agent
+sudo systemctl restart air780e-agent
+```
+
+### 界面上某个设备字段一直是"未知"
+
+Server 和 Agent 版本不一致。Server 数据库缺少对应列时会丢弃该字段，Agent 版本
+过旧不上报时该列保持 NULL —— 两者在界面上无法区分。按 2.6 升级 Agent，按 1.5
+升级 Server，确保两端同版本。
 
 ### 登录后立即退出
 

@@ -43,7 +43,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        # 3.11 is the floor declared by requires-python; 3.14 is what a current
+        # Arch/Fedora host provides as `python3`, and the Agent is installed
+        # against the system interpreter (see docs/deploy.md §2.1), so the
+        # matrix ceiling has to track the newest stable release — not the
+        # version the Docker image happens to pin.
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     defaults:
       run:
         working-directory: agent
@@ -68,7 +73,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     defaults:
       run:
         working-directory: server

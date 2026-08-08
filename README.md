@@ -2,7 +2,7 @@
 
 面向 Air780E AT 固件模块的多卡短信中枢。项目由本地 Agent、中心 Server 和 Web 管理界面组成，提供短信收发、通知转发、保号任务、设备监控与数据备份能力。
 
-当前状态：M0–M7 已完成；Agent 与 Server 共 339 项自动化测试，前端另有 48 项。公开发布基线的 CI、依赖/镜像扫描、代码扫描、部署自检和 tag 触发的发布流水线已纳入仓库；许可证为 MIT，发行方式为源码构建 + GHCR 多架构镜像（按摘要部署，不发 `latest`），正式支持矩阵与版本策略仍需在首个 Release 前由仓库所有者确认。
+当前状态：M0–M7 已完成；Agent 与 Server 共 341 项自动化测试，前端另有 48 项。公开发布基线的 CI、依赖/镜像扫描、代码扫描、部署自检和 tag 触发的发布流水线已纳入仓库；许可证为 MIT，发行方式为源码构建 + GHCR 多架构镜像（按摘要部署，不发 `latest`）。支持矩阵与版本策略见 [deploy.md](docs/deploy.md) §0：Python 3.11–3.14，遵循 SemVer 且 `0.x` 阶段不承诺向后兼容，**Agent 与 Server 必须同版本部署**。
 
 > 本仓库中的域名、电话号码、IMEI、ICCID、Token 和消息内容均为示例值，不对应真实账户或设备。运行时配置、数据库、日志和凭据不得提交到版本库。
 
@@ -92,7 +92,7 @@ Agent 主动连接 Server，因此连接模块的网络不需要公网 IP 或端
 ### Agent
 
 - Linux
-- Python 3.11+ 与 [uv](https://docs.astral.sh/uv/)
+- Python 3.11–3.14（部署时用发行版自带的 `python3`；[uv](https://docs.astral.sh/uv/) 仅开发需要）
 - Air780E USB 版本，刷入 AT 固件
 - 当前用户或服务账户拥有 `/dev/ttyACM*` 访问权限
 
