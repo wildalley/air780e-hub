@@ -17,16 +17,47 @@ import json
 import logging
 import sqlite3
 import threading
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 log = logging.getLogger(__name__)
 
+# Schema version, held in SQLite's own ``PRAGMA user_version``.
+#
+# Version 1 is the schema as of 2026-08-08 — every table in SCHEMA plus the two
+# columns that used to be patched in by unversioned ALTERs (``messages.read_at``
+# and ``devices.radio_enabled``).  Databases created before versioning read back
+# as 0 and are reconciled to 1 on first open; see ``Database._migrate``.
+#
+# To add a migration: append one entry to ``MIGRATIONS`` with the next integer
+# and bump this constant.  Never renumber or edit a released entry — a database
+# that already ran it will not run it again, so an edit only affects databases
+# that have not, and the two then disagree about what version N means.
+SCHEMA_VERSION = 1
+
 # Persisted (settings table) key for the SMS retention window, in days.  The
 # operator edits it on the Notify page; when unset the env default applies.
 SETTING_MESSAGE_RETENTION_DAYS = "message_retention_days"
+
+
+class SchemaTooNew(RuntimeError):
+    """The database was written by a newer Server than this one.
+
+    Refusing beats proceeding: a newer schema may hold columns and tables this
+    build never writes, and letting it run would silently drop whatever the
+    newer Server was persisting.  Downgrades restore a backup instead.
+    """
+
+
+class MigrationFailed(RuntimeError):
+    """A migration raised and was rolled back; the snapshot path is attached."""
+
+    def __init__(self, message: str, *, snapshot: Path | None = None) -> None:
+        super().__init__(message)
+        self.snapshot = snapshot
+
 
 SCHEMA = """
 PRAGMA journal_mode = WAL;
@@ -279,6 +310,11 @@ class Database:
         self.path = Path(path)
         if str(self.path) != ":memory:":
             self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Whether this file already held a schema *before* we touched it.  Read
+        # it now: ``executescript(SCHEMA)`` creates every table, after which a
+        # brand-new file is indistinguishable from an existing one, and only an
+        # existing one has data worth snapshotting before a migration.
+        pre_existing = self._has_schema()
         self._db = sqlite3.connect(
             self.path, isolation_level=None, check_same_thread=False
         )
@@ -286,10 +322,44 @@ class Database:
         self._lock = threading.RLock()
         with self._lock:
             self._db.executescript(SCHEMA)
-            self._apply_additive_migrations()
+            self._migrate(pre_existing=pre_existing)
 
-    def _apply_additive_migrations(self) -> None:
-        """Bring pre-versioned databases up to the current additive schema."""
+    def _has_schema(self) -> bool:
+        """True if the file exists and already contains hub tables."""
+        if str(self.path) == ":memory:" or not self.path.exists():
+            return False
+        try:
+            conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+        except sqlite3.Error:
+            return False
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'devices'"
+            ).fetchone()
+            return row is not None
+        except sqlite3.DatabaseError:
+            return False
+        finally:
+            conn.close()
+
+    # -- schema versioning -------------------------------------------------
+
+    def _user_version(self) -> int:
+        return int(self._db.execute("PRAGMA user_version").fetchone()[0])
+
+    def _set_user_version(self, version: int) -> None:
+        # PRAGMA takes no parameters, hence the interpolation; the value is an
+        # int from MIGRATIONS, never external input.
+        self._db.execute(f"PRAGMA user_version = {int(version)}")
+
+    def _reconcile_to_baseline(self) -> None:
+        """Bring a pre-versioning database up to schema version 1.
+
+        Kept column-by-column and idempotent because version 0 is not one known
+        state: it is every database created before versioning existed, and any
+        of these columns may or may not be present.  From version 1 on, ordered
+        migrations can assume the previous step ran.
+        """
         columns = {
             table: {
                 row[1] for row in self._db.execute(f"PRAGMA table_info({table})")
@@ -300,6 +370,121 @@ class Database:
             self._db.execute("ALTER TABLE messages ADD COLUMN read_at TEXT")
         if "radio_enabled" not in columns["devices"]:
             self._db.execute("ALTER TABLE devices ADD COLUMN radio_enabled INTEGER")
+
+    # Ordered migrations from version 1 onwards: (version, description,
+    # statements).  Each runs inside its own transaction and only on databases
+    # below it.
+    #
+    # Statements are listed individually rather than as one script on purpose:
+    # ``executescript`` COMMITs before it runs, which would close the
+    # transaction ``_run_step`` opened and leave a failed migration half
+    # applied with no way to roll it back.
+    MIGRATIONS: tuple[tuple[int, str, tuple[str, ...]], ...] = ()
+
+    def _snapshot_before_migration(self, from_version: int) -> Path | None:
+        """Copy the database aside before migrating it.
+
+        Returns the snapshot path, or None for an in-memory database (nothing to
+        recover) .  A failure here aborts the migration: proceeding would leave
+        no way back if a later step corrupts the file.
+        """
+        if str(self.path) == ":memory:":
+            return None
+        dest = self.path.with_name(f"{self.path.name}.v{from_version}.bak")
+        try:
+            target = sqlite3.connect(dest)
+            try:
+                self._db.backup(target)
+            finally:
+                target.close()
+        except (sqlite3.Error, OSError) as exc:
+            raise MigrationFailed(
+                f"could not snapshot the database before migrating: {exc}"
+            ) from exc
+        log.info("pre-migration snapshot written to %s", dest)
+        return dest
+
+    def _migrate(self, *, pre_existing: bool) -> None:
+        version = self._user_version()
+        if version > SCHEMA_VERSION:
+            raise SchemaTooNew(
+                f"database schema version {version} is newer than this server "
+                f"supports ({SCHEMA_VERSION}); upgrade the server or restore a "
+                f"backup taken from this version"
+            )
+        if version == SCHEMA_VERSION:
+            return
+
+        # Only an existing database needs protecting.  A file we just created is
+        # empty, and snapshotting it would litter the data directory on every
+        # first start.
+        snapshot = (
+            self._snapshot_before_migration(version)
+            if pre_existing and version < SCHEMA_VERSION
+            else None
+        )
+
+        if version == 0:
+            self._run_step(
+                0,
+                1,
+                "reconcile pre-versioning schema",
+                self._reconcile_to_baseline,
+                snapshot,
+            )
+            version = 1
+
+        for target, description, statements in self.MIGRATIONS:
+            if target <= version:
+                continue
+            self._run_step(
+                version,
+                target,
+                description,
+                lambda statements=statements: self._run_statements(statements),
+                snapshot,
+            )
+            version = target
+
+    def _run_statements(self, statements: Iterable[str]) -> None:
+        for statement in statements:
+            self._db.execute(statement)
+
+    def _run_step(
+        self,
+        from_version: int,
+        to_version: int,
+        description: str,
+        apply: Callable[[], None],
+        snapshot: Path | None,
+    ) -> None:
+        """Apply one migration step atomically, or roll it back and raise.
+
+        The connection runs in autocommit, so the transaction is explicit.  The
+        version bump goes inside it: a step that committed its DDL but not its
+        version would be replayed on the next start.  ``apply`` must therefore
+        not call ``executescript``, which would COMMIT this transaction out from
+        under the step; see ``MIGRATIONS``.
+        """
+        log.info("migrating schema %d -> %d: %s", from_version, to_version, description)
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            apply()
+            self._set_user_version(to_version)
+        except Exception as exc:
+            # Best effort: report why the migration failed, not why the cleanup
+            # after it did.  A rollback that cannot run leaves the original
+            # exception as the useful one.
+            try:
+                self._db.execute("ROLLBACK")
+            except sqlite3.Error:
+                log.exception("rollback after the failed migration also failed")
+            raise MigrationFailed(
+                f"migration {from_version} -> {to_version} ({description}) failed "
+                f"and was rolled back: {exc}",
+                snapshot=snapshot,
+            ) from exc
+        self._db.execute("COMMIT")
 
     def close(self) -> None:
         with self._lock:
@@ -901,6 +1086,7 @@ class Database:
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 )
             }
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
         except sqlite3.DatabaseError as exc:
             raise ValueError(f"文件不是有效的 SQLite 数据库: {exc}") from exc
         finally:
@@ -911,6 +1097,14 @@ class Database:
                 "这不是有效的 Hub 备份(缺少表: "
                 + ", ".join(sorted(missing))
                 + ")"
+            )
+        # A backup from a newer Server may carry columns this build never writes;
+        # restoring it would silently drop them on the next write.  Caught here,
+        # before the file overwrites live data.
+        if version > SCHEMA_VERSION:
+            raise ValueError(
+                f"备份来自更新版本的 Server(schema {version},当前支持 "
+                f"{SCHEMA_VERSION});请先升级 Server 再恢复"
             )
 
     def restore_from(self, src: str | Path) -> None:
@@ -925,11 +1119,14 @@ class Database:
         try:
             with self._lock:
                 source.backup(self._db)
-                # Older valid backups predate additive operational tables.
-                # Reapplying the idempotent schema keeps the live process usable
-                # immediately after restore without requiring a restart.
+                # Older valid backups predate additive operational tables and
+                # carry their own (lower) user_version.  Reapplying the schema
+                # and running the ordered migrations brings the restored data to
+                # the current version, so the live process stays usable without
+                # a restart.  pre_existing=True: this file now holds real data,
+                # so a migration must snapshot it first.
                 self._db.executescript(SCHEMA)
-                self._apply_additive_migrations()
+                self._migrate(pre_existing=True)
         finally:
             source.close()
 

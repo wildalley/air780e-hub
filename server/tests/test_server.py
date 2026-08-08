@@ -1342,6 +1342,34 @@ def test_restore_rejects_unrelated_sqlite(admin, tmp_path):
     assert "缺少表" in response.json()["detail"]
 
 
+def test_restore_reports_the_snapshot_when_migrating_the_backup_fails(admin, monkeypatch):
+    """A failed post-restore migration must name the copy that can undo it.
+
+    By this point the uploaded data already overwrote the live database, so a
+    bare 500 would leave the operator with a half-migrated file and no hint
+    that a recoverable snapshot exists.
+    """
+    from hub_server.db import Database, MigrationFailed
+
+    snapshot = admin.get("/api/system/backup")
+    assert snapshot.status_code == 200
+
+    def explode(self, *, pre_existing: bool) -> None:
+        raise MigrationFailed("boom", snapshot=Path("/tmp/hub.db.v0.bak"))
+
+    monkeypatch.setattr(Database, "_migrate", explode)
+
+    response = admin.post(
+        "/api/system/restore",
+        content=snapshot.content,
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    assert response.status_code == 500
+    detail = response.json()["detail"]
+    assert "迁移失败" in detail
+    assert "/tmp/hub.db.v0.bak" in detail
+
+
 def test_restore_rejects_garbage_and_empty_uploads(admin):
     """Neither a non-database blob nor an empty body may reach the live data."""
     garbage = admin.post(

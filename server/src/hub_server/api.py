@@ -29,7 +29,7 @@ from . import __version__
 from .alerts import SETTING_ENABLED
 from .auth import SESSION_COOKIE, AuthError, hash_agent_token
 from .config import ConfigError
-from .db import SETTING_MESSAGE_RETENTION_DAYS, utcnow
+from .db import SETTING_MESSAGE_RETENTION_DAYS, MigrationFailed, utcnow
 from .gateway import (
     SETTING_PREVIOUS_AGENT_TOKEN_EXPIRES_AT,
     SETTING_PREVIOUS_AGENT_TOKEN_HASH,
@@ -893,7 +893,18 @@ def build_router(state: AppState) -> APIRouter:
                 state.db.validate_backup(tmp)
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
-            state.db.restore_from(tmp)
+            try:
+                state.db.restore_from(tmp)
+            except MigrationFailed as exc:
+                # The backup's data is already in place by now; only bringing it
+                # to the current schema failed.  The snapshot path is the way
+                # back, so it has to reach the operator rather than dying in the
+                # log behind a bare 500.
+                log.exception("restore failed while migrating the restored data")
+                detail = f"备份已写入但迁移失败: {exc}"
+                if exc.snapshot is not None:
+                    detail += f";迁移前的副本保存在 {exc.snapshot}"
+                raise HTTPException(status_code=500, detail=detail) from exc
         finally:
             _safe_unlink(tmp)
         return {"ok": True}

@@ -9,9 +9,26 @@ import sys
 
 from .auth import Auth, AuthError
 from .config import Settings
-from .db import Database
+from .db import Database, MigrationFailed, SchemaTooNew
 
 log = logging.getLogger("hub-server")
+
+
+def _report_schema_problem(exc: SchemaTooNew | MigrationFailed) -> int:
+    """Turn a schema failure into an operator message instead of a traceback.
+
+    Both cases are things an operator did and can act on — started an older
+    Server against a newer database, or hit a migration that would not apply.
+    A stack trace buries the one line that says which.
+    """
+    print(f"database: {exc}", file=sys.stderr)
+    snapshot = getattr(exc, "snapshot", None)
+    if snapshot is not None:
+        print(
+            f"the database was left untouched; a pre-migration copy is at {snapshot}",
+            file=sys.stderr,
+        )
+    return 1
 
 
 def _serve(args: argparse.Namespace) -> int:
@@ -23,7 +40,11 @@ def _serve(args: argparse.Namespace) -> int:
     if args.port:
         settings.port = args.port
 
-    app = create_app(settings)
+    try:
+        app = create_app(settings)
+    except (SchemaTooNew, MigrationFailed) as exc:
+        return _report_schema_problem(exc)
+
     uvicorn.run(
         app,
         host=settings.host,
@@ -38,7 +59,12 @@ def _serve(args: argparse.Namespace) -> int:
 
 def _auth(args: argparse.Namespace) -> int:
     settings = Settings.from_env()
-    db = Database(settings.db_path)
+    try:
+        db = Database(settings.db_path)
+    except (SchemaTooNew, MigrationFailed) as exc:
+        # Password recovery is exactly when an operator is already having a bad
+        # day; a traceback here would hide which problem they actually have.
+        return _report_schema_problem(exc)
     auth = Auth(db, session_ttl_hours=settings.session_ttl_hours)
     try:
         if args.auth_command == "reset-password":
