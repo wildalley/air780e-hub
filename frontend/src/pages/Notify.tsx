@@ -150,9 +150,13 @@ export function NotifyPage() {
   )
   const { data: rules = [], mutate: mutateRules } = useSWR('/api/rules', () => api.rules.list())
   const { data: sims = [] } = useSWR('/api/sims', () => api.sims.list())
-  const { data: notifyLogs = [] } = useSWR('/api/notify-logs', () => api.notifyLogs(), {
-    refreshInterval: LIVE_MS,
-  })
+  // "最近投递" is a summary card, not a log browser — the Logs page carries the
+  // full paged view. Ask for exactly the 50 rows it renders.
+  const { data: notifyPage } = useSWR(
+    '/api/notify-logs?recent',
+    () => api.notifyLogs('limit=50&offset=0'),
+    { refreshInterval: LIVE_MS },
+  )
 
   // Rules carry a denormalised `channel_name`, so renaming or deleting a
   // channel has to refetch both lists, not just the one that was written.
@@ -412,7 +416,7 @@ export function NotifyPage() {
 
       {tab === 3 && (
         <Stack spacing={2}>
-          <DeliveryLogCard logs={notifyLogs} />
+          <DeliveryLogCard logs={notifyPage?.items ?? []} />
           <SettingsCard
             onError={(m) => toast.show(m, 'error')}
             onSaved={() => toast.show('设置已保存', 'success')}
@@ -758,7 +762,7 @@ function DeliveryLogCard({ logs }: { logs: NotifyLog[] }) {
                 </TableRow>
               </TableHead>
               <TableBody>
-                {logs.slice(0, 50).map((log) => (
+                {logs.map((log) => (
                   <TableRow key={log.id}>
                     <TableCell sx={{ whiteSpace: 'nowrap' }}>{formatTs(log.ts)}</TableCell>
                     <TableCell>{log.channel_name || log.channel_id || '系统通知'}</TableCell>

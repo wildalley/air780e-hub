@@ -31,7 +31,15 @@ import ExpandMoreIcon from '@mui/icons-material/ExpandMore'
 import StorageIcon from '@mui/icons-material/StorageOutlined'
 import useSWR, { mutate as mutateKey } from 'swr'
 import { api, ApiError, type ActivityWindow, type Incident } from '../api'
-import { EmptyRow, Loading, OnlineChip, formatTs, useToast } from '../components/common'
+import {
+  EmptyRow,
+  Loading,
+  OnlineChip,
+  Pager,
+  formatTs,
+  usePager,
+  useToast,
+} from '../components/common'
 import { PageHeader } from '../components/PageHeader'
 import { StatTile } from '../components/StatTile'
 import { LIVE_MS } from '../swr'
@@ -148,14 +156,21 @@ export function OperationsPage() {
   )
   // Scope in the key: flipping 未解决/全部 serves the other list from cache and
   // leaves diagnostics and the audit log untouched.
-  const { data: incidents = [], mutate: mutateIncidents } = useSWR(
-    ['/api/operations/incidents', scope],
-    () => api.operations.incidents(scope),
+  const incidentPager = usePager()
+  const auditPager = usePager()
+
+  const { data: incidentPage, mutate: mutateIncidents } = useSWR(
+    ['/api/operations/incidents', scope, incidentPager.query],
+    () => api.operations.incidents(scope, incidentPager.query),
     { refreshInterval: LIVE_MS, keepPreviousData: true },
   )
-  const { data: audit = [] } = useSWR('/api/operations/audit', () => api.operations.audit(), {
-    refreshInterval: LIVE_MS,
-  })
+  const { data: auditPage } = useSWR(
+    ['/api/operations/audit', auditPager.query],
+    () => api.operations.audit(auditPager.query),
+    { refreshInterval: LIVE_MS, keepPreviousData: true },
+  )
+  const incidents = incidentPage?.items ?? []
+  const audit = auditPage?.items ?? []
 
   // Resolving an incident changes the list, the active-incident tile in
   // diagnostics, and the nav badge that reads the same count endpoint.
@@ -475,7 +490,14 @@ export function OperationsPage() {
                   exclusive
                   size="small"
                   value={scope}
-                  onChange={(_, value) => value && setScope(value)}
+                  onChange={(_, value) => {
+                    if (!value) return
+                    setScope(value)
+                    // 未解决 holds fewer rows than 全部, so a page that exists in
+                    // one may not in the other — narrowing while deep in the
+                    // list would otherwise land on a blank page.
+                    incidentPager.reset()
+                  }}
                   aria-label="事件范围"
                 >
                   <ToggleButton value="open">未解决</ToggleButton>
@@ -557,6 +579,7 @@ export function OperationsPage() {
                     )}
                   </TableBody>
                 </Table>
+                <Pager total={incidentPage?.total ?? 0} pager={incidentPager} />
               </TableContainer>
             </>
           ) : (
@@ -591,6 +614,7 @@ export function OperationsPage() {
                   )}
                 </TableBody>
               </Table>
+              <Pager total={auditPage?.total ?? 0} pager={auditPager} />
             </TableContainer>
           )}
         </CardContent>

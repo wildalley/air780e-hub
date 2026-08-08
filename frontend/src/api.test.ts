@@ -95,3 +95,44 @@ describe('request success handling', () => {
     await expect(api.auth.logout()).resolves.toBeUndefined()
   })
 })
+
+describe('paged list endpoints', () => {
+  const empty = { items: [], total: 0 }
+
+  it('forwards the paging query to every log endpoint', async () => {
+    // One shape across all five is what lets a single pager component drive
+    // them; a call that dropped its query would silently serve page 1 forever.
+    const cases: [string, () => Promise<unknown>][] = [
+      ['/api/logs?limit=25&offset=50', () => api.logs('limit=25&offset=50')],
+      ['/api/notify-logs?limit=25&offset=50', () => api.notifyLogs('limit=25&offset=50')],
+      ['/api/task-logs?limit=25&offset=50', () => api.tasks.logs('limit=25&offset=50')],
+      [
+        '/api/operations/audit?limit=25&offset=50',
+        () => api.operations.audit('limit=25&offset=50'),
+      ],
+    ]
+    for (const [expected, call] of cases) {
+      const spy = mockFetch({ json: async () => empty })
+      await call()
+      expect(spy.mock.calls[0][0]).toBe(expected)
+    }
+  })
+
+  it('keeps the incident status filter alongside the paging query', async () => {
+    // The pager and the 未解决/全部 toggle are independent controls; losing
+    // either from the URL makes the other appear broken.
+    const spy = mockFetch({ json: async () => empty })
+    await api.operations.incidents('all', 'limit=100&offset=200')
+    expect(spy.mock.calls[0][0]).toBe(
+      '/api/operations/incidents?status=all&limit=100&offset=200',
+    )
+  })
+
+  it('returns items and total straight through', async () => {
+    mockFetch({ json: async () => ({ items: [{ id: 1 }], total: 4231 }) })
+    const page = await api.logs('limit=1&offset=0')
+    expect(page.items).toHaveLength(1)
+    // The total is what the pager needs; the page length would cap it at 1.
+    expect(page.total).toBe(4231)
+  })
+})

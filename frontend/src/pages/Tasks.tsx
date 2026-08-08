@@ -34,7 +34,7 @@ import DeleteIcon from '@mui/icons-material/DeleteOutlined'
 import RunIcon from '@mui/icons-material/PlayArrowOutlined'
 import useSWR from 'swr'
 import { api, ApiError, type Device, type Task, type TaskInput } from '../api'
-import { Loading, formatTs, useToast } from '../components/common'
+import { Loading, Pager, formatTs, usePager, useToast } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
 import { LIVE_MS } from '../swr'
 import { STATUS } from '../tokens'
@@ -92,11 +92,13 @@ export function TasksPage() {
   const { data: tasks, mutate: mutateTasks } = useSWR('/api/tasks', () => api.tasks.list(), {
     refreshInterval: LIVE_MS,
   })
-  const { data: logs = [], mutate: mutateLogs } = useSWR(
-    '/api/task-logs',
-    () => api.tasks.logs(),
-    { refreshInterval: LIVE_MS },
+  const logPager = usePager()
+  const { data: logPage, mutate: mutateLogs } = useSWR(
+    ['/api/task-logs', logPager.query],
+    () => api.tasks.logs(logPager.query),
+    { refreshInterval: LIVE_MS, keepPreviousData: true },
   )
+  const logs = logPage?.items ?? []
   // Shared cache key with the devices page and the composer — the dropdown of
   // modules costs nothing here if another view already fetched it.
   const { data: devices = [] } = useSWR('/api/devices', () => api.devices.list())
@@ -408,6 +410,7 @@ export function TasksPage() {
                   ))}
                 </TableBody>
               </Table>
+              <Pager total={logPage?.total ?? 0} pager={logPager} />
             </TableContainer>
           )}
         </CardContent>

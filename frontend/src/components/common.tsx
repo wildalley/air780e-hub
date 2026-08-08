@@ -5,6 +5,7 @@ import {
   CircularProgress,
   Snackbar,
   TableCell,
+  TablePagination,
   TableRow,
   useMediaQuery,
 } from '@mui/material'
@@ -78,6 +79,64 @@ export function EmptyRow({ colSpan, children, py = 4 }: {
         <Box sx={{ position: 'sticky', left: 0, display: 'inline-block' }}>{children}</Box>
       </TableCell>
     </TableRow>
+  )
+}
+
+/**
+ * Offset paging state for a log view.
+ *
+ * The log endpoints used to return only their newest N rows, so anything older
+ * was unreachable however long retention kept it. `limit`/`offset` go into the
+ * SWR key, so each page is cached separately and stepping back to one already
+ * seen is instant.
+ */
+export function usePager(pageSize = 50) {
+  const [page, setPage] = useState(0)
+  const [size, setSize] = useState(pageSize)
+  const reset = useCallback(() => setPage(0), [])
+  return {
+    page,
+    limit: size,
+    offset: page * size,
+    setPage,
+    /** Changing page size keeps you near the same rows rather than jumping. */
+    setSize: useCallback((next: number) => {
+      setSize(next)
+      setPage(0)
+    }, []),
+    reset,
+    query: `limit=${size}&offset=${page * size}`,
+  }
+}
+
+/**
+ * Pager under a table.
+ *
+ * Rendered even for a single page: the row count is worth showing on its own,
+ * and a control that appears only past a threshold reads as a glitch.
+ */
+export function Pager({
+  total,
+  pager,
+  sizes = [25, 50, 100, 200],
+}: {
+  total: number
+  pager: ReturnType<typeof usePager>
+  sizes?: number[]
+}) {
+  return (
+    <TablePagination
+      component="div"
+      count={total}
+      page={pager.page}
+      rowsPerPage={pager.limit}
+      rowsPerPageOptions={sizes}
+      onPageChange={(_, next) => pager.setPage(next)}
+      onRowsPerPageChange={(event) => pager.setSize(Number(event.target.value))}
+      labelRowsPerPage="每页"
+      labelDisplayedRows={({ from, to, count }) => `${from}-${to} / 共 ${count} 条`}
+      sx={{ borderTop: 1, borderColor: 'divider' }}
+    />
   )
 }
 

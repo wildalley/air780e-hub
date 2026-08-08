@@ -159,6 +159,11 @@ def _minutes_ago(minutes: int) -> str:
     ).isoformat(timespec="seconds")
 
 
+def _items(response) -> list[dict]:
+    """The rows out of a paged list response."""
+    return response.json()["items"]
+
+
 def test_agent_needs_a_valid_token(client):
     from starlette.websockets import WebSocketDisconnect
 
@@ -592,7 +597,7 @@ def test_agent_log_is_stored_without_message_bodies(admin):
         })
         ws.receive_json()
 
-    logs = admin.get("/api/logs").json()
+    logs = _items(admin.get("/api/logs"))
     assert logs[0]["message"] == "storage 48/50, draining"
     assert logs[0]["level"] == "warning"
 
@@ -911,7 +916,7 @@ def test_deliberate_flight_mode_is_stored_without_a_network_incident(admin):
 
     device = next(d for d in admin.get("/api/devices").json() if d["name"] == "a")
     assert device["radio_enabled"] == 0
-    incidents = admin.get("/api/operations/incidents?status=open").json()
+    incidents = _items(admin.get("/api/operations/incidents?status=open"))
     assert not any(i["kind"] == "network_unregistered" for i in incidents)
 
 
@@ -924,7 +929,7 @@ def test_radio_on_but_unregistered_still_opens_a_network_incident(admin):
         })
         ws.receive_json()
 
-    incidents = admin.get("/api/operations/incidents?status=open").json()
+    incidents = _items(admin.get("/api/operations/incidents?status=open"))
     assert any(i["kind"] == "network_unregistered" for i in incidents)
 
 
@@ -1016,7 +1021,7 @@ def test_operations_diagnostics_and_audit_are_available_to_admin(admin):
     assert body["storage"]["disk_free_bytes"] > 0
 
     admin.post("/api/system/purge")
-    events = admin.get("/api/operations/audit").json()
+    events = _items(admin.get("/api/operations/audit"))
     assert any(event["action"] == "POST /api/system/purge" for event in events)
     assert "hunter2hunter" not in json.dumps(events)
 
@@ -1112,7 +1117,7 @@ def test_incidents_can_be_acknowledged_and_resolved(admin):
         detail="safe detail",
     )
 
-    open_rows = admin.get("/api/operations/incidents").json()
+    open_rows = _items(admin.get("/api/operations/incidents"))
     assert [row["id"] for row in open_rows] == [incident["id"]]
 
     acknowledged = admin.put(
@@ -1127,8 +1132,8 @@ def test_incidents_can_be_acknowledged_and_resolved(admin):
         json={"status": "resolved"},
     ).json()
     assert resolved["status"] == "resolved"
-    assert admin.get("/api/operations/incidents").json() == []
-    assert admin.get("/api/operations/incidents?status=all").json()[0]["id"] == incident["id"]
+    assert _items(admin.get("/api/operations/incidents")) == []
+    assert _items(admin.get("/api/operations/incidents?status=all"))[0]["id"] == incident["id"]
 
 
 def test_network_registration_incident_tracks_recovery(admin):
@@ -1139,7 +1144,7 @@ def test_network_registration_incident_tracks_recovery(admin):
             "registered": False, "ts": _minutes_ago(1),
         })
         ws.receive_json()
-        assert admin.get("/api/operations/incidents").json()[0]["kind"] == "network_unregistered"
+        assert _items(admin.get("/api/operations/incidents"))[0]["kind"] == "network_unregistered"
 
         ws.send_json({
             "type": "status", "seq": 2, "device": "a", "online": True,
@@ -1147,7 +1152,7 @@ def test_network_registration_incident_tracks_recovery(admin):
         })
         ws.receive_json()
 
-    assert admin.get("/api/operations/incidents").json() == []
+    assert _items(admin.get("/api/operations/incidents")) == []
 
 
 def test_failed_sends_aggregate_per_module_and_recover(admin):
@@ -1167,7 +1172,7 @@ def test_failed_sends_aggregate_per_module_and_recover(admin):
             })
             ws.receive_json()
 
-        open_rows = admin.get("/api/operations/incidents").json()
+        open_rows = _items(admin.get("/api/operations/incidents"))
         assert len(open_rows) == 1
         assert open_rows[0]["kind"] == "sms_send_failed"
         assert open_rows[0]["occurrences"] == 3
@@ -1178,7 +1183,7 @@ def test_failed_sends_aggregate_per_module_and_recover(admin):
         })
         ws.receive_json()
 
-    assert admin.get("/api/operations/incidents").json() == []
+    assert _items(admin.get("/api/operations/incidents")) == []
 
 
 def test_going_offline_closes_the_module_specific_incidents(admin):
@@ -1199,7 +1204,7 @@ def test_going_offline_closes_the_module_specific_incidents(admin):
             "body": "x", "status": "failed", "ts": _minutes_ago(2),
         })
         ws.receive_json()
-        assert len(admin.get("/api/operations/incidents").json()) == 2
+        assert len(_items(admin.get("/api/operations/incidents"))) == 2
 
         # A real offline notification need not restate registration at all —
         # the module is gone, so there is nothing to report about it.
@@ -1209,7 +1214,7 @@ def test_going_offline_closes_the_module_specific_incidents(admin):
         })
         ws.receive_json()
 
-    kinds = {row["kind"] for row in admin.get("/api/operations/incidents").json()}
+    kinds = {row["kind"] for row in _items(admin.get("/api/operations/incidents"))}
     assert "network_unregistered" not in kinds
     assert "sms_send_failed" not in kinds
 
@@ -1472,3 +1477,123 @@ def test_restore_rejects_garbage_and_empty_uploads(admin):
 
     # The server is still serving after both rejections.
     assert admin.get("/api/overview").status_code == 200
+
+
+# --------------------------------------------------------------------------
+# log pagination
+# --------------------------------------------------------------------------
+
+
+def _seed_agent_logs(admin, count: int, *, ts: str | None = None) -> None:
+    """Insert *count* agent log rows, newest message last.
+
+    When *ts* is given every row shares it, which is the case that exposes an
+    unstable sort: without a tiebreak, SQLite may return equal-``ts`` rows in
+    any order and paging over them repeats or drops rows.
+    """
+    db = admin.app.state.hub.db
+    for index in range(count):
+        db.execute(
+            "INSERT INTO agent_logs (agent_id, device, level, message, ts) "
+            "VALUES ('agent-a', 'a', 'info', ?, ?)",
+            (
+                f"line-{index:03d}",
+                ts or _minutes_ago(count - index),
+            ),
+        )
+
+
+def test_log_pages_carry_the_full_total_not_the_page_size(admin):
+    """``total`` is what makes a pager able to render its last page.
+
+    Returning the page length instead would read as "one page, done" for every
+    window, which is exactly the bug that hid the older records: the UI cannot
+    know more exist.
+    """
+    _seed_agent_logs(admin, 25)
+
+    body = admin.get("/api/logs?limit=10").json()
+    assert len(body["items"]) == 10
+    assert body["total"] == 25
+
+
+def test_paging_through_logs_visits_every_row_exactly_once(admin):
+    _seed_agent_logs(admin, 25)
+
+    seen: list[str] = []
+    for offset in (0, 10, 20):
+        page = admin.get(f"/api/logs?limit=10&offset={offset}").json()["items"]
+        seen.extend(row["message"] for row in page)
+
+    # Every seeded row, once, newest first — no gaps and no repeats.
+    assert seen == [f"line-{index:03d}" for index in reversed(range(25))]
+
+
+def test_rows_sharing_a_timestamp_still_read_newest_first(admin):
+    """Bulk-written logs share a second, and ``ts`` alone cannot order them.
+
+    Ordering by ``ts DESC`` alone, SQLite walks the ts index, whose entries are
+    (key, rowid) — so rows with an equal ts come back *rowid ascending*, which
+    is oldest-first inside the tie group.  A log view whose entire contract is
+    newest-first then shows those rows backwards.  The ``id DESC`` tiebreak is
+    what fixes it; paging over them was already deterministic without it.
+    """
+    stamp = _minutes_ago(5)
+    _seed_agent_logs(admin, 30, ts=stamp)
+
+    seen: list[str] = []
+    for offset in (0, 10, 20):
+        page = admin.get(f"/api/logs?limit=10&offset={offset}").json()["items"]
+        seen.extend(row["message"] for row in page)
+
+    # Newest (highest id, seeded last) first, all the way down.
+    assert seen == [f"line-{index:03d}" for index in reversed(range(30))]
+    assert len(set(seen)) == 30, "a row was repeated across pages"
+
+
+def test_an_offset_past_the_end_returns_an_empty_page_not_an_error(admin):
+    """The pager can land here by holding a page while rows age out."""
+    _seed_agent_logs(admin, 5)
+
+    body = admin.get("/api/logs?limit=10&offset=500").json()
+    assert body["items"] == []
+    # total still describes the collection, so the UI can recover to a real page.
+    assert body["total"] == 5
+
+
+def test_incident_totals_track_the_status_filter(admin):
+    """``total`` must count what the filter selects, not the whole table.
+
+    A pager sized from an unfiltered count would offer pages that come back
+    empty as soon as the operator narrows to open incidents.
+    """
+    db = admin.app.state.hub.db
+    for index in range(4):
+        db.open_incident(
+            f"fp-{index}",
+            kind="test",
+            severity="warning",
+            source="a",
+            title=f"incident {index}",
+        )
+    # Resolve half of them, so the two counts genuinely differ.
+    for row in db.query("SELECT id FROM incidents LIMIT 2"):
+        db.set_incident_status(row["id"], "resolved")
+
+    assert admin.get("/api/operations/incidents?status=open").json()["total"] == 2
+    assert admin.get("/api/operations/incidents?status=all").json()["total"] == 4
+
+
+def test_every_paged_log_endpoint_answers_with_items_and_total(admin):
+    """One shape across all five, so the frontend pager is written once."""
+    for path in (
+        "/api/logs",
+        "/api/notify-logs",
+        "/api/task-logs",
+        "/api/operations/audit",
+        "/api/operations/incidents",
+    ):
+        body = admin.get(f"{path}?limit=5&offset=0").json()
+        assert isinstance(body, dict), f"{path} did not return an object"
+        assert isinstance(body["items"], list), f"{path} has no items list"
+        assert isinstance(body["total"], int), f"{path} has no integer total"

@@ -15,7 +15,7 @@ import {
 } from '@mui/material'
 import useSWR from 'swr'
 import { api } from '../api'
-import { Loading, formatTs } from '../components/common'
+import { Loading, Pager, formatTs, usePager } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
 import { STATUS } from '../tokens'
 
@@ -29,16 +29,29 @@ const REFRESH_MS = 20_000
 export function LogsPage() {
   const [tab, setTab] = useState(0)
 
+  // A pager per tab: paging one list must not move the other, and each keeps
+  // its position while the other is on screen.
+  const agentPager = usePager()
+  const notifyPager = usePager()
+
   // Two keys, not one composite fetch: the visible tab is the one that has to
   // be current, and a failure in either list leaves the other still rendering.
-  const { data: agentLogs } = useSWR('/api/logs', () => api.logs(), {
-    refreshInterval: REFRESH_MS,
-  })
-  const { data: notifyLogs = [] } = useSWR('/api/notify-logs', () => api.notifyLogs(), {
-    refreshInterval: REFRESH_MS,
-  })
+  // The paging params are in the key, so a page already visited is cached.
+  const { data: agentPage } = useSWR(
+    ['/api/logs', agentPager.query],
+    () => api.logs(agentPager.query),
+    { refreshInterval: REFRESH_MS, keepPreviousData: true },
+  )
+  const { data: notifyPage } = useSWR(
+    ['/api/notify-logs', notifyPager.query],
+    () => api.notifyLogs(notifyPager.query),
+    { refreshInterval: REFRESH_MS, keepPreviousData: true },
+  )
 
-  if (!agentLogs) return <Loading />
+  if (!agentPage) return <Loading />
+
+  const agentLogs = agentPage.items
+  const notifyLogs = notifyPage?.items ?? []
 
   return (
     <Stack spacing={3}>
@@ -46,8 +59,10 @@ export function LogsPage() {
 
       <Card>
         <Tabs value={tab} onChange={(_, next) => setTab(next)} sx={{ px: 2 }}>
-          <Tab label={`设备日志 (${agentLogs.length})`} />
-          <Tab label={`推送日志 (${notifyLogs.length})`} />
+          {/* The total, not the page length — a page size of 50 would
+              otherwise read as "50 logs" no matter how many there are. */}
+          <Tab label={`设备日志 (${agentPage.total})`} />
+          <Tab label={`推送日志 (${notifyPage?.total ?? 0})`} />
         </Tabs>
         <CardContent sx={{ p: 0, '&:last-child': { pb: 0 } }}>
           {tab === 0 ? (
@@ -83,6 +98,7 @@ export function LogsPage() {
                     ))}
                   </TableBody>
                 </Table>
+                <Pager total={agentPage.total} pager={agentPager} />
               </TableContainer>
             )
           ) : notifyLogs.length === 0 ? (
@@ -123,6 +139,7 @@ export function LogsPage() {
                   ))}
                 </TableBody>
               </Table>
+              <Pager total={notifyPage?.total ?? 0} pager={notifyPager} />
             </TableContainer>
           )}
         </CardContent>

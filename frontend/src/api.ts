@@ -1,5 +1,17 @@
 /** Typed API client. One place that knows about HTTP so pages never do. */
 
+/**
+ * One page of a list endpoint.
+ *
+ * `total` is the count under the same filter, not the page length — it is what
+ * lets a pager render its last page. The log endpoints used to return a bare
+ * array capped at their newest N rows, so everything older was unreachable.
+ */
+export interface Page<T> {
+  items: T[]
+  total: number
+}
+
 export class ApiError extends Error {
   constructor(
     public status: number,
@@ -483,9 +495,9 @@ export const api = {
     update: (id: number, body: TaskInput) => put<Task>(`/api/tasks/${id}`, body),
     remove: (id: number) => del<{ ok: boolean }>(`/api/tasks/${id}`),
     run: (id: number) => post<{ task_id: number; status: 'started' }>(`/api/tasks/${id}/run`),
-    logs: () => get<TaskLog[]>('/api/task-logs'),
+    logs: (query = '') => get<Page<TaskLog>>(`/api/task-logs?${query}`),
   },
-  notifyLogs: () => get<NotifyLog[]>('/api/notify-logs'),
+  notifyLogs: (query = '') => get<Page<NotifyLog>>(`/api/notify-logs?${query}`),
   stats: {
     /** Daily per-card counts for the dashboard trend chart. */
     messages: (days: number) => get<MessageStat[]>(`/api/stats/messages?days=${days}`),
@@ -494,12 +506,12 @@ export const api = {
     get: () => get<NotifySettings>('/api/notify-settings'),
     update: (body: NotifySettings) => put<NotifySettings>('/api/notify-settings', body),
   },
-  logs: () => get<AgentLog[]>('/api/logs'),
+  logs: (query = '') => get<Page<AgentLog>>(`/api/logs?${query}`),
   operations: {
     diagnostics: () => get<Diagnostics>('/api/operations/diagnostics'),
-    audit: () => get<AuditEvent[]>('/api/operations/audit'),
-    incidents: (status: 'open' | 'all' = 'open') =>
-      get<Incident[]>(`/api/operations/incidents?status=${status}`),
+    audit: (query = '') => get<Page<AuditEvent>>(`/api/operations/audit?${query}`),
+    incidents: (status: 'open' | 'all' = 'open', query = '') =>
+      get<Page<Incident>>(`/api/operations/incidents?status=${status}&${query}`),
     incidentCount: () => get<{ total: number }>('/api/operations/incidents/count'),
     setIncidentStatus: (id: number, status: Incident['status']) =>
       put<Incident>(`/api/operations/incidents/${id}`, { status }),

@@ -71,9 +71,11 @@ export function DashboardPage() {
     () => api.stats.messages(statsDays),
     { refreshInterval: TREND_MS, keepPreviousData: true },
   )
-  const { data: incidents = [] } = useSWR(
+  // The panel shows the first few and a count, so one small page is enough —
+  // no pager here, unlike the Operations page which lists them all.
+  const { data: incidentPage } = useSWR(
     '/api/operations/incidents?status=open',
-    () => api.operations.incidents('open'),
+    () => api.operations.incidents('open', 'limit=25&offset=0'),
     { refreshInterval: LIVE_MS },
   )
 
@@ -95,7 +97,10 @@ export function DashboardPage() {
     <Stack spacing={3}>
       <PageHeader title="仪表盘" subtitle="模块、短信与存储,一目了然" />
 
-      <AttentionPanel incidents={incidents} />
+      <AttentionPanel
+        incidents={incidentPage?.items ?? []}
+        total={incidentPage?.total ?? 0}
+      />
 
       <Box
         sx={{
@@ -302,8 +307,13 @@ export function DashboardPage() {
   )
 }
 
-function AttentionPanel({ incidents }: { incidents: Incident[] }) {
-  if (incidents.length === 0) {
+/**
+ * `total` is the open-incident count; `incidents` is only the first page of
+ * them. The headline and the "另有 N" line must both read from `total`, or a
+ * page-sized cap would silently become the number the operator sees.
+ */
+function AttentionPanel({ incidents, total }: { incidents: Incident[]; total: number }) {
+  if (total === 0) {
     return (
       <Alert
         severity="success"
@@ -331,7 +341,7 @@ function AttentionPanel({ incidents }: { incidents: Incident[] }) {
       }
       sx={{ alignItems: 'flex-start' }}
     >
-      <AlertTitle sx={{ mb: 0.75 }}>{incidents.length} 个事件需要处理</AlertTitle>
+      <AlertTitle sx={{ mb: 0.75 }}>{total} 个事件需要处理</AlertTitle>
       <Stack spacing={0.75}>
         {incidents.slice(0, 3).map((incident) => (
           <Box key={incident.id}>
@@ -343,9 +353,9 @@ function AttentionPanel({ incidents }: { incidents: Incident[] }) {
             </Typography>
           </Box>
         ))}
-        {incidents.length > 3 && (
+        {total > 3 && (
           <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-            另有 {incidents.length - 3} 个事件
+            另有 {total - 3} 个事件
           </Typography>
         )}
       </Stack>

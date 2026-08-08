@@ -707,7 +707,7 @@ def test_channel_test_button_reports_success(admin):
     assert response.json()["ok"] is True
     assert len(recorder.requests) == 1
 
-    logs = admin.get("/api/notify-logs").json()
+    logs = admin.get("/api/notify-logs").json()["items"]
     assert logs[0]["status"] == "ok"
     assert logs[0]["message_id"] is None, "a test send belongs to no message"
 
@@ -877,7 +877,7 @@ def test_an_sms_over_the_socket_is_pushed(admin):
     assert "验证码 123456" in body["body"]
     assert "移动卡" in body["body"], "the card's label names the source"
 
-    logs = admin.get("/api/notify-logs").json()
+    logs = admin.get("/api/notify-logs").json()["items"]
     assert logs[0]["status"] == "ok"
     assert logs[0]["channel_name"] == "Bark"
 
@@ -930,7 +930,7 @@ def test_a_task_receipt_is_logged_and_dates_the_next_run(admin):
     task = make_task(admin, notify_on_result=False)
     send_receipt(admin, task["id"])
 
-    logs = admin.get("/api/task-logs").json()
+    logs = admin.get("/api/task-logs").json()["items"]
     assert logs[0]["status"] == "ok"
     assert logs[0]["task_name"] == "移动卡保号"
 

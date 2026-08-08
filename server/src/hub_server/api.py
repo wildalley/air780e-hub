@@ -115,6 +115,44 @@ _BUCKET_TS = (
 
 
 # --------------------------------------------------------------------------
+# paged list responses
+# --------------------------------------------------------------------------
+
+
+def paged(
+    db: Any,
+    *,
+    select: str,
+    source: str,
+    order: str,
+    limit: int,
+    offset: int,
+    where: str = "",
+    params: tuple = (),
+    count_source: str | None = None,
+) -> dict[str, Any]:
+    """One page of an append-only list, plus the unpaged total.
+
+    The log views used to take a bare ``LIMIT`` with no offset, so they were
+    not a first page but the *only* page: everything older than the newest N
+    rows was unreachable from the UI however long retention kept it.  ``total``
+    comes from the same filter as the page, so the UI can say where the window
+    sits in the whole set.
+
+    *count_source* narrows the count to the base table.  Every join here is a
+    LEFT JOIN onto a primary key, so it cannot change the row count — counting
+    across it would give the same number for more work.
+    """
+    clause = f" {where}" if where else ""
+    items = db.query(
+        f"SELECT {select} FROM {source}{clause} ORDER BY {order} LIMIT ? OFFSET ?",
+        (*params, limit, offset),
+    )
+    row = db.one(f"SELECT COUNT(*) AS n FROM {count_source or source}{clause}", params)
+    return {"items": items, "total": int(row["n"]) if row else 0}
+
+
+# --------------------------------------------------------------------------
 # request bodies
 # --------------------------------------------------------------------------
 
@@ -684,12 +722,18 @@ def build_router(state: AppState) -> APIRouter:
         return rows
 
     @router.get("/notify-logs", dependencies=guard)
-    def notify_logs(limit: int = Query(100, ge=1, le=1000)) -> list[dict[str, Any]]:
-        return state.db.query(
-            "SELECT n.*, c.name AS channel_name FROM notify_logs n "
-            "LEFT JOIN channels c ON c.id = n.channel_id "
-            "ORDER BY n.ts DESC LIMIT ?",
-            (limit,),
+    def notify_logs(
+        limit: int = Query(100, ge=1, le=1000),
+        offset: int = Query(0, ge=0),
+    ) -> dict[str, Any]:
+        return paged(
+            state.db,
+            select="n.*, c.name AS channel_name",
+            source="notify_logs n LEFT JOIN channels c ON c.id = n.channel_id",
+            count_source="notify_logs n",
+            order="n.ts DESC, n.id DESC",
+            limit=limit,
+            offset=offset,
         )
 
     # -- notify settings ---------------------------------------------------
@@ -775,19 +819,34 @@ def build_router(state: AppState) -> APIRouter:
         return await _call(agent_id, {"type": "run_task", "task_id": task_id})
 
     @router.get("/task-logs", dependencies=guard)
-    def task_logs(limit: int = Query(100, ge=1, le=1000)) -> list[dict[str, Any]]:
-        return state.db.query(
-            "SELECT l.*, t.name AS task_name FROM task_logs l "
-            "LEFT JOIN tasks t ON t.id = l.task_id ORDER BY l.ts DESC LIMIT ?",
-            (limit,),
+    def task_logs(
+        limit: int = Query(100, ge=1, le=1000),
+        offset: int = Query(0, ge=0),
+    ) -> dict[str, Any]:
+        return paged(
+            state.db,
+            select="l.*, t.name AS task_name",
+            source="task_logs l LEFT JOIN tasks t ON t.id = l.task_id",
+            count_source="task_logs l",
+            order="l.ts DESC, l.id DESC",
+            limit=limit,
+            offset=offset,
         )
 
     # -- logs and system ---------------------------------------------------
 
     @router.get("/logs", dependencies=guard)
-    def agent_logs(limit: int = Query(200, ge=1, le=2000)) -> list[dict[str, Any]]:
-        return state.db.query(
-            "SELECT * FROM agent_logs ORDER BY ts DESC LIMIT ?", (limit,)
+    def agent_logs(
+        limit: int = Query(200, ge=1, le=2000),
+        offset: int = Query(0, ge=0),
+    ) -> dict[str, Any]:
+        return paged(
+            state.db,
+            select="*",
+            source="agent_logs",
+            order="ts DESC, id DESC",
+            limit=limit,
+            offset=offset,
         )
 
     # -- operations -------------------------------------------------------
@@ -838,22 +897,39 @@ def build_router(state: AppState) -> APIRouter:
         }
 
     @router.get("/operations/audit", dependencies=guard)
-    def audit_events(limit: int = Query(200, ge=1, le=2000)) -> list[dict[str, Any]]:
-        return state.db.query(
-            "SELECT * FROM audit_events ORDER BY ts DESC, id DESC LIMIT ?", (limit,)
+    def audit_events(
+        limit: int = Query(200, ge=1, le=2000),
+        offset: int = Query(0, ge=0),
+    ) -> dict[str, Any]:
+        return paged(
+            state.db,
+            select="*",
+            source="audit_events",
+            order="ts DESC, id DESC",
+            limit=limit,
+            offset=offset,
         )
 
     @router.get("/operations/incidents", dependencies=guard)
     def incidents(
         status: Literal["open", "all"] = "open",
         limit: int = Query(200, ge=1, le=2000),
-    ) -> list[dict[str, Any]]:
-        where = "WHERE status != 'resolved'" if status == "open" else ""
-        return state.db.query(
-            f"SELECT * FROM incidents {where} "
-            "ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 "
-            "ELSE 2 END, last_seen_at DESC LIMIT ?",
-            (limit,),
+        offset: int = Query(0, ge=0),
+    ) -> dict[str, Any]:
+        return paged(
+            state.db,
+            select="*",
+            source="incidents",
+            where="WHERE status != 'resolved'" if status == "open" else "",
+            # Severity first, so paging never buries a critical incident on a
+            # later page while warnings fill the first one.  id breaks ties in
+            # last_seen_at, without which a page boundary could repeat a row.
+            order=(
+                "CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 "
+                "ELSE 2 END, last_seen_at DESC, id DESC"
+            ),
+            limit=limit,
+            offset=offset,
         )
 
     @router.get("/operations/incidents/count", dependencies=guard)
