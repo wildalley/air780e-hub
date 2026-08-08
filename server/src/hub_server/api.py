@@ -43,6 +43,78 @@ log = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------
+# device history downsampling
+# --------------------------------------------------------------------------
+
+# Roughly how many points a history series should carry, whatever the window.
+# A chart is around 800px wide, so ~360 points is already more than it can
+# resolve; past that the extra rows only cost transfer and client-side merging.
+HISTORY_TARGET_POINTS = 360
+
+# Bucket widths in seconds, coarsest last.  The first one that brings the
+# window under the target wins.  Modules report every ~30s, so short windows
+# land on the 30s bucket and stay effectively raw.
+HISTORY_BUCKETS = (30, 60, 300, 900, 1800, 3600, 7200, 21600)
+
+
+def history_bucket_seconds(hours: int) -> int:
+    """Bucket width for a window of *hours*, bounding the row count.
+
+    Without this the response carried every stored sample: a 7-day window
+    across ten modules reporting every 30s is over 200k rows, rebuilt every
+    15s by the dashboard's refresh.  Bucketing makes the size a function of
+    the window instead of the sampling rate.
+    """
+    span = hours * 3600
+    for width in HISTORY_BUCKETS:
+        if span / width <= HISTORY_TARGET_POINTS:
+            return width
+    return HISTORY_BUCKETS[-1]
+
+
+# How each column survives being collapsed into a bucket.  The rules differ
+# because the columns mean different things:
+#
+#   signal metrics  AVG — the series is read as a trend, so the mean is the
+#                   honest summary of a bucket.
+#   online/reg.     MIN — a bucket the module dropped out of must read as down.
+#                   Averaging would bury a two-minute outage inside a 30-minute
+#                   point, which is the one thing an operations view must not do.
+#   storage         MAX — a high-water mark.  Storage matters when it is nearly
+#                   full, and the peak is what says so; a mean would hide it.
+HISTORY_AGGREGATES = (
+    ("online", "MIN({c})"),
+    ("registered", "MIN({c})"),
+    ("rssi", "CAST(ROUND(AVG({c})) AS INTEGER)"),
+    ("dbm", "CAST(ROUND(AVG({c})) AS INTEGER)"),
+    ("bars", "CAST(ROUND(AVG({c})) AS INTEGER)"),
+    ("rsrp", "CAST(ROUND(AVG({c})) AS INTEGER)"),
+    ("rsrq", "CAST(ROUND(AVG({c})) AS INTEGER)"),
+    ("storage_used", "MAX({c})"),
+    ("storage_cap", "MAX({c})"),
+)
+
+
+def history_columns(prefix: str = "") -> str:
+    """Render the aggregate list, qualified by *prefix* where a join needs it.
+
+    ``devices`` carries its own ``online`` and ``registered``, so the joined
+    query must say which table it means.
+    """
+    return ", ".join(
+        expression.format(c=f"{prefix}{name}") + f" AS {name}"
+        for name, expression in HISTORY_AGGREGATES
+    )
+
+# Bucket start, rendered back into the same UTC ISO-8601 shape the raw column
+# stores, so the response is indistinguishable in form from an unbucketed one.
+_BUCKET_TS = (
+    "strftime('%Y-%m-%dT%H:%M:%S+00:00', "
+    "CAST(strftime('%s', {ts}) / {width} AS INTEGER) * {width}, 'unixepoch')"
+)
+
+
+# --------------------------------------------------------------------------
 # request bodies
 # --------------------------------------------------------------------------
 
@@ -264,17 +336,25 @@ def build_router(state: AppState) -> APIRouter:
     def all_device_history(
         hours: int = Query(24, ge=1, le=24 * 30),
     ) -> dict[str, list[dict[str, Any]]]:
-        """Return every device series in one request for the dashboard."""
+        """Return every device series in one request for the dashboard.
+
+        Downsampled into time buckets — see ``history_bucket_seconds``.  The
+        response shape is the same as an unbucketed one, so a caller reading
+        points off it needs no changes; only the density differs.
+        """
         cutoff = (
             datetime.now(UTC) - timedelta(hours=hours)
         ).isoformat(timespec="seconds")
+        width = history_bucket_seconds(hours)
+        bucket = _BUCKET_TS.format(ts="s.ts", width=width)
         names = [row["name"] for row in state.db.query("SELECT name FROM devices")]
         grouped: dict[str, list[dict[str, Any]]] = {name: [] for name in names}
         rows = state.db.query(
-            "SELECT d.name, s.ts, s.online, s.registered, s.rssi, s.dbm, "
-            "s.bars, s.rsrp, s.rsrq, s.storage_used, s.storage_cap "
+            f"SELECT d.name, {bucket} AS ts, {history_columns('s.')} "
             "FROM device_status s JOIN devices d ON d.id = s.device_id "
-            "WHERE s.ts >= ? ORDER BY d.name, s.ts",
+            "WHERE s.ts >= ? "
+            f"GROUP BY d.name, CAST(strftime('%s', s.ts) / {width} AS INTEGER) "
+            "ORDER BY d.name, ts",
             (cutoff,),
         )
         for row in rows:
@@ -294,10 +374,13 @@ def build_router(state: AppState) -> APIRouter:
         cutoff = (
             datetime.now(UTC) - timedelta(hours=hours)
         ).isoformat(timespec="seconds")
+        width = history_bucket_seconds(hours)
+        bucket = _BUCKET_TS.format(ts="ts", width=width)
         return state.db.query(
-            "SELECT ts, online, registered, rssi, dbm, bars, rsrp, rsrq, "
-            "storage_used, storage_cap FROM device_status "
-            "WHERE device_id = ? AND ts >= ? ORDER BY ts",
+            f"SELECT {bucket} AS ts, {history_columns()} "
+            "FROM device_status WHERE device_id = ? AND ts >= ? "
+            f"GROUP BY CAST(strftime('%s', ts) / {width} AS INTEGER) "
+            "ORDER BY ts",
             (row["id"], cutoff),
         )
 

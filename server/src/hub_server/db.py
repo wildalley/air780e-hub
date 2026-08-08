@@ -153,6 +153,10 @@ CREATE TABLE IF NOT EXISTS device_status (
     storage_cap  INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_status_device_ts ON device_status(device_id, ts DESC);
+-- The dashboard reads every device at once, so it filters on ts alone and the
+-- composite index above cannot serve it — ts is not its leading column.  Without
+-- this the 15-second refresh scans the whole table however short the window is.
+CREATE INDEX IF NOT EXISTS idx_status_ts ON device_status(ts);
 
 CREATE TABLE IF NOT EXISTS channels (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,

@@ -445,11 +445,94 @@ def test_status_is_recorded_for_the_history_graph(admin):
             })
             ws.receive_json()
 
-    history = admin.get("/api/devices/a/history?hours=24").json()
+    # A short window buckets at 30s, below the 1-minute spacing of these
+    # samples, so each is still its own point and the raw values read back.
+    history = admin.get("/api/devices/a/history?hours=1").json()
     assert [row["rssi"] for row in history] == [24, 18, 11]
-    histories = admin.get("/api/devices/history?hours=24").json()
+    histories = admin.get("/api/devices/history?hours=1").json()
     assert [row["rssi"] for row in histories["a"]] == [24, 18, 11]
     assert histories["b"] == []
+
+
+def test_history_bucket_width_bounds_the_row_count():
+    """Every window must fit the point target, and widen monotonically."""
+    from hub_server.api import (
+        HISTORY_BUCKETS,
+        HISTORY_TARGET_POINTS,
+        history_bucket_seconds,
+    )
+
+    previous = 0
+    for hours in (1, 3, 6, 12, 24, 24 * 7, 24 * 30):
+        width = history_bucket_seconds(hours)
+        assert hours * 3600 / width <= HISTORY_TARGET_POINTS, hours
+        assert width >= previous, "a longer window must not bucket finer"
+        previous = width
+
+    # Short windows stay effectively raw: modules report every ~30s.
+    assert history_bucket_seconds(1) == 30
+    # The longest window the API accepts still has to land on the ladder.
+    assert history_bucket_seconds(24 * 30) in HISTORY_BUCKETS
+
+
+def test_history_collapses_a_long_window_into_buckets(admin):
+    """A 7-day window must not return one point per stored sample.
+
+    The regression this guards: the endpoint used to return every row in the
+    window, so ten modules reporting every 30s produced a six-figure response
+    that the dashboard rebuilt every 15 seconds.
+    """
+    from hub_server.api import history_bucket_seconds
+
+    width = history_bucket_seconds(24 * 7)
+    assert width >= 1800, "a 7-day window should bucket coarsely"
+
+    # Twelve samples one minute apart, all inside a single bucket.
+    with _connect(admin) as ws:
+        _greet(ws)
+        for seq in range(1, 13):
+            ws.send_json({
+                "type": "status", "seq": seq, "device": "a", "online": True,
+                "registered": True, "rssi": 20, "dbm": -70,
+                "bars": 3, "storage_used": 0, "storage_capacity": 50,
+                "ts": _minutes_ago(seq),
+            })
+            ws.receive_json()
+
+    points = admin.get("/api/devices/a/history?hours=168").json()
+    assert 0 < len(points) <= 2, f"12 samples collapsed to {len(points)} points"
+
+
+def test_history_bucket_keeps_an_outage_and_the_storage_peak(admin):
+    """Aggregation must not smooth away the things an operator looks for.
+
+    A module that dropped out inside a bucket has to read as down, and storage
+    has to read as its high-water mark — an average would hide both.
+    """
+    with _connect(admin) as ws:
+        _greet(ws)
+        samples = [
+            (1, True, True, 10),
+            (2, False, False, 90),   # the outage, and the storage peak
+            (3, True, True, 20),
+        ]
+        for seq, online, registered, used in samples:
+            ws.send_json({
+                "type": "status", "seq": seq, "device": "a",
+                "online": online, "registered": registered,
+                "rssi": 20, "dbm": -70, "bars": 3,
+                "storage_used": used, "storage_capacity": 100,
+                "ts": _minutes_ago(seq),
+            })
+            ws.receive_json()
+
+    # One bucket wide enough to hold all three samples.
+    points = admin.get("/api/devices/a/history?hours=168").json()
+    assert len(points) >= 1
+    collapsed = points[0]
+    assert collapsed["online"] == 0, "an outage inside the bucket must survive"
+    assert collapsed["registered"] == 0
+    assert collapsed["storage_used"] == 90, "storage must read as the peak"
 
 
 def test_history_window_respects_offset_timestamps(admin):
