@@ -45,7 +45,9 @@ import {
   type RulePreview,
   type Sim,
 } from '../api'
-import { Loading, formatTs, useToast } from '../components/common'
+import { formatTs } from '../format'
+import { useToast } from '../toast'
+import { Loading } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
 import { LIVE_MS } from '../swr'
 import { STATUS } from '../tokens'

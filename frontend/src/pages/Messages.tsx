@@ -33,8 +33,10 @@ import RefreshIcon from '@mui/icons-material/RefreshOutlined'
 import DownloadIcon from '@mui/icons-material/FileDownloadOutlined'
 import ContentCopyIcon from '@mui/icons-material/ContentCopyOutlined'
 import CheckIcon from '@mui/icons-material/CheckOutlined'
+import { detectOtp, hasOlderMessages, OTP_RE, resolveThread } from '../messages'
 import { api, ApiError, type Conversation, type Device, type Message } from '../api'
-import { Loading, useToast } from '../components/common'
+import { useToast } from '../toast'
+import { Loading } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
 import { useDebounced } from '../swr'
 import { STATUS } from '../tokens'
@@ -55,19 +57,6 @@ const THREAD_PAGE = 200
 // Roughly where a GSM-7 message splits.  Only a hint: the agent does the real
 // segmentation, and Unicode content splits far earlier.
 const SINGLE_SEGMENT = 70
-
-/**
- * The last 4–8 digit run in the body, if any.  This is the whole point of the
- * box — the verification code.  Lookbehind/lookahead keep a longer run like a
- * phone number from matching a prefix of itself.
- */
-const OTP_RE = /(?<!\d)(\d{4,8})(?!\d)/g
-
-export function detectOtp(body: string): string | null {
-  let code: string | null = null
-  for (const match of body.matchAll(OTP_RE)) code = match[1]
-  return code
-}
 
 /** Split a body around its codes; codes render as highlighted tokens. */
 function highlightOtp(body: string): ReactNode[] {
@@ -98,40 +87,6 @@ function highlightOtp(body: string): ReactNode[] {
   }
   if (last < body.length) parts.push(body.slice(last))
   return parts
-}
-
-/**
- * The open thread, resolved against the current list rather than copied into
- * state when it was clicked.
- *
- * The list is the source of truth: after a reply is sent the refetched row
- * carries the new preview, timestamp and count, and the header has to show
- * them. Holding a snapshot in state and syncing it from an effect is what this
- * replaces.
- *
- * `fallback` covers a thread that is not in the list — one opened from search
- * can be older than the conversations window, and it must still render.
- */
-/**
- * Whether a thread has messages older than the ones already fetched.
- *
- * Compares against how many actually came back, not against the requested
- * window: the two differ on the last window, and comparing to the request
- * would leave "加载更早的消息" showing forever at the top of a fully-read
- * conversation.
- */
-export function hasOlderMessages(total: number, fetched: number): boolean {
-  return total > fetched
-}
-
-export function resolveThread(
-  open: Pick<Conversation, 'peer' | 'sim_id'> | null,
-  threads: Conversation[] | undefined,
-  fallback: Conversation | null,
-): Conversation | null {
-  if (!open) return null
-  const fresh = threads?.find((t) => t.peer === open.peer && t.sim_id === open.sim_id)
-  return fresh ?? fallback
 }
 
 export function MessagesPage() {

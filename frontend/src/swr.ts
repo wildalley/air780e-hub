@@ -8,7 +8,7 @@
  * Keys are the API paths (`/api/devices`), so a mutation anywhere can
  * revalidate a page it does not import by calling `mutate('/api/devices')`.
  */
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import type { SWRConfiguration } from 'swr'
 import { ApiError } from './api'
 
@@ -28,6 +28,35 @@ export function useDebounced<T>(value: T, ms: number): T {
     return () => clearTimeout(timer)
   }, [value, ms])
   return settled
+}
+
+/**
+ * Offset paging state for a log view.
+ *
+ * Lives here with `useDebounced` because its product is the same thing: a
+ * fragment of an SWR key. Putting `query` in the key caches each page
+ * separately, so stepping back to one already seen is instant.
+ *
+ * The log endpoints used to return only their newest N rows, so anything older
+ * was unreachable however long retention kept it.
+ */
+export function usePager(pageSize = 50) {
+  const [page, setPage] = useState(0)
+  const [size, setSize] = useState(pageSize)
+  return {
+    page,
+    limit: size,
+    offset: page * size,
+    setPage,
+    /** Changing page size returns to the first page rather than stranding you
+     *  on an index the smaller list no longer has. */
+    setSize: useCallback((next: number) => {
+      setSize(next)
+      setPage(0)
+    }, []),
+    reset: useCallback(() => setPage(0), []),
+    query: `limit=${size}&offset=${page * size}`,
+  }
 }
 
 /** Statuses where a retry cannot succeed — the answer will not change. */

@@ -30,16 +30,12 @@ import ResolveIcon from '@mui/icons-material/CheckCircleOutlineOutlined'
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore'
 import StorageIcon from '@mui/icons-material/StorageOutlined'
 import useSWR, { mutate as mutateKey } from 'swr'
+import { successRate } from '../opsStats'
 import { api, ApiError, type ActivityWindow, type Incident } from '../api'
-import {
-  EmptyRow,
-  Loading,
-  OnlineChip,
-  Pager,
-  formatTs,
-  usePager,
-  useToast,
-} from '../components/common'
+import { formatTs } from '../format'
+import { usePager } from '../swr'
+import { useToast } from '../toast'
+import { EmptyRow, Loading, OnlineChip, Pager } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
 import { StatTile } from '../components/StatTile'
 import { LIVE_MS } from '../swr'
@@ -82,27 +78,6 @@ function severityColor(severity: Incident['severity']): string {
   if (severity === 'critical') return STATUS.critical
   if (severity === 'warning') return STATUS.warning
   return 'text.secondary'
-}
-
-/**
- * Success rate, or an em dash when nothing ran. 0/0 is not 0% — a window with
- * no attempts says nothing about health, and rendering it as 0% would light up
- * the accent colour on an idle hub.
- */
-export function successRate(ok: number, failed: number): { text: string; accent?: string } {
-  const total = ok + failed
-  if (total === 0) return { text: '—' }
-  const percent = (ok / total) * 100
-  // Only a clean sweep prints "100%". With even one failure, `toFixed(1)`
-  // would round 99.95%+ up to "100.0%" and hide it, so floor to the tenth
-  // instead — a rate that is not perfect must never read as if it were.
-  const text = failed === 0
-    ? '100%'
-    : `${(Math.floor(percent * 10) / 10).toFixed(1)}%`
-  return {
-    text,
-    accent: percent >= 99 ? STATUS.good : percent >= 90 ? STATUS.warning : STATUS.critical,
-  }
 }
 
 /** Row counts, biggest first — the interesting one is whichever is growing. */

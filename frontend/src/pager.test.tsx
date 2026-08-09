@@ -8,7 +8,7 @@
  */
 import { act, render } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
-import { usePager } from './common'
+import { usePager } from './swr'
 
 type Pager = ReturnType<typeof usePager>
 

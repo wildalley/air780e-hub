@@ -1,5 +1,5 @@
+import { successRate } from '../opsStats'
 import { describe, expect, it } from 'vitest'
-import { successRate } from './Operations'
 import { STATUS } from '../tokens'
 
 /**

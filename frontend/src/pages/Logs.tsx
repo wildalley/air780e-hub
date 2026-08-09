@@ -15,7 +15,9 @@ import {
 } from '@mui/material'
 import useSWR from 'swr'
 import { api } from '../api'
-import { Loading, Pager, formatTs, usePager } from '../components/common'
+import { formatTs } from '../format'
+import { usePager } from '../swr'
+import { Loading, Pager } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
 import { STATUS } from '../tokens'
 

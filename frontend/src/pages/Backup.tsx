@@ -17,7 +17,7 @@ import {
 import DownloadIcon from '@mui/icons-material/CloudDownloadOutlined'
 import UploadIcon from '@mui/icons-material/UploadFileOutlined'
 import { api, ApiError } from '../api'
-import { useToast } from '../components/common'
+import { useToast } from '../toast'
 import { PageHeader } from '../components/PageHeader'
 
 export function BackupPage() {

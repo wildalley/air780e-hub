@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { formatTs, relativeTs } from './common'
+import { formatTs, relativeTs } from './format'
 
 afterEach(() => {
   vi.useRealTimers()

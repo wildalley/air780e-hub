@@ -19,7 +19,7 @@ import VisibilityIcon from '@mui/icons-material/VisibilityOutlined'
 import CopyIcon from '@mui/icons-material/ContentCopyOutlined'
 import RotateIcon from '@mui/icons-material/PublishedWithChangesOutlined'
 import { api, ApiError, type AgentTokenInfo } from '../api'
-import { useToast } from '../components/common'
+import { useToast } from '../toast'
 import { PageHeader } from '../components/PageHeader'
 
 export function SettingsPage({ onPasswordChanged }: { onPasswordChanged: () => void }) {

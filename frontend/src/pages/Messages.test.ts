@@ -1,6 +1,6 @@
+import { detectOtp, hasOlderMessages, resolveThread } from '../messages'
 import { describe, expect, it } from 'vitest'
 import type { Conversation } from '../api'
-import { detectOtp, hasOlderMessages, resolveThread } from './Messages'
 
 /**
  * `detectOtp` drives the copy-code button on every received message, so its
