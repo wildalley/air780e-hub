@@ -242,6 +242,85 @@ def test_sms_in_is_stored_and_acked(admin):
     assert items[0]["sim_iccid"] == "89860622180012345670"
 
 
+def test_the_pdu_and_dcs_the_agent_sends_are_kept(admin):
+    """These are what make a garbled message diagnosable after the fact.
+
+    The agent had always sent ``pdu``; the server dropped it. Once the modem's
+    own copy is deleted (``delete_after_read`` defaults on) the decoded body was
+    all that survived, and a body alone cannot tell a decoder bug from a payload
+    that was never text.
+    """
+    with _connect(admin) as ws:
+        _greet(ws)
+        ws.send_json({
+            "type": "sms_in", "seq": 11, "device": "a",
+            "iccid": "89860622180012345670", "peer": "10086",
+            "body": "验证码 123456", "ts": "2026-08-02T18:00:00+08:00",
+            "segments": 1,
+            "pdu": "0791261010101010040C91261019283746000052806151713140",
+            "dcs": 0,
+        })
+        assert ws.receive_json() == {"type": "ack", "seq": 11}
+
+    row = admin.app.state.hub.db.one(
+        "SELECT raw_pdu, dcs, is_binary FROM messages WHERE peer = '10086'"
+    )
+    assert row["raw_pdu"].startswith("079126101010")
+    assert row["dcs"] == 0
+    assert row["is_binary"] == 0
+
+
+def test_a_binary_sms_is_stored_flagged_and_previewed_as_data(admin):
+    """An operator data SMS must not read as a message someone sent.
+
+    This is the giffgaff case: an OTA payload decoded as text produced a wall of
+    mojibake in the conversation, and one that decoded to nothing produced a
+    blank bubble with "(空)" in the list.
+    """
+    with _connect(admin) as ws:
+        _greet(ws)
+        ws.send_json({
+            "type": "sms_in", "seq": 12, "device": "a",
+            "iccid": "89860622180012345670", "peer": "giffgaff",
+            "body": "鼠S耸盘涌羹",          # what the text decode produced
+            "ts": "2026-08-06T21:15:24+08:00",
+            "segments": 1,
+            "pdu": "0705912143F5040BC8329BFD0600F5",
+            "dcs": 4,
+            "binary": True,
+        })
+        assert ws.receive_json() == {"type": "ack", "seq": 12}
+
+    items = admin.get("/api/messages").json()["items"]
+    assert items[0]["is_binary"] == 1
+    # The body is kept rather than blanked: the raw PDU plus what the decode
+    # produced is the whole evidence trail. The UI is what stops showing it.
+    assert items[0]["body"] == "鼠S耸盘涌羹"
+    assert items[0]["dcs"] == 4
+
+    # The conversation list carries the flag too, or its preview still shows
+    # the mojibake even once the bubble stops.
+    thread = admin.get("/api/conversations").json()[0]
+    assert thread["last_is_binary"] == 1
+
+
+def test_a_frame_with_a_malformed_dcs_still_stores_the_message(admin):
+    """A diagnostic column is not worth refusing a message over."""
+    with _connect(admin) as ws:
+        _greet(ws)
+        ws.send_json({
+            "type": "sms_in", "seq": 13, "device": "a",
+            "iccid": "89860622180012345670", "peer": "10086",
+            "body": "hello", "ts": "2026-08-02T18:00:00+08:00",
+            "dcs": "not-a-number",
+        })
+        assert ws.receive_json() == {"type": "ack", "seq": 13}
+
+    row = admin.app.state.hub.db.one("SELECT body, dcs FROM messages")
+    assert row["body"] == "hello"
+    assert row["dcs"] is None
+
+
 def test_replayed_event_is_not_duplicated(admin):
     """The agent replays after a lost ack; that must not double a message."""
     event = {

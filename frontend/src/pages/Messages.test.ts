@@ -1,4 +1,4 @@
-import { detectOtp, hasOlderMessages, resolveThread } from '../messages'
+import { detectOtp, hasOlderMessages, resolveThread, threadPreview } from '../messages'
 import { describe, expect, it } from 'vitest'
 import type { Conversation } from '../api'
 
@@ -146,5 +146,35 @@ describe('hasOlderMessages', () => {
     // A total that lags the page (a delete landing between the two queries)
     // must not render a button that would fetch nothing.
     expect(hasOlderMessages(5, 10)).toBe(false)
+  })
+})
+
+/**
+ * `threadPreview` is what the conversation list shows for the newest message.
+ *
+ * A data SMS has no text worth previewing: its decoded body is either mojibake
+ * or empty, which is exactly what the list used to render.
+ */
+describe('threadPreview', () => {
+  it('names a data SMS instead of previewing its bytes', () => {
+    // The real case: a giffgaff OTA message whose body decoded to CJK garbage.
+    expect(
+      threadPreview({ last_body: '鼠S耸盘涌羹', last_is_binary: 1 }),
+    ).toBe('运营商数据短信')
+    // And the one that decoded to nothing at all.
+    expect(threadPreview({ last_body: '', last_is_binary: 1 })).toBe('运营商数据短信')
+  })
+
+  it('previews real text unchanged', () => {
+    expect(threadPreview({ last_body: '验证码 123456' })).toBe('验证码 123456')
+    expect(threadPreview({ last_body: '验证码 123456', last_is_binary: 0 })).toBe(
+      '验证码 123456',
+    )
+  })
+
+  it('falls back for an empty text message', () => {
+    // Not binary, genuinely empty — keep the old placeholder rather than
+    // claiming it was data.
+    expect(threadPreview({ last_body: '' })).toBe('(空)')
   })
 })

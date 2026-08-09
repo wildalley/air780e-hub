@@ -37,6 +37,20 @@ export function hasOlderMessages(total: number, fetched: number): boolean {
 }
 
 /**
+ * One line of preview for the conversation list.
+ *
+ * A data SMS has no text to preview, and its decoded body is mojibake or empty
+ * — the list used to show a run of CJK garbage, or "(空)" for the ones that
+ * decoded to nothing at all. Naming what it is beats showing either.
+ */
+export function threadPreview(
+  thread: Pick<Conversation, 'last_body'> & { last_is_binary?: number },
+): string {
+  if (thread.last_is_binary) return '运营商数据短信'
+  return thread.last_body || '(空)'
+}
+
+/**
  * The open thread, resolved against the current list rather than copied into
  * state when it was clicked.
  *

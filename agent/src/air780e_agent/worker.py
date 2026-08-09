@@ -375,6 +375,12 @@ class DeviceWorker:
                 "ts_source": "scts" if sms.timestamp else "local",
                 "segments": segments,
                 "pdu": sms.raw,
+                # The PDU alone cannot say how it was read: the alphabet comes
+                # from TP-DCS, and a wrong reading is exactly the failure these
+                # two make diagnosable after the fact.
+                "dcs": sms.dcs,
+                "alphabet": sms.alphabet,
+                "binary": sms.is_binary,
             },
         )
         # Deliberately no message body in logs: verification codes are sensitive.

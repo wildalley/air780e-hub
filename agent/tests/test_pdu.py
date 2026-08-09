@@ -16,6 +16,7 @@ from air780e_agent.pdu import (
     Reassembler,
     alphabet_from_dcs,
     decode_pdu,
+    encode_deliver,
     encode_submit,
     gsm7,
 )
@@ -302,3 +303,91 @@ def test_reassembler_flushes_expired_partials():
     assert len(flushed) == 1
     assert flushed[0].text  # partial content survives rather than being lost
     assert r.pending_count == 0
+
+
+# --------------------------------------------------------------------------
+# binary / port-addressed SMS
+# --------------------------------------------------------------------------
+
+
+def _deliver_with_udh(udh: bytes, payload: bytes, dcs: int) -> str:
+    """Hand-build one SMS-DELIVER carrying *udh* + *payload*.
+
+    Written out rather than reusing ``encode_deliver`` because that only builds
+    text messages, and the point here is a PDU whose user data was never text.
+    TP-UDL is in octets because every case below uses an 8-bit DCS.
+    """
+    first = 0x00 | (0x40 if udh else 0x00)   # TP-MTI=DELIVER, TP-UDHI when a UDH
+    body = (bytes([len(udh)]) + udh if udh else b"") + payload
+    return "".join([
+        "00",                       # no SMSC in the returned PDU
+        f"{first:02X}",
+        "05", "81", "0100F8",       # TP-OA: 5 digits, national, "10086"
+        "00",                       # TP-PID
+        f"{dcs:02X}",               # TP-DCS
+        "62808081204300",           # TP-SCTS
+        f"{len(body):02X}",         # TP-UDL
+        body.hex().upper(),
+    ])
+
+
+def test_port_addressed_sms_is_flagged_as_binary():
+    """An 8-bit port-addressing UDH means the payload is for an application.
+
+    Operators push OTA/config messages this way. Decoded as text they become a
+    wall of mojibake in a conversation, so the decoder has to say what they are
+    — before this, ``_parse_udh`` only looked for concatenation and such a
+    message was indistinguishable from one a person sent.
+    """
+    udh = bytes([0x04, 0x02, 0x0B, 0x84])       # IEI 0x04, dest 0x0B, src 0x84
+    sms = decode_pdu(_deliver_with_udh(udh, bytes(range(16)), dcs=0x04))
+
+    assert sms.ports == (0x0B, 0x84)
+    assert sms.is_binary
+
+
+def test_sixteen_bit_port_addressing_is_also_flagged():
+    udh = bytes([0x05, 0x04, 0x0B, 0x84, 0x23, 0xF0])
+    sms = decode_pdu(_deliver_with_udh(udh, b"\x01\x02\x03", dcs=0x04))
+
+    assert sms.ports == (0x0B84, 0x23F0)
+    assert sms.is_binary
+
+
+def test_eight_bit_dcs_alone_is_enough_to_flag_binary():
+    """No UDH at all, just a data coding scheme that says octets."""
+    sms = decode_pdu(_deliver_with_udh(b"", b"\xde\xad\xbe\xef", dcs=0x04))
+
+    assert sms.alphabet == "8bit"
+    assert sms.ports is None
+    assert sms.is_binary
+
+
+def test_a_udh_carrying_both_concat_and_ports_reports_both():
+    """A real UDH often holds several IEs; the walk must not stop at the first.
+
+    Before this the loop returned as soon as it found concatenation, so a
+    multipart OTA message read as ordinary text.
+    """
+    udh = bytes([0x00, 0x03, 0x2A, 0x02, 0x01]) + bytes([0x04, 0x02, 0x0B, 0x84])
+    sms = decode_pdu(_deliver_with_udh(udh, bytes(8), dcs=0x04))
+
+    assert sms.concat is not None
+    assert (sms.concat.ref, sms.concat.total, sms.concat.seq) == (0x2A, 2, 1)
+    assert sms.ports == (0x0B, 0x84)
+    assert sms.is_binary
+
+
+def test_a_concatenated_text_message_is_not_binary():
+    """The flag must not fire on the UDH that ordinary long messages carry."""
+    for part in encode_submit("10086", "x" * 400):
+        sms = decode_pdu(part.pdu_hex)
+        assert sms.concat is not None
+        assert sms.ports is None
+        assert not sms.is_binary
+
+
+def test_a_plain_text_message_is_not_binary():
+    sms = decode_pdu(encode_deliver("10086", "验证码 123456")[0])
+    assert not sms.is_binary
+    assert sms.ports is None

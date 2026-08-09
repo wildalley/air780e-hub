@@ -31,11 +31,17 @@ log = logging.getLogger(__name__)
 # and ``devices.radio_enabled``).  Databases created before versioning read back
 # as 0 and are reconciled to 1 on first open; see ``Database._migrate``.
 #
+# Version 2 adds ``messages.raw_pdu`` and ``messages.dcs``.
+#
 # To add a migration: append one entry to ``MIGRATIONS`` with the next integer
-# and bump this constant.  Never renumber or edit a released entry — a database
-# that already ran it will not run it again, so an edit only affects databases
-# that have not, and the two then disagree about what version N means.
-SCHEMA_VERSION = 1
+# and bump this constant, and add the same columns/tables to SCHEMA so a brand
+# new database gets them directly.  That is not a duplicate: SCHEMA builds the
+# current shape for a new file, MIGRATIONS moves an existing file forward, and
+# ``_migrate`` stamps a new file rather than replaying migrations against it.
+# Never renumber or edit a released entry — a database that already ran it will
+# not run it again, so an edit only affects databases that have not, and the two
+# then disagree about what version N means.
+SCHEMA_VERSION = 2
 
 # Persisted (settings table) key for the SMS retention window, in days.  The
 # operator edits it on the Notify page; when unset the env default applies.
@@ -132,6 +138,19 @@ CREATE TABLE IF NOT EXISTS messages (
     seq        INTEGER,
     error      TEXT,
     read_at    TEXT,
+    -- The PDU exactly as the modem returned it, and its TP-DCS.  The agent has
+    -- always sent both; not keeping them meant a garbled message could not be
+    -- diagnosed after the fact, because the agent deletes the message from the
+    -- modem once it is read (delete_after_read defaults on) and stores no PDU
+    -- of its own.  The decoded body was all that survived, which is not enough
+    -- to tell a decoder bug from a message that was never text to begin with.
+    raw_pdu    TEXT,
+    dcs        INTEGER,
+    -- Set when the payload was data rather than text: an 8-bit TP-DCS, or a
+    -- port-addressing UDH (OTA provisioning, WAP push, SIM toolkit).  Such a
+    -- payload decoded as text is a wall of mojibake, so the UI renders it as
+    -- what it is instead of pretending someone sent it.
+    is_binary  INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts DESC);
@@ -375,15 +394,52 @@ class Database:
         if "radio_enabled" not in columns["devices"]:
             self._db.execute("ALTER TABLE devices ADD COLUMN radio_enabled INTEGER")
 
-    # Ordered migrations from version 1 onwards: (version, description,
-    # statements).  Each runs inside its own transaction and only on databases
-    # below it.
+    # Ordered migrations from version 1 onwards: (version, description, method).
+    # Each runs inside its own transaction and only on databases below it.
     #
-    # Statements are listed individually rather than as one script on purpose:
-    # ``executescript`` COMMITs before it runs, which would close the
-    # transaction ``_run_step`` opened and leave a failed migration half
-    # applied with no way to roll it back.
-    MIGRATIONS: tuple[tuple[int, str, tuple[str, ...]], ...] = ()
+    # The third element names a method rather than holding SQL, because a step
+    # generally has to look at the database before deciding what to do — see
+    # ``_add_columns_if_missing``.  Whatever the method runs, it must use
+    # ``execute`` and never ``executescript``: the latter COMMITs before it
+    # runs, which would close the transaction ``_run_step`` opened and leave a
+    # failed migration half applied with no way to roll it back.
+    MIGRATIONS: tuple[tuple[int, str, str], ...] = (
+        (2, "keep the raw PDU, TP-DCS and binary flag of every message",
+         "_migration_message_diagnostics"),
+    )
+
+    def _add_columns_if_missing(self, table: str, columns: dict[str, str]) -> None:
+        """``ALTER TABLE ... ADD COLUMN`` for each column not already there.
+
+        The check is required, not defensive padding.  SCHEMA and MIGRATIONS
+        describe the same shape from two directions: SCHEMA builds it for a new
+        file, MIGRATIONS walks an old one forward.  A table that did not exist
+        when the database was created is built by SCHEMA at the *current* shape,
+        columns and all — and then an unconditional ADD COLUMN for those same
+        columns fails on a duplicate.  Skipping what is present makes the step
+        agree with whichever way the table got here.
+        """
+        present = {row[1] for row in self._db.execute(f"PRAGMA table_info({table})")}
+        for name, decl in columns.items():
+            if name not in present:
+                self._db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+    def _migration_message_diagnostics(self) -> None:
+        """v1 -> v2: the columns that make a garbled message diagnosable.
+
+        The agent had always sent the PDU and TP-DCS; the server dropped both.
+        Once the modem's own copy is deleted (``delete_after_read`` defaults on)
+        the decoded body was all that survived, which cannot distinguish a
+        decoder bug from a payload that was never text.
+        """
+        self._add_columns_if_missing(
+            "messages",
+            {
+                "raw_pdu": "TEXT",
+                "dcs": "INTEGER",
+                "is_binary": "INTEGER NOT NULL DEFAULT 0",
+            },
+        )
 
     def _snapshot_before_migration(self, from_version: int) -> Path | None:
         """Copy the database aside before migrating it.
@@ -419,6 +475,17 @@ class Database:
         if version == SCHEMA_VERSION:
             return
 
+        if not pre_existing:
+            # A file we just created already has the current shape: SCHEMA ran
+            # against it a moment ago.  Stamping it here rather than replaying
+            # the migrations is what keeps a migration free to say
+            # ``ALTER TABLE ... ADD COLUMN`` — replaying that against a table
+            # SCHEMA had already created would fail on a duplicate column, on
+            # every first start.  Migrations exist to move *old* databases
+            # forward, and this one has no past.
+            self._set_user_version(SCHEMA_VERSION)
+            return
+
         # Only an existing database needs protecting.  A file we just created is
         # empty, and snapshotting it would litter the data directory on every
         # first start.
@@ -438,21 +505,13 @@ class Database:
             )
             version = 1
 
-        for target, description, statements in self.MIGRATIONS:
+        for target, description, method in self.MIGRATIONS:
             if target <= version:
                 continue
             self._run_step(
-                version,
-                target,
-                description,
-                lambda statements=statements: self._run_statements(statements),
-                snapshot,
+                version, target, description, getattr(self, method), snapshot
             )
             version = target
-
-    def _run_statements(self, statements: Iterable[str]) -> None:
-        for statement in statements:
-            self._db.execute(statement)
 
     def _run_step(
         self,
@@ -709,15 +768,18 @@ class Database:
         segments: int = 1,
         seq: int | None = None,
         error: str | None = None,
+        raw_pdu: str | None = None,
+        dcs: int | None = None,
+        is_binary: bool = False,
     ) -> int:
         sim_id = self.upsert_sim(iccid)
         cursor = self.execute(
             "INSERT INTO messages "
             "(agent_id, device, sim_id, direction, peer, body, ts, status, "
-            " segments, seq, error, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " segments, seq, error, raw_pdu, dcs, is_binary, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (agent_id, device, sim_id, direction, peer, body, to_utc_iso(ts), status,
-             segments, seq, error, utcnow()),
+             segments, seq, error, raw_pdu, dcs, int(is_binary), utcnow()),
         )
         return int(cursor.lastrowid)
 
@@ -733,6 +795,7 @@ class Database:
         return self.query(
             "SELECT m.sim_id, m.peer, m.device, "
             "       m.id AS last_id, m.body AS last_body, "
+            "       m.is_binary AS last_is_binary, "
             "       m.direction AS last_direction, m.status AS last_status, "
             "       MAX(m.ts) AS last_ts, COUNT(*) AS message_count, "
             "       SUM(CASE WHEN m.direction = 'in' AND m.read_at IS NULL "

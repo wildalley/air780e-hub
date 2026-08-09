@@ -26,6 +26,20 @@ from .db import Database, utcnow
 
 log = logging.getLogger(__name__)
 
+
+def _optional_int(value: Any) -> int | None:
+    """Coerce a frame field to int, or None when it is absent or malformed.
+
+    Frames come off the wire, so a field can be missing, null, or a string. A
+    diagnostic column is not worth refusing a message over.
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
 CLOSE_AUTH_FAILED = 4001
 CLOSE_PROTOCOL_ERROR = 4002
 CLOSE_AGENT_CONFLICT = 4003
@@ -270,6 +284,11 @@ class Gateway:
             status="received",
             segments=int(frame.get("segments") or 1),
             seq=frame.get("seq"),
+            # The agent has always sent these; dropping them left a garbled
+            # message undiagnosable once the modem's copy was deleted.
+            raw_pdu=frame.get("pdu") or None,
+            dcs=_optional_int(frame.get("dcs")),
+            is_binary=bool(frame.get("binary")),
         )
         if self.on_message is not None:
             await self.on_message(message_id, frame)

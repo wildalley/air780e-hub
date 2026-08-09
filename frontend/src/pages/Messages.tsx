@@ -32,8 +32,9 @@ import ErrorIcon from '@mui/icons-material/ErrorOutlined'
 import RefreshIcon from '@mui/icons-material/RefreshOutlined'
 import DownloadIcon from '@mui/icons-material/FileDownloadOutlined'
 import ContentCopyIcon from '@mui/icons-material/ContentCopyOutlined'
+import DataIcon from '@mui/icons-material/DataObjectOutlined'
 import CheckIcon from '@mui/icons-material/CheckOutlined'
-import { detectOtp, hasOlderMessages, OTP_RE, resolveThread } from '../messages'
+import { detectOtp, hasOlderMessages, OTP_RE, resolveThread, threadPreview } from '../messages'
 import { api, ApiError, type Conversation, type Device, type Message } from '../api'
 import { useToast } from '../toast'
 import { Loading } from '../components/common'
@@ -337,7 +338,7 @@ function ThreadList({
                       }}
                     >
                       {thread.last_direction === 'out' && '你:'}
-                      {thread.last_body || '(空)'}
+                      {threadPreview(thread)}
                     </Typography>
                     <Stack direction="row" spacing={0.75} sx={{ mt: 0.75 }}>
                       <Chip
@@ -628,7 +629,12 @@ function Bubble({
 }) {
   const outgoing = message.direction === 'out'
   const failed = message.status === 'failed'
-  const code = detectOtp(message.body)
+  // Data, not text: an 8-bit TP-DCS or a port-addressing UDH (OTA
+  // provisioning, WAP push, SIM toolkit). Decoding it as characters is what
+  // produced the wall of mojibake this replaces, and an OTP search over it
+  // would only ever find noise.
+  const binary = Boolean(message.is_binary)
+  const code = binary ? null : detectOtp(message.body)
   const [copied, setCopied] = useState(false)
 
   const copy = async () => {
@@ -678,7 +684,16 @@ function Bubble({
               wordBreak: 'break-word',
             }}
           >
-            <Typography variant="body2">{highlightOtp(message.body)}</Typography>
+            {binary ? (
+              <Stack direction="row" spacing={0.75} sx={{ alignItems: 'center' }}>
+                <DataIcon fontSize="small" sx={{ opacity: 0.7 }} />
+                <Typography variant="body2" sx={{ fontStyle: 'italic', opacity: 0.85 }}>
+                  运营商数据短信,无文本内容
+                </Typography>
+              </Stack>
+            ) : (
+              <Typography variant="body2">{highlightOtp(message.body)}</Typography>
+            )}
           </Box>
           <Stack
             direction="row"

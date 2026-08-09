@@ -145,6 +145,9 @@ export interface Message {
   read_at?: string | null
   sim_label?: string
   sim_iccid?: string
+  raw_pdu?: string | null
+  dcs?: number | null
+  is_binary?: number   // 1 if the payload was data, not text (8-bit DCS or port-addressed UDH)
 }
 
 /** One thread: everything exchanged with one number through one card. */
@@ -154,6 +157,8 @@ export interface Conversation {
   device: string
   last_id: number
   last_body: string
+  /** 1 when the newest message was data rather than text. */
+  last_is_binary?: number
   last_direction: 'in' | 'out'
   last_status: string
   last_ts: string

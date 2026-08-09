@@ -58,10 +58,28 @@ class DecodedSms:
     alphabet: str = "gsm7"
     concat: Concat | None = None
     raw: str = ""
+    #: Destination/source ports from a port-addressing UDH, when present.
+    ports: tuple[int, int] | None = None
 
     @property
     def is_multipart(self) -> bool:
         return self.concat is not None and self.concat.total > 1
+
+    @property
+    def is_binary(self) -> bool:
+        """True when this carries data rather than a message for a person.
+
+        Two independent signals, either of which is enough:
+
+        * an 8-bit TP-DCS — the payload is octets, not characters;
+        * a port-addressing UDH — the content is addressed to an application
+          (OTA provisioning, WAP push, SIM toolkit), not to the inbox.
+
+        Worth surfacing because such a payload decoded as text becomes a wall of
+        mojibake in a conversation.  ``text`` is still whatever the decode
+        produced; the caller decides whether to show it.
+        """
+        return self.alphabet == "8bit" or self.ports is not None
 
 
 @dataclass
@@ -191,23 +209,38 @@ def _decode_scts(data: bytes) -> datetime | None:
         return None
 
 
-def _parse_udh(udh: bytes) -> Concat | None:
-    """Pull the concatenation IE out of a user-data header, if present."""
+def _parse_udh(udh: bytes) -> tuple[Concat | None, tuple[int, int] | None]:
+    """Pull the concatenation and port-addressing IEs out of a user-data header.
+
+    Both are returned because they answer different questions and either can
+    appear without the other: concatenation says how to reassemble, ports say
+    the payload was never meant for a human reader.  The loop keeps walking
+    after a match — a real UDH often carries both IEs.
+    """
+    concat: Concat | None = None
+    ports: tuple[int, int] | None = None
     pos = 0
     while pos + 2 <= len(udh):
         iei = udh[pos]
         ie_len = udh[pos + 1]
         payload = udh[pos + 2 : pos + 2 + ie_len]
         if iei == 0x00 and len(payload) >= 3:  # 8-bit reference
-            return Concat(ref=payload[0], total=payload[1], seq=payload[2])
-        if iei == 0x08 and len(payload) >= 4:  # 16-bit reference
-            return Concat(
+            concat = concat or Concat(ref=payload[0], total=payload[1], seq=payload[2])
+        elif iei == 0x08 and len(payload) >= 4:  # 16-bit reference
+            concat = concat or Concat(
                 ref=(payload[0] << 8) | payload[1],
                 total=payload[2],
                 seq=payload[3],
             )
+        elif iei == 0x04 and len(payload) >= 2:  # 8-bit port addressing
+            ports = ports or (payload[0], payload[1])
+        elif iei == 0x05 and len(payload) >= 4:  # 16-bit port addressing
+            ports = ports or (
+                (payload[0] << 8) | payload[1],
+                (payload[2] << 8) | payload[3],
+            )
         pos += 2 + ie_len
-    return None
+    return concat, ports
 
 
 def _decode_ucs2(payload: bytes) -> str:
@@ -229,9 +262,10 @@ def _decode_ucs2(payload: bytes) -> str:
 
 def _decode_user_data(
     body: bytes, udl: int, dcs: int, has_udh: bool
-) -> tuple[str, Concat | None, str]:
+) -> tuple[str, Concat | None, str, tuple[int, int] | None]:
     alphabet = alphabet_from_dcs(dcs)
     concat: Concat | None = None
+    ports: tuple[int, int] | None = None
     udh_octets = 0
 
     if has_udh:
@@ -239,7 +273,7 @@ def _decode_user_data(
             raise PduError("UDHI set but user data is empty")
         udhl = body[0]
         udh_octets = udhl + 1
-        concat = _parse_udh(body[1:udh_octets])
+        concat, ports = _parse_udh(body[1:udh_octets])
 
     if alphabet == "gsm7":
         # The 7-bit stream is realigned so it starts on a septet boundary.
@@ -254,7 +288,7 @@ def _decode_user_data(
         payload = body[udh_octets:udl] if udl <= len(body) else body[udh_octets:]
         text = payload.decode("latin-1", errors="replace")
 
-    return text, concat, alphabet
+    return text, concat, alphabet, ports
 
 
 # --------------------------------------------------------------------------
@@ -306,7 +340,7 @@ def decode_pdu(pdu_hex: str) -> DecodedSms:
         raise PduError(f"unsupported TP-MTI {mti} (first octet 0x{first:02X})")
 
     udl = reader.byte()
-    text, concat, alphabet = _decode_user_data(reader.rest(), udl, dcs, has_udh)
+    text, concat, alphabet, ports = _decode_user_data(reader.rest(), udl, dcs, has_udh)
 
     return DecodedSms(
         kind=kind,
@@ -318,6 +352,7 @@ def decode_pdu(pdu_hex: str) -> DecodedSms:
         alphabet=alphabet,
         concat=concat,
         raw=cleaned.upper(),
+        ports=ports,
     )
 
 

@@ -13,6 +13,7 @@ from hub_server.db import (
     Database,
     MigrationFailed,
     SchemaTooNew,
+    utcnow,
 )
 
 
@@ -219,18 +220,24 @@ def test_a_failed_restore_migration_leaves_the_live_connection_usable(
 def test_an_ordered_migration_applies_and_bumps_the_version(tmp_path, monkeypatch):
     path = tmp_path / "hub.db"
     Database(path).close()
-    assert _user_version(path) == 1
+    assert _user_version(path) == SCHEMA_VERSION
 
-    monkeypatch.setattr(db_module, "SCHEMA_VERSION", 2)
+    monkeypatch.setattr(db_module, "SCHEMA_VERSION", SCHEMA_VERSION + 1)
+    monkeypatch.setattr(
+        Database,
+        "_probe_step",
+        lambda self: self._db.execute("ALTER TABLE devices ADD COLUMN probe TEXT"),
+        raising=False,
+    )
     monkeypatch.setattr(
         Database,
         "MIGRATIONS",
-        ((2, "add a probe column", ("ALTER TABLE devices ADD COLUMN probe TEXT",)),),
+        ((SCHEMA_VERSION + 1, "add a probe column", "_probe_step"),),
     )
 
     database = Database(path)
     try:
-        assert _user_version(path) == 2
+        assert _user_version(path) == SCHEMA_VERSION + 1
         columns = {row["name"] for row in database.query("PRAGMA table_info(devices)")}
         assert "probe" in columns
     finally:
@@ -240,45 +247,126 @@ def test_an_ordered_migration_applies_and_bumps_the_version(tmp_path, monkeypatc
 def test_a_partly_failing_ordered_migration_rolls_back_completely(tmp_path, monkeypatch):
     """A step that fails midway must leave nothing behind.
 
-    The regression this guards: listing the statements as one ``executescript``
-    script instead of individually.  ``executescript`` COMMITs before it runs,
-    which closes the transaction the step opened — the first statement would
-    then stick, the version bump would commit on its own, and the rollback would
-    raise inside the error handler and discard the snapshot path.
+    The regression this guards: running a step's statements through
+    ``executescript``.  It COMMITs before it runs, which closes the transaction
+    the step opened — the first statement would then stick, the version bump
+    would commit on its own, and the rollback would raise inside the error
+    handler and discard the snapshot path.
     """
     path = tmp_path / "hub.db"
     Database(path).close()
 
-    monkeypatch.setattr(db_module, "SCHEMA_VERSION", 2)
+    def half_apply(self) -> None:
+        self._db.execute("ALTER TABLE devices ADD COLUMN good TEXT")
+        self._db.execute("ALTER TABLE nonexistent ADD COLUMN bad TEXT")
+
+    monkeypatch.setattr(db_module, "SCHEMA_VERSION", SCHEMA_VERSION + 1)
+    monkeypatch.setattr(Database, "_half_apply", half_apply, raising=False)
     monkeypatch.setattr(
         Database,
         "MIGRATIONS",
-        (
-            (
-                2,
-                "add two columns, badly",
-                (
-                    "ALTER TABLE devices ADD COLUMN good TEXT",
-                    "ALTER TABLE nonexistent ADD COLUMN bad TEXT",
-                ),
-            ),
-        ),
+        ((SCHEMA_VERSION + 1, "add two columns, badly", "_half_apply"),),
     )
 
     with pytest.raises(MigrationFailed) as caught:
         Database(path)
 
     # The snapshot path survives to the caller, so an operator can recover.
-    assert caught.value.snapshot == path.with_name(f"{path.name}.v1.bak")
+    assert caught.value.snapshot == path.with_name(
+        f"{path.name}.v{SCHEMA_VERSION}.bak"
+    )
     assert caught.value.snapshot.exists()
     # Neither the first statement nor the version bump stuck.
-    assert _user_version(path) == 1
+    assert _user_version(path) == SCHEMA_VERSION
     connection = sqlite3.connect(path)
     try:
         names = {row[1] for row in connection.execute("PRAGMA table_info(devices)")}
         assert "good" not in names
     finally:
         connection.close()
+
+
+def test_a_fresh_database_is_stamped_rather_than_migrated(tmp_path):
+    """SCHEMA already built the current shape, so no step should replay on it.
+
+    The regression this guards: v2 adds ``messages.raw_pdu`` both in SCHEMA and
+    as an ADD COLUMN migration.  Replaying that against a table SCHEMA had just
+    created fails on a duplicate column — on every first start.
+    """
+    path = tmp_path / "hub.db"
+    database = Database(path)
+    try:
+        assert _user_version(path) == SCHEMA_VERSION
+        columns = {row["name"] for row in database.query("PRAGMA table_info(messages)")}
+        assert {"raw_pdu", "dcs", "is_binary"} <= columns
+    finally:
+        database.close()
+
+
+def test_the_v2_migration_is_idempotent_against_a_half_built_database(tmp_path):
+    """A table SCHEMA created fresh must not then be ALTERed for the same columns.
+
+    Not hypothetical, and this is the case that caught it: the pre-versioning
+    fixture writes today's SCHEMA minus one column, so its ``messages`` table
+    already carries ``raw_pdu``.  The database still reads as version 0 and
+    walks 0 -> 1 -> 2, and the v2 step has to notice the columns are present
+    instead of failing on a duplicate.
+    """
+    path = tmp_path / "hub.db"
+    _write_pre_radio_schema(path)
+    assert _user_version(path) == 0
+
+    database = Database(path)
+    try:
+        assert _user_version(path) == SCHEMA_VERSION
+        columns = {row["name"] for row in database.query("PRAGMA table_info(messages)")}
+        assert {"raw_pdu", "dcs", "is_binary"} <= columns
+        # The 0 -> 1 step still did its own job on the way through.
+        device_columns = {
+            row["name"] for row in database.query("PRAGMA table_info(devices)")
+        }
+        assert "radio_enabled" in device_columns
+    finally:
+        database.close()
+
+
+def test_an_upgrade_adds_the_diagnostic_columns_and_keeps_the_messages(tmp_path):
+    """The v1 -> v2 path on a database that already holds messages."""
+    path = tmp_path / "hub.db"
+    database = Database(path)
+    try:
+        database.insert_message(
+            agent_id="agent-a", device="a", direction="in", peer="10086",
+            body="验证码 1234", ts=utcnow(),
+        )
+    finally:
+        database.close()
+
+    # Rewind to v1 and drop the v2 columns, i.e. exactly a pre-upgrade file.
+    connection = sqlite3.connect(path)
+    try:
+        for column in ("raw_pdu", "dcs", "is_binary"):
+            connection.execute(f"ALTER TABLE messages DROP COLUMN {column}")
+        connection.execute("PRAGMA user_version = 1")
+        connection.commit()
+    finally:
+        connection.close()
+
+    database = Database(path)
+    try:
+        assert _user_version(path) == SCHEMA_VERSION
+        columns = {row["name"] for row in database.query("PRAGMA table_info(messages)")}
+        assert {"raw_pdu", "dcs", "is_binary"} <= columns
+        row = database.one("SELECT body, raw_pdu, dcs, is_binary FROM messages")
+        assert row["body"] == "验证码 1234"
+        # Existing rows get no PDU — it was never stored — but must read as text.
+        assert row["raw_pdu"] is None
+        assert row["is_binary"] == 0
+    finally:
+        database.close()
+
+    snapshot = path.with_name(f"{path.name}.v1.bak")
+    assert snapshot.exists(), "an upgrade of a populated database must snapshot it"
 
 
 def test_the_cli_reports_a_too_new_database_without_a_traceback(
