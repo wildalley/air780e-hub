@@ -454,8 +454,13 @@ def test_message_export_is_utf8_csv_with_intact_multiline_bodies(admin):
     rows = list(csv.reader(io.StringIO(response.content.decode("utf-8-sig"))))
     assert rows[0] == [
         "id", "ts", "direction", "sim_id", "sim_label", "peer", "body", "status",
+        "is_binary", "dcs", "raw_pdu",
     ]
     assert rows[1][5:7] == ["10086", body]
+    # New diagnostic columns are present; values are empty for a pre-upgrade row.
+    assert rows[1][8] == "0"    # is_binary
+    assert rows[1][9] == ""     # dcs (None → "")
+    assert rows[1][10] == ""    # raw_pdu (None → "")
 
 
 def test_message_list_total_uses_the_same_filters(admin):

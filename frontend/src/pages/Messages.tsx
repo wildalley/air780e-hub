@@ -636,6 +636,29 @@ function Bubble({
   const binary = Boolean(message.is_binary)
   const code = binary ? null : detectOtp(message.body)
   const [copied, setCopied] = useState(false)
+  const [pduCopied, setPduCopied] = useState(false)
+
+  /**
+   * The raw PDU is the only thing that can settle why a message decoded the way
+   * it did, and the modem's own copy is gone by the time anyone notices (the
+   * agent deletes after reading). One click beats DevTools or a SQL prompt.
+   */
+  const copyPdu = async () => {
+    if (!message.raw_pdu) return
+    const detail = [
+      `pdu=${message.raw_pdu}`,
+      `dcs=${message.dcs ?? '(未记录)'}`,
+      `binary=${binary ? 1 : 0}`,
+      `segments=${message.segments}`,
+    ].join('\n')
+    try {
+      await navigator.clipboard.writeText(detail)
+    } catch {
+      return
+    }
+    setPduCopied(true)
+    setTimeout(() => setPduCopied(false), 1200)
+  }
 
   const copy = async () => {
     if (!code) return
@@ -716,6 +739,21 @@ function Bubble({
               }}>
                 · {message.segments} 段
               </Typography>
+            )}
+            {message.raw_pdu && (
+              <Tooltip title={pduCopied ? '已复制' : '复制原始 PDU(排查用)'}>
+                <IconButton
+                  size="small"
+                  onClick={() => void copyPdu()}
+                  aria-label="复制原始 PDU"
+                >
+                  {pduCopied ? (
+                    <CheckIcon sx={{ fontSize: 14, color: STATUS.good }} />
+                  ) : (
+                    <DataIcon sx={{ fontSize: 14, opacity: 0.5 }} />
+                  )}
+                </IconButton>
+              </Tooltip>
             )}
             {failed && (
               <>

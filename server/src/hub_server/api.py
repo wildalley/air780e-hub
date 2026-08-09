@@ -544,6 +544,10 @@ def build_router(state: AppState) -> APIRouter:
             yield line([
                 "id", "ts", "direction", "sim_id", "sim_label", "peer",
                 "body", "status",
+                # The diagnostic trio. In the export because this is the one
+                # place an operator can hand a garbled message to someone who
+                # can read a PDU, without opening DevTools or a SQL prompt.
+                "is_binary", "dcs", "raw_pdu",
             ])
             for message in state.db.iter_messages(
                 limit=limit, sim_id=sim_id, peer=peer, search=search
@@ -557,6 +561,9 @@ def build_router(state: AppState) -> APIRouter:
                     message["peer"],
                     message["body"],
                     message["status"],
+                    message.get("is_binary") or 0,
+                    "" if message.get("dcs") is None else message["dcs"],
+                    message.get("raw_pdu") or "",
                 ])
 
         return StreamingResponse(
