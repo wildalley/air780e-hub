@@ -25,6 +25,7 @@
 - Agent 与 Server 双重检查 UDH 边界；giffgaff 等运营商发送的损坏 UDH 和空控制短信不再按 GSM-7 渲染成乱码，也不会进入通知渠道，滚动升级期间旧 Agent 的错误标记也会被 Server 纠正。
 - 迟到的临时 TP-ST 不再覆盖已保存的终态回执、状态码、时间或原始 PDU。
 - Server 不再先记录幂等标记、业务写入失败后仍确认事件；幂等标记与业务数据现同事务提交，失败整体回滚且不发送 ACK。Agent 收到 ACK 后会立即推进下一积压批次，不再每 200 条等待 5 秒。
+- Agent 在 Python 3.11 下不再因积压 ACK 唤醒与 WebSocket 断开同时发生而吞掉 sender 取消；链接会正常结束并进入重连，不会永久卡住。
 - `probe` 不再把 `ATI` 型号串重复显示成固件版本；普通检查和兼容性报告现分别读取 `AT+CGMI`、`AT+CGMM` 与 `AT+CGMR`。
 
 ### Upgrade Notes
