@@ -252,6 +252,11 @@ Air780E 发射瞬间电流可达约 2A。插主板前置 USB 口或无源 hub �
 
 按顺序走,每步确认再进行下一步:
 
+先用 `air780e-probe --report /tmp/air780e-compat.json` 生成默认脱敏的只读报告;它会
+自动记录发行版、内核、USB/ACM 接口和 `CGMI` / `CGMM` / `CGMR`,并区分
+ModemManager 未安装、已停止或正在运行。生产 Agent 已运行时须先按
+[兼容性矩阵](compatibility.md#生成脱敏报告)进入短维护窗口,避免两个进程抢串口。
+
 ```bash
 # 1. 枚举与固件类型
 dmesg | tail -30
@@ -281,4 +286,4 @@ mmcli -m 0 --messaging-list
 udevadm info -a /dev/ttyACM3 | grep -m3 KERNELS
 ```
 
-验证结果回填到本文档的「待验证」各处。
+验证结果回填到[硬件与系统兼容性矩阵](compatibility.md),再更新本文档的「待验证」项。

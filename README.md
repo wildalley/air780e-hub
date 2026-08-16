@@ -45,6 +45,7 @@
 - 短信、状态采样、日志、审计与已解决事件的分项保留期，SQLite 快照备份与恢复
 - Agent Token 支持带有限宽限期的在线轮换
 - 可调循环次数的断网重放、进程重启、重复事件、USB 重新枚举与自愈限频故障基线
+- 默认脱敏的只读兼容性报告，记录发行版、内核、USB/ACM 接口和真实固件版本
 - 响应式桌面和移动端界面，SIM 信息使用独立卡片管理，顶栏提供项目仓库入口
 
 ## 架构
@@ -179,6 +180,7 @@ npm run build
 - [发布清单](docs/release.md)
 - [短信性能基线](docs/performance.md)
 - [故障注入与恢复基线](docs/reliability.md)
+- [硬件与系统兼容性矩阵](docs/compatibility.md)
 - [变更日志](CHANGELOG.md)
 - [通知渠道与规则](docs/notify.md)
 - [Agent / Server 协议](docs/protocol.md)

@@ -22,6 +22,7 @@ air780e-hub 分为两个独立进程：
 
 **实机验证状态（0.1.0）**：仅一套环境跑通端到端 —— Arch Linux、Python 3.14、
 两个 Air780E（固件 `AirM2M_780EPV_V1011_LTE_AT`）、两张漫游 SIM。
+逐组合证据、验证等级和待扩充项见[硬件与系统兼容性矩阵](compatibility.md)。
 
 未实测但已按文档适配的部分：
 
@@ -320,6 +321,10 @@ Agent 可以按 IMEI 或 ICCID 自动发现模块，无需依赖不稳定的 `tt
 /opt/air780e-agent/.venv/bin/python -m air780e_agent.probe --scan
 /opt/air780e-agent/.venv/bin/python -m air780e_agent.probe /dev/ttyACM0
 ```
+
+需要归档发行版、内核、USB 接口和真实 `CGMR` 固件版本时,按
+[兼容性矩阵](compatibility.md#生成脱敏报告)在 Agent 停止的短维护窗口生成脱敏报告。
+报告不会读取或删除短信,但仍不能和正在占用串口的 Agent 并发运行。
 
 如果需要固定符号链接，可安装 udev 示例并在配置中显式设置 `port`。
 
