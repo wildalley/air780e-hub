@@ -11,7 +11,7 @@
 1. **许可证** —— [MIT](../LICENSE)；
 2. **发行方式** —— **源码构建 + GHCR 多架构镜像**。源码构建是参考路径，镜像是便利而非替代；只发 `X.Y.Z` 与 `X.Y` tag，不发可变 `latest`；
 3. **支持矩阵** —— 见 [deploy.md](deploy.md) §0。Python 3.11–3.14（CI 全覆盖）、Node 24 仅构建期、amd64 / arm64 镜像；实机验证只覆盖 Arch Linux + 固件 `V1011` 一套环境，Debian / Ubuntu 与 arm64 均未实测；
-4. **版本策略** —— 从 `0.1.0` 起遵循 SemVer，`0.x` 阶段不承诺向后兼容，**Agent 与 Server 必须同版本部署**。转入 `1.0.0` 的前置条件是 `schema_version` 顺序迁移、协议版本协商、Agent 版本上报三项完成，且支持矩阵至少覆盖两个发行版。
+4. **版本策略** —— 从 `0.1.0` 起遵循 SemVer，`0.x` 阶段不承诺向后兼容，**Agent 与 Server 必须同版本部署**。截至 2026-08-16，schema 顺序迁移、协议版本协商和 Agent 版本上报三个技术前提已经完成；转入 `1.0.0` 仍要求支持矩阵至少实测两个发行版，并完成一个真实保号周期的持续运行观察。
 
 结论已同步到 `README.md`、`CHANGELOG.md` 和 [deploy.md](deploy.md) §0。后续变更支持范围时，这四处要一并更新。
 
@@ -20,7 +20,7 @@
 在目标提交上确认 GitHub Actions 的 `CI` 和 `Security` 全部通过：
 
 - Agent / Server 的 ruff 检查；
-- Agent / Server 在 Python 3.11、3.12、3.13 上的测试；
+- Agent / Server 在 Python 3.11、3.12、3.13、3.14 上的测试；
 - 前端 `npm ci`、ESLint、Vitest 与生产构建；
 - `docker compose -f deploy/docker-compose.yml config --quiet`；
 - 本地 Markdown 链接检查；

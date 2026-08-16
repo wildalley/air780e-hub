@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi.testclient import TestClient
@@ -104,6 +105,18 @@ def test_there_is_no_password_free_mode(admin):
 
 def test_healthz_is_public(client):
     assert client.get("/healthz").json()["ok"] is True
+
+
+def test_calendar_today_uses_the_configured_timezone(tmp_path):
+    east = Settings(data_dir=tmp_path, timezone="Pacific/Kiritimati")
+    west = Settings(data_dir=tmp_path, timezone="Pacific/Pago_Pago")
+    assert east.calendar_today() == datetime.now(
+        ZoneInfo("Pacific/Kiritimati")
+    ).date()
+    assert west.calendar_today() == datetime.now(
+        ZoneInfo("Pacific/Pago_Pago")
+    ).date()
+    assert east.calendar_today() > west.calendar_today()
 
 
 def test_openapi_is_not_exposed(client):
@@ -1140,19 +1153,109 @@ def test_set_radio_requires_an_admin_session(client):
 # --------------------------------------------------------------------------
 
 
-def test_sim_can_be_labelled(admin):
+def test_sim_payg_details_and_lifecycle_dates_can_be_managed(admin):
     with _connect(admin) as ws:
         _greet(ws)
         ws.send_json({"type": "status", "seq": 1, "device": "a"})
         ws.receive_json()
 
     sim_id = admin.get("/api/sims").json()[0]["id"]
+    today = admin.app.state.hub.settings.calendar_today()
+    expiry = (today + timedelta(days=20)).isoformat()
+    activity_due = (today + timedelta(days=5)).isoformat()
     response = admin.patch(f"/api/sims/{sim_id}", json={
         "label": "移动主卡", "phone_number": "13800138000",
+        "billing_type": "payg", "plan_name": "30GB 月包",
+        "balance": "12.50", "low_balance_threshold": "10.00", "currency": "usd",
+        "expires_at": expiry, "activity_due_at": activity_due,
     })
     assert response.status_code == 200
     assert response.json()["label"] == "移动主卡"
     assert response.json()["phone_number"] == "13800138000"
+    assert response.json()["billing_type"] == "payg"
+    assert response.json()["plan_name"] == "30GB 月包"
+    assert response.json()["balance"] == "12.50"
+    assert response.json()["low_balance_threshold"] == "10.00"
+    assert response.json()["currency"] == "USD"
+    balance_updated_at = response.json()["balance_updated_at"]
+    assert datetime.fromisoformat(balance_updated_at).tzinfo is not None
+    assert response.json()["expires_at"] == expiry
+    assert response.json()["activity_due_at"] == activity_due
+
+    incidents = _items(admin.get("/api/operations/incidents"))
+    assert {incident["fingerprint"] for incident in incidents} == {
+        f"sim-expiry:{sim_id}",
+        f"sim-activity:{sim_id}",
+    }
+    by_fingerprint = {incident["fingerprint"]: incident for incident in incidents}
+    assert by_fingerprint[f"sim-expiry:{sim_id}"]["severity"] == "warning"
+    assert by_fingerprint[f"sim-activity:{sim_id}"]["kind"] == "sim_activity_due"
+    assert by_fingerprint[f"sim-activity:{sim_id}"]["severity"] == "critical"
+
+    unchanged = admin.patch(
+        f"/api/sims/{sim_id}", json={"balance": "12.50", "expires_at": None}
+    )
+    assert unchanged.status_code == 200
+    assert unchanged.json()["balance_updated_at"] == balance_updated_at
+    remaining = _items(admin.get("/api/operations/incidents"))
+    assert [incident["fingerprint"] for incident in remaining] == [
+        f"sim-activity:{sim_id}"
+    ]
+
+    low = admin.patch(f"/api/sims/{sim_id}", json={"balance": "8.00"})
+    assert low.status_code == 200
+    assert low.json()["balance"] == "8.00"
+    remaining = _items(admin.get("/api/operations/incidents"))
+    by_fingerprint = {incident["fingerprint"]: incident for incident in remaining}
+    assert set(by_fingerprint) == {
+        f"sim-activity:{sim_id}",
+        f"sim-balance:{sim_id}",
+    }
+    assert by_fingerprint[f"sim-balance:{sim_id}"]["kind"] == "sim_low_balance"
+    assert by_fingerprint[f"sim-balance:{sim_id}"]["severity"] == "warning"
+
+    cleared = admin.patch(
+        f"/api/sims/{sim_id}",
+        json={
+            "billing_type": None,
+            "plan_name": None,
+            "balance": None,
+            "low_balance_threshold": None,
+            "currency": None,
+            "activity_due_at": None,
+        },
+    )
+    assert cleared.status_code == 200
+    assert cleared.json()["billing_type"] == "unknown"
+    assert cleared.json()["plan_name"] == ""
+    assert cleared.json()["balance"] is None
+    assert cleared.json()["low_balance_threshold"] is None
+    assert cleared.json()["currency"] == ""
+    assert cleared.json()["balance_updated_at"] is None
+    assert cleared.json()["expires_at"] is None
+    assert cleared.json()["activity_due_at"] is None
+    assert _items(admin.get("/api/operations/incidents")) == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "unchanged"),
+    (
+        ("expires_at", "2026-02-30", None),
+        ("activity_due_at", "2026-02-30", None),
+        ("balance", "1e3", None),
+        ("low_balance_threshold", "-1.00", None),
+        ("currency", "US", ""),
+        ("billing_type", "metered", "unknown"),
+    ),
+)
+def test_sim_billing_rejects_invalid_values(admin, field, value, unchanged):
+    with _connect(admin) as ws:
+        _greet(ws)
+
+    sim_id = admin.get("/api/sims").json()[0]["id"]
+    response = admin.patch(f"/api/sims/{sim_id}", json={field: value})
+    assert response.status_code == 422
+    assert admin.get("/api/sims").json()[0][field] == unchanged
 
 
 def test_channel_and_rule_crud(admin):

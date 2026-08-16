@@ -9,7 +9,9 @@ from __future__ import annotations
 import os
 import secrets
 from dataclasses import dataclass
+from datetime import UTC, date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 class ConfigError(Exception):
@@ -92,6 +94,14 @@ class Settings:
     @property
     def token_path(self) -> Path:
         return self.data_dir / "agent_token"
+
+    def calendar_today(self) -> date:
+        """Current calendar date in the operator-configured timezone."""
+        try:
+            timezone = ZoneInfo(self.timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            timezone = UTC
+        return datetime.now(timezone).date()
 
     @classmethod
     def from_env(cls) -> Settings:

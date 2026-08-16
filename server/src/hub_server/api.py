@@ -17,7 +17,7 @@ import shutil
 import tempfile
 import time
 from collections.abc import Iterable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
@@ -184,6 +184,23 @@ class RadioBody(BaseModel):
 class SimPatch(BaseModel):
     label: str | None = None
     phone_number: str | None = None
+    billing_type: Literal["unknown", "payg", "prepaid", "postpaid"] | None = None
+    plan_name: str | None = Field(default=None, max_length=128)
+    balance: str | None = Field(
+        default=None,
+        max_length=32,
+        pattern=r"^-?\d+(?:\.\d{1,6})?$",
+    )
+    low_balance_threshold: str | None = Field(
+        default=None,
+        max_length=32,
+        pattern=r"^\d+(?:\.\d{1,6})?$",
+    )
+    currency: str | None = Field(
+        default=None, max_length=3, pattern=r"^(?:[A-Za-z]{3})?$"
+    )
+    expires_at: date | None = None
+    activity_due_at: date | None = None
     note: str | None = None
 
 
@@ -449,16 +466,37 @@ def build_router(state: AppState) -> APIRouter:
 
     @router.patch("/sims/{sim_id}", dependencies=guard)
     def patch_sim(sim_id: int, body: SimPatch) -> dict[str, Any]:
-        fields = {k: v for k, v in body.model_dump().items() if v is not None}
+        current = state.db.one(
+            "SELECT id, balance FROM sims WHERE id = ?", (sim_id,)
+        )
+        if current is None:
+            raise HTTPException(status_code=404, detail="no such SIM")
+
+        fields = body.model_dump(exclude_unset=True)
         if not fields:
             raise HTTPException(status_code=400, detail="nothing to update")
+        for key in ("label", "phone_number", "plan_name", "currency", "note"):
+            if key in fields and fields[key] is None:
+                fields[key] = ""
+        if "billing_type" in fields and fields["billing_type"] is None:
+            fields["billing_type"] = "unknown"
+        if "currency" in fields:
+            fields["currency"] = fields["currency"].upper()
+        if "balance" in fields:
+            if fields["balance"] is None:
+                fields["balance_updated_at"] = None
+            elif fields["balance"] != current["balance"]:
+                fields["balance_updated_at"] = utcnow()
+        for key in ("expires_at", "activity_due_at"):
+            if isinstance(fields.get(key), date):
+                fields[key] = fields[key].isoformat()
         assignments = ",".join(f"{key} = :{key}" for key in fields)
         state.db.execute(
             f"UPDATE sims SET {assignments} WHERE id = :id", {**fields, "id": sim_id}
         )
+        state.db.reconcile_sim_incidents(state.settings.calendar_today())
         row = state.db.one("SELECT * FROM sims WHERE id = ?", (sim_id,))
-        if row is None:
-            raise HTTPException(status_code=404, detail="no such SIM")
+        assert row is not None
         return row
 
     # -- messages ----------------------------------------------------------

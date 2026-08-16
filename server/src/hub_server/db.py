@@ -18,7 +18,8 @@ import logging
 import sqlite3
 import threading
 from collections.abc import Callable, Iterable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +36,7 @@ log = logging.getLogger(__name__)
 # Version 3 records the Agent/Server WebSocket protocol version.
 # Version 4 adds per-segment SMS delivery reports.
 # Version 5 reclassifies stored data PDUs that predate the current checks.
+# Version 6 adds structured SIM billing and lifecycle dates used for reminders.
 #
 # To add a migration: append one entry to ``MIGRATIONS`` with the next integer
 # and bump this constant, and add the same columns/tables to SCHEMA so a brand
@@ -44,7 +46,7 @@ log = logging.getLogger(__name__)
 # Never renumber or edit a released entry — a database that already ran it will
 # not run it again, so an edit only affects databases that have not, and the two
 # then disagree about what version N means.
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # Persisted (settings table) key for the SMS retention window, in days.  The
 # operator edits it on the Notify page; when unset the env default applies.
@@ -97,6 +99,14 @@ CREATE TABLE IF NOT EXISTS sims (
     iccid         TEXT UNIQUE NOT NULL,
     label         TEXT NOT NULL DEFAULT '',
     phone_number  TEXT NOT NULL DEFAULT '',
+    billing_type  TEXT NOT NULL DEFAULT 'unknown',
+    plan_name     TEXT NOT NULL DEFAULT '',
+    balance       TEXT,
+    low_balance_threshold TEXT,
+    currency      TEXT NOT NULL DEFAULT '',
+    balance_updated_at TEXT,
+    expires_at    TEXT,
+    activity_due_at TEXT,
     operator      TEXT NOT NULL DEFAULT '',
     smsc          TEXT NOT NULL DEFAULT '',
     note          TEXT NOT NULL DEFAULT '',
@@ -521,6 +531,8 @@ class Database:
          "_migration_sms_delivery_segments"),
         (5, "reclassify stored data-message PDUs",
          "_migration_data_messages"),
+        (6, "record SIM billing details and lifecycle dates",
+         "_migration_sim_lifecycle"),
     )
 
     def _add_columns_if_missing(self, table: str, columns: dict[str, str]) -> None:
@@ -608,6 +620,22 @@ class Database:
                     "UPDATE messages SET is_binary = 1 WHERE id = ?", malformed
                 )
             last_id = int(rows[-1]["id"])
+
+    def _migration_sim_lifecycle(self) -> None:
+        """v5 -> v6: operator-maintained billing and renewal information."""
+        self._add_columns_if_missing(
+            "sims",
+            {
+                "billing_type": "TEXT NOT NULL DEFAULT 'unknown'",
+                "plan_name": "TEXT NOT NULL DEFAULT ''",
+                "balance": "TEXT",
+                "low_balance_threshold": "TEXT",
+                "currency": "TEXT NOT NULL DEFAULT ''",
+                "balance_updated_at": "TEXT",
+                "expires_at": "TEXT",
+                "activity_due_at": "TEXT",
+            },
+        )
 
     def _snapshot_before_migration(self, from_version: int) -> Path | None:
         """Copy the database aside before migrating it.
@@ -805,6 +833,175 @@ class Database:
                 "SELECT id FROM sims WHERE iccid = ?", (iccid,)
             ).fetchone()
         return int(row["id"]) if row else None
+
+    def reconcile_sim_incidents(self, today: date) -> None:
+        """Reconcile balance, package-expiry, and keep-alive incidents.
+
+        Values are deliberately operator-maintained. Carrier APIs, SMS, and
+        USSD responses vary too much to turn into billing state without a
+        provider-specific integration.
+        """
+        sims = self.query(
+            "SELECT id, iccid, label, phone_number, plan_name, balance, "
+            "low_balance_threshold, currency, expires_at, activity_due_at FROM sims"
+        )
+        for sim in sims:
+            display = (
+                sim["label"]
+                or sim["phone_number"]
+                or f"尾号 {sim['iccid'][-4:]}"
+            )
+            source = f"SIM {display}"
+            plan = sim["plan_name"] or "未命名套餐"
+            self._reconcile_sim_balance(sim=sim, source=source)
+            self._reconcile_sim_deadline(
+                sim_id=sim["id"],
+                source=source,
+                value=sim["expires_at"],
+                today=today,
+                fingerprint_prefix="sim-expiry",
+                kind="sim_expiring",
+                subject="套餐",
+                date_label="套餐到期日",
+                context=f"{plan}；",
+                action="请及时续费并更新套餐到期日。",
+            )
+            self._reconcile_sim_deadline(
+                sim_id=sim["id"],
+                source=source,
+                value=sim["activity_due_at"],
+                today=today,
+                fingerprint_prefix="sim-activity",
+                kind="sim_activity_due",
+                subject="保号期限",
+                date_label="保号截止日",
+                context="",
+                action="请按运营商规则产生有效活动，并更新保号截止日。",
+            )
+
+    def _reconcile_sim_balance(self, *, sim: dict[str, Any], source: str) -> None:
+        """Open or resolve the low-balance incident for one SIM."""
+        fingerprint = f"sim-balance:{sim['id']}"
+        balance_value = sim["balance"]
+        threshold_value = sim["low_balance_threshold"]
+        if balance_value is None:
+            self.resolve_incident(
+                fingerprint, detail="SIM 余额已清空，低余额提醒已关闭"
+            )
+            return
+        if threshold_value is None:
+            self.resolve_incident(
+                fingerprint, detail="SIM 低余额阈值已清空，提醒已关闭"
+            )
+            return
+
+        try:
+            balance = Decimal(balance_value)
+            threshold = Decimal(threshold_value)
+            if not balance.is_finite() or not threshold.is_finite() or threshold < 0:
+                raise InvalidOperation
+        except (InvalidOperation, TypeError, ValueError):
+            log.warning(
+                "SIM %s has invalid balance data: balance=%r threshold=%r",
+                sim["id"],
+                balance_value,
+                threshold_value,
+            )
+            self.resolve_incident(
+                fingerprint, detail="SIM 余额或低余额阈值格式无效，提醒已关闭"
+            )
+            return
+
+        currency = sim["currency"]
+        current = f"{currency} {balance_value}".strip()
+        threshold_display = f"{currency} {threshold_value}".strip()
+        if balance > threshold:
+            self.resolve_incident(
+                fingerprint, detail=f"SIM 余额已恢复至 {current}"
+            )
+            return
+
+        if balance < 0:
+            severity = "critical"
+            title = f"{source} 余额为负"
+        elif balance == 0:
+            severity = "critical"
+            title = f"{source} 余额已用尽"
+        else:
+            severity = "warning"
+            title = f"{source} 余额不足"
+
+        self.open_incident(
+            fingerprint,
+            kind="sim_low_balance",
+            severity=severity,
+            source=source,
+            title=title,
+            detail=(
+                f"当前余额 {current}，低余额阈值 {threshold_display}。"
+                "请及时充值并更新余额。"
+            ),
+        )
+
+    def _reconcile_sim_deadline(
+        self,
+        *,
+        sim_id: int,
+        source: str,
+        value: str | None,
+        today: date,
+        fingerprint_prefix: str,
+        kind: str,
+        subject: str,
+        date_label: str,
+        context: str,
+        action: str,
+    ) -> None:
+        """Apply the shared 30/7-day policy to one SIM lifecycle date."""
+        fingerprint = f"{fingerprint_prefix}:{sim_id}"
+        if not value:
+            self.resolve_incident(
+                fingerprint, detail=f"SIM {date_label}已清空，提醒已关闭"
+            )
+            return
+
+        try:
+            deadline = date.fromisoformat(value)
+        except (TypeError, ValueError):
+            log.warning("SIM %s has an invalid %s: %r", sim_id, date_label, value)
+            self.resolve_incident(
+                fingerprint, detail=f"SIM {date_label}格式无效，提醒已关闭"
+            )
+            return
+
+        days = (deadline - today).days
+        if days > 30:
+            self.resolve_incident(
+                fingerprint, detail=f"SIM {date_label}已更新至 {value}"
+            )
+            return
+
+        if days < 0:
+            severity = "critical"
+            title = f"{source} {subject}已过期"
+            timing = f"已过期 {-days} 天"
+        elif days == 0:
+            severity = "critical"
+            title = f"{source} {subject}今天到期"
+            timing = "今天到期"
+        else:
+            severity = "critical" if days <= 7 else "warning"
+            title = f"{source} {subject}即将到期"
+            timing = f"还有 {days} 天到期"
+
+        self.open_incident(
+            fingerprint,
+            kind=kind,
+            severity=severity,
+            source=source,
+            title=title,
+            detail=f"{context}{date_label} {value}，{timing}。{action}",
+        )
 
     # Fields a status event may legitimately set to a falsy value (0 signal,
     # offline, empty store) — absence of the key is what means "unchanged".

@@ -117,11 +117,21 @@ export interface Device {
   phone_number?: string
 }
 
+export type SimBillingType = 'unknown' | 'payg' | 'prepaid' | 'postpaid'
+
 export interface Sim {
   id: number
   iccid: string
   label: string
   phone_number: string
+  billing_type: SimBillingType
+  plan_name: string
+  balance: string | null
+  low_balance_threshold: string | null
+  currency: string
+  balance_updated_at: string | null
+  expires_at: string | null
+  activity_due_at: string | null
   operator: string
   smsc: string
   note: string
@@ -450,7 +460,24 @@ export const api = {
   },
   sims: {
     list: () => get<Sim[]>('/api/sims'),
-    patch: (id: number, body: Partial<Pick<Sim, 'label' | 'phone_number' | 'note'>>) =>
+    patch: (
+      id: number,
+      body: Partial<
+        Pick<
+          Sim,
+          | 'label'
+          | 'phone_number'
+          | 'billing_type'
+          | 'plan_name'
+          | 'balance'
+          | 'low_balance_threshold'
+          | 'currency'
+          | 'expires_at'
+          | 'activity_due_at'
+          | 'note'
+        >
+      >,
+    ) =>
       patch<Sim>(`/api/sims/${id}`, body),
   },
   messages: {

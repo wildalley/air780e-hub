@@ -92,7 +92,7 @@ class AuditMiddleware:
 
 
 async def _housekeeping(state: AppState) -> None:
-    """Enforce retention.  Verification codes should not pile up forever."""
+    """Enforce retention and keep calendar-based incidents current."""
     while True:
         await asyncio.sleep(PURGE_INTERVAL)
         try:
@@ -105,6 +105,9 @@ async def _housekeeping(state: AppState) -> None:
                 audit_max_rows=state.settings.audit_max_rows,
             )
             state.auth.purge_expired_sessions()
+            state.db.reconcile_sim_incidents(
+                state.settings.calendar_today()
+            )
             if any(removed.values()):
                 log.info("housekeeping removed %s", removed)
         except Exception:
@@ -117,6 +120,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        try:
+            state.db.reconcile_sim_incidents(
+                state.settings.calendar_today()
+            )
+        except Exception:
+            log.exception("initial SIM incident reconciliation failed")
         task = asyncio.create_task(_housekeeping(state), name="housekeeping")
         try:
             yield

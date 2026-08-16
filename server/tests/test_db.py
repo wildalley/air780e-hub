@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import date
 
 import pytest
 
@@ -322,6 +323,19 @@ def test_a_fresh_database_is_stamped_rather_than_migrated(tmp_path):
             "message_id", "modem_reference", "status_code", "service_center_ts",
             "discharge_ts", "raw_pdu",
         } <= delivery_columns
+        sim_columns = {
+            row["name"] for row in database.query("PRAGMA table_info(sims)")
+        }
+        assert {
+            "billing_type",
+            "plan_name",
+            "balance",
+            "low_balance_threshold",
+            "currency",
+            "balance_updated_at",
+            "expires_at",
+            "activity_due_at",
+        } <= sim_columns
     finally:
         database.close()
 
@@ -488,6 +502,209 @@ def test_v4_upgrade_reclassifies_stored_data_pdus(tmp_path):
         ).fetchone() == (0,)
     finally:
         snapshot.close()
+
+
+def test_v5_upgrade_adds_sim_billing_fields_and_keeps_sims(tmp_path):
+    path = tmp_path / "hub.db"
+    database = Database(path)
+    sim_id = database.upsert_sim("8986000000000000001", operator="中国移动")
+    database.execute("UPDATE sims SET label = '主卡' WHERE id = ?", (sim_id,))
+    database.close()
+
+    connection = sqlite3.connect(path)
+    try:
+        for column in (
+            "activity_due_at",
+            "expires_at",
+            "balance_updated_at",
+            "currency",
+            "low_balance_threshold",
+            "balance",
+            "plan_name",
+            "billing_type",
+        ):
+            connection.execute(f"ALTER TABLE sims DROP COLUMN {column}")
+        connection.execute("PRAGMA user_version = 5")
+        connection.commit()
+    finally:
+        connection.close()
+
+    database = Database(path)
+    try:
+        assert _user_version(path) == SCHEMA_VERSION
+        row = database.one(
+            "SELECT iccid, label, billing_type, plan_name, balance, "
+            "low_balance_threshold, currency, balance_updated_at, expires_at, "
+            "activity_due_at FROM sims WHERE id = ?",
+            (sim_id,),
+        )
+        assert row == {
+            "iccid": "8986000000000000001",
+            "label": "主卡",
+            "billing_type": "unknown",
+            "plan_name": "",
+            "balance": None,
+            "low_balance_threshold": None,
+            "currency": "",
+            "balance_updated_at": None,
+            "expires_at": None,
+            "activity_due_at": None,
+        }
+    finally:
+        database.close()
+
+    snapshot = sqlite3.connect(path.with_name(f"{path.name}.v5.bak"))
+    try:
+        columns = {row[1] for row in snapshot.execute("PRAGMA table_info(sims)")}
+        assert not {
+            "billing_type",
+            "plan_name",
+            "balance",
+            "low_balance_threshold",
+            "currency",
+            "balance_updated_at",
+            "expires_at",
+            "activity_due_at",
+        } & columns
+    finally:
+        snapshot.close()
+
+
+def test_sim_lifecycle_incidents_warn_escalate_and_resolve_independently(tmp_path):
+    database = Database(tmp_path / "hub.db")
+    today = date(2026, 8, 16)
+    try:
+        warning_id = database.upsert_sim("8986000000000000001")
+        critical_id = database.upsert_sim("8986000000000000002")
+        overdue_id = database.upsert_sim("8986000000000000003")
+        database.execute(
+            "UPDATE sims SET label = ?, plan_name = ?, expires_at = ?, "
+            "activity_due_at = ? WHERE id = ?",
+            ("主卡", "30GB 月包", "2026-09-15", "2026-08-21", warning_id),
+        )
+        database.execute(
+            "UPDATE sims SET phone_number = ?, expires_at = ? WHERE id = ?",
+            ("13800138000", "2026-08-23", critical_id),
+        )
+        database.execute(
+            "UPDATE sims SET expires_at = ? WHERE id = ?",
+            ("2026-08-15", overdue_id),
+        )
+
+        database.reconcile_sim_incidents(today)
+        incidents = {
+            row["fingerprint"]: row
+            for row in database.query("SELECT * FROM incidents ORDER BY id")
+        }
+        warning = incidents[f"sim-expiry:{warning_id}"]
+        assert warning["kind"] == "sim_expiring"
+        assert warning["severity"] == "warning"
+        assert warning["source"] == "SIM 主卡"
+        assert "30GB 月包" in warning["detail"]
+        assert "还有 30 天" in warning["detail"]
+
+        activity = incidents[f"sim-activity:{warning_id}"]
+        assert activity["kind"] == "sim_activity_due"
+        assert activity["severity"] == "critical"
+        assert activity["source"] == "SIM 主卡"
+        assert "保号截止日 2026-08-21" in activity["detail"]
+        assert "还有 5 天" in activity["detail"]
+
+        critical = incidents[f"sim-expiry:{critical_id}"]
+        assert critical["severity"] == "critical"
+        assert "还有 7 天" in critical["detail"]
+
+        overdue = incidents[f"sim-expiry:{overdue_id}"]
+        assert overdue["severity"] == "critical"
+        assert "已过期 1 天" in overdue["detail"]
+
+        database.execute(
+            "UPDATE sims SET expires_at = ? WHERE id = ?",
+            ("2026-09-16", warning_id),
+        )
+        database.execute(
+            "UPDATE sims SET expires_at = NULL WHERE id = ?", (critical_id,)
+        )
+        database.reconcile_sim_incidents(today)
+
+        statuses = {
+            row["fingerprint"]: row["status"]
+            for row in database.query("SELECT fingerprint, status FROM incidents")
+        }
+        assert statuses[f"sim-expiry:{warning_id}"] == "resolved"
+        assert statuses[f"sim-activity:{warning_id}"] == "active"
+        assert statuses[f"sim-expiry:{critical_id}"] == "resolved"
+        assert statuses[f"sim-expiry:{overdue_id}"] == "active"
+
+        database.execute(
+            "UPDATE sims SET activity_due_at = NULL WHERE id = ?", (warning_id,)
+        )
+        database.reconcile_sim_incidents(today)
+        assert database.one(
+            "SELECT status FROM incidents WHERE fingerprint = ?",
+            (f"sim-activity:{warning_id}",),
+        )["status"] == "resolved"
+    finally:
+        database.close()
+
+
+def test_sim_low_balance_incident_warns_escalates_and_resolves(tmp_path):
+    database = Database(tmp_path / "hub.db")
+    today = date(2026, 8, 16)
+    try:
+        sim_id = database.upsert_sim("8944100000000000001")
+        database.execute(
+            "UPDATE sims SET label = ?, balance = ?, low_balance_threshold = ?, "
+            "currency = ? WHERE id = ?",
+            ("英国 PAYG", "5.50", "10.00", "GBP", sim_id),
+        )
+        database.reconcile_sim_incidents(today)
+
+        incident = database.one(
+            "SELECT * FROM incidents WHERE fingerprint = ?",
+            (f"sim-balance:{sim_id}",),
+        )
+        assert incident["kind"] == "sim_low_balance"
+        assert incident["severity"] == "warning"
+        assert incident["source"] == "SIM 英国 PAYG"
+        assert "当前余额 GBP 5.50" in incident["detail"]
+        assert "低余额阈值 GBP 10.00" in incident["detail"]
+
+        database.execute(
+            "UPDATE sims SET balance = ? WHERE id = ?", ("-0.01", sim_id)
+        )
+        database.reconcile_sim_incidents(today)
+        incident = database.one(
+            "SELECT * FROM incidents WHERE fingerprint = ?",
+            (f"sim-balance:{sim_id}",),
+        )
+        assert incident["severity"] == "critical"
+        assert incident["title"] == "SIM 英国 PAYG 余额为负"
+
+        database.execute(
+            "UPDATE sims SET balance = ? WHERE id = ?", ("25.00", sim_id)
+        )
+        database.reconcile_sim_incidents(today)
+        assert database.one(
+            "SELECT status FROM incidents WHERE fingerprint = ?",
+            (f"sim-balance:{sim_id}",),
+        )["status"] == "resolved"
+
+        database.execute(
+            "UPDATE sims SET balance = ?, low_balance_threshold = ? WHERE id = ?",
+            ("5.00", "10.00", sim_id),
+        )
+        database.reconcile_sim_incidents(today)
+        database.execute(
+            "UPDATE sims SET low_balance_threshold = NULL WHERE id = ?", (sim_id,)
+        )
+        database.reconcile_sim_incidents(today)
+        assert database.one(
+            "SELECT status FROM incidents WHERE fingerprint = ?",
+            (f"sim-balance:{sim_id}",),
+        )["status"] == "resolved"
+    finally:
+        database.close()
 
 
 def test_the_cli_reports_a_too_new_database_without_a_traceback(
