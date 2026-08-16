@@ -44,6 +44,7 @@
 - 模块离线、网络未注册、短信发送失败、保号任务失败、通知投递失败及 SIM 低余额/套餐/保号期限事件，可确认、手动解决并在恢复后自动关闭
 - 短信、状态采样、日志、审计与已解决事件的分项保留期，SQLite 快照备份与恢复
 - Agent Token 支持带有限宽限期的在线轮换
+- 可调循环次数的断网重放、进程重启、重复事件、USB 重新枚举与自愈限频故障基线
 - 响应式桌面和移动端界面，SIM 信息使用独立卡片管理，顶栏提供项目仓库入口
 
 ## 架构
@@ -177,6 +178,7 @@ npm run build
 - [部署指南](docs/deploy.md)
 - [发布清单](docs/release.md)
 - [短信性能基线](docs/performance.md)
+- [故障注入与恢复基线](docs/reliability.md)
 - [变更日志](CHANGELOG.md)
 - [通知渠道与规则](docs/notify.md)
 - [Agent / Server 协议](docs/protocol.md)
