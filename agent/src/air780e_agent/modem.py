@@ -87,6 +87,9 @@ def _declared_octets(header: str) -> int | None:
 @dataclass
 class ModemInfo:
     model: str = ""
+    manufacturer: str = ""
+    hardware_model: str = ""
+    firmware: str = ""
     imei: str = ""
     iccid: str = ""
     smsc: str = ""
@@ -215,6 +218,9 @@ class Air780E:
             return response.lines[0] if response.lines else None
 
         info.model = await quiet("ATI") or ""
+        info.manufacturer = await quiet("AT+CGMI") or ""
+        info.hardware_model = await quiet("AT+CGMM") or ""
+        info.firmware = await quiet("AT+CGMR") or ""
         info.imei = await quiet("AT+CGSN") or ""
 
         iccid = await quiet("AT+ICCID")

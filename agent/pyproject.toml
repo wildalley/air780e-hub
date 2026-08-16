@@ -17,6 +17,7 @@ dev = [
 
 [project.scripts]
 air780e-agent = "air780e_agent.cli:main"
+air780e-probe = "air780e_agent.probe:main"
 
 [build-system]
 requires = ["hatchling"]

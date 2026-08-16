@@ -7,6 +7,7 @@ Doubles as the hardware bring-up tool: the checklist in
     python -m air780e_agent.probe /dev/ttyACM3 --listen
     python -m air780e_agent.probe /dev/ttyACM3 --send 10086 CXHF
     python -m air780e_agent.probe --scan          # try every /dev/ttyACM*
+    air780e-probe --report /tmp/air780e-compat.json
 """
 
 from __future__ import annotations
@@ -14,10 +15,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import glob
+import json
 import logging
 import sys
+from pathlib import Path
 
 from .at import ATClient, ATError, SerialTransport
+from .compat import DEFAULT_PORT_PATTERN, build_compatibility_report
 from .modem import Air780E
 from .pdu import DecodedSms
 
@@ -40,7 +44,7 @@ async def _identify(port: str, timeout: float = 3.0) -> str | None:
         await client.close()
 
 
-async def scan(pattern: str = "/dev/ttyACM*") -> None:
+async def scan(pattern: str = DEFAULT_PORT_PATTERN) -> None:
     ports = sorted(glob.glob(pattern))
     if not ports:
         print(f"no ports matched {pattern}")
@@ -87,8 +91,11 @@ async def inspect(port: str, *, listen: bool, send: tuple[str, str] | None) -> i
     used, capacity = await modem.storage_usage()
 
     print(f"port        {port}")
-    print(f"model       {info.model}")
-    print(f"firmware    {info.model}")
+    print(f"manufacturer {info.manufacturer or '(unavailable)'}")
+    print(f"model       {info.hardware_model or info.model}")
+    print(f"firmware    {info.firmware or '(unavailable)'}")
+    if info.model and info.model != info.hardware_model:
+        print(f"ATI         {info.model}")
     print(f"IMEI        {info.imei or '(unavailable)'}")
     print(f"ICCID       {info.iccid or '(no SIM?)'}")
     print(f"SMSC        {info.smsc or '(unset — sending will fail)'}")
@@ -139,6 +146,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("port", nargs="?", help="serial device, e.g. /dev/ttyACM3")
     parser.add_argument("--scan", action="store_true",
                         help="try every /dev/ttyACM* and report which speaks AT")
+    parser.add_argument(
+        "--report",
+        metavar="PATH",
+        help="write a redacted, read-only compatibility JSON report ('-' for stdout)",
+    )
+    parser.add_argument(
+        "--pattern",
+        default=DEFAULT_PORT_PATTERN,
+        help=f"serial glob used by --scan/--report (default: {DEFAULT_PORT_PATTERN})",
+    )
     parser.add_argument("--listen", action="store_true",
                         help="stay attached and print incoming messages")
     parser.add_argument("--send", nargs=2, metavar=("NUMBER", "TEXT"),
@@ -151,11 +168,32 @@ def main(argv: list[str] | None = None) -> int:
         format="%(levelname)s %(name)s %(message)s",
     )
 
+    if args.report:
+        ports = [args.port] if args.port else None
+        report = asyncio.run(
+            build_compatibility_report(pattern=args.pattern, ports=ports)
+        )
+        rendered = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        if args.report == "-":
+            print(rendered, end="")
+        else:
+            try:
+                Path(args.report).write_text(rendered, encoding="utf-8")
+            except OSError as exc:
+                print(f"cannot write {args.report}: {exc}", file=sys.stderr)
+                return 1
+            summary = report["summary"]
+            print(
+                f"wrote {args.report}: {summary['at_ports']} AT port(s), "
+                f"{summary['usb_devices']} USB device(s)"
+            )
+        return 0 if report["summary"]["validation_ready"] else 1
+
     if args.scan or not args.port:
         if not args.scan:
             parser.print_help()
             return 2
-        asyncio.run(scan())
+        asyncio.run(scan(args.pattern))
         return 0
 
     send = tuple(args.send) if args.send else None

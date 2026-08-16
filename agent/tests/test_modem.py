@@ -19,6 +19,9 @@ from air780e_agent.modem import Air780E, Signal
 
 async def test_initialize_reads_identity(modem, rig):
     assert modem.info.model == rig.mock.model
+    assert modem.info.manufacturer == rig.mock.manufacturer
+    assert modem.info.hardware_model == rig.mock.hardware_model
+    assert modem.info.firmware == rig.mock.firmware
     assert modem.info.imei == rig.mock.imei
     assert modem.info.iccid == rig.mock.iccid
     assert modem.info.smsc == rig.mock.smsc

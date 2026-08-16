@@ -52,6 +52,9 @@ class MockAir780E:
     transport: Transport
 
     model: str = DEFAULT_MODEL
+    manufacturer: str = "AirM2M"
+    hardware_model: str = "Air780EPV"
+    firmware: str = "V1011"
     imei: str = "867567048825499"
     iccid: str = "89860622180012345678"
     smsc: str = "+8613800210500"
@@ -217,6 +220,10 @@ class MockAir780E:
             return self._reply()
         if upper == "ATI":
             return self._reply([self.model])
+        if upper == "AT+CGMI":
+            return self._reply([self.manufacturer])
+        if upper == "AT+CGMM":
+            return self._reply([self.hardware_model])
         if upper in ("ATE0", "ATE1"):
             self._echo = upper.endswith("1")
             return self._reply()
@@ -267,7 +274,7 @@ class MockAir780E:
         if upper == "AT+CGSN":
             return self._reply([self.imei])
         if upper == "AT+CGMR":
-            return self._reply([self.model])
+            return self._reply([self.firmware])
         if upper == "AT+CSCA?":
             return self._reply([f'+CSCA: "{self.smsc}",145'])
         if upper == "AT+CBC":
