@@ -136,3 +136,15 @@ describe('paged list endpoints', () => {
     expect(page.total).toBe(4231)
   })
 })
+
+describe('message content filters', () => {
+  it('forwards data filters to list and conversations', async () => {
+    const spy = mockFetch({ json: async () => ({ items: [], total: 0 }) })
+    await api.messages.list({ content: 'data' })
+    expect(spy.mock.calls[0][0]).toBe('/api/messages?content=data')
+
+    spy.mockClear()
+    await api.messages.conversations('text')
+    expect(spy.mock.calls[0][0]).toBe('/api/conversations?content=text')
+  })
+})

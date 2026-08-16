@@ -43,6 +43,9 @@ class _Partial:
             alphabet=head.alphabet,
             concat=head.concat,
             raw=" ".join(p.raw for p in ordered),
+            ports=next((part.ports for part in ordered if part.ports is not None), None),
+            udh_malformed=any(part.udh_malformed for part in ordered),
+            pid=head.pid,
         )
 
 

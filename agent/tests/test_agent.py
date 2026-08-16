@@ -330,6 +330,12 @@ async def test_send_sms_command(agent):
     assert out["status"] == "sent"
     assert out["cmd_id"] == "c-1"
 
+    reference = out["refs"][0]
+    agent.mocks["a"].report_delivery(reference, "10086")
+    deliveries = await agent.wait_for_events("sms_delivery", 1)
+    assert deliveries[-1].payload["reference"] == reference
+    assert deliveries[-1].payload["status"] == "delivered"
+
 
 async def test_send_sms_failure_is_reported(agent):
     await agent.wait_online()

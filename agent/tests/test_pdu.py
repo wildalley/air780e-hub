@@ -16,7 +16,9 @@ from air780e_agent.pdu import (
     Reassembler,
     alphabet_from_dcs,
     decode_pdu,
+    decode_status_report,
     encode_deliver,
+    encode_status_report,
     encode_submit,
     gsm7,
 )
@@ -27,6 +29,33 @@ DELIVER_HOW_ARE_YOU = (
     "07911326040000F0040B911346610089F6"
     "0000208062917314080CC8F71D14969741F977FD07"
 )
+
+# Three giffgaff data messages seen on a real modem.  Each claims GSM-7 text and
+# sets TP-UDHI, but its first information element runs past the declared header.
+# Treating bytes after that untrustworthy boundary as text is what produced the
+# visible wall of mojibake.
+DELIVER_GIFFGAFF_MALFORMED_UDH = (
+    (
+        "0791448720003023440ED0E7B4D97C0E9BCDCF0016A81D7687CF65A01C5E7693D3EE330B34BFA7E9"
+        "6334C8FDA6A7CDE971989E7EBBE7A0B7FBC0369B416F39885E97BB41F277B89D769F416FB3199476"
+        "83F2EFBA1C141E8FDF75375D073AA7CD66173BFF2287E768F13B2C272B144374B92C9FBB40D3B0B9"
+        "0CA2CBC3F6327BEE0200000000000000000000000000000000000000000000000000000000000000"
+        "0000000000000000"
+    ),
+    (
+        "0791448720003023400ED0E7B4D97C0E9BCDCD00D0DB0DAACFD3EE3328FFAECB4170F4DB5D0685C5"
+        "F27798CC02CDCB747ADA7D06CDE1653739ED3E83C661F89C050ABBC9203ABA0C12"
+    ),
+    (
+        "0791448720003023640ED0E7B4D97C0E9BCD59007B993D7EB7CB20A01B3444A7DD6117A8195E9741"
+        "F3BABC0CCABFEB7250783C7ED7DD74507A0E4ABB416379999CA683E86F507D5E06C9DFE176DA7D06"
+        "CDCB727B7A5C9E83D06579D905CABEEBA0F1BBCE2683C2ECF91B24AEE74161105D1EB697D9207298"
+        "1E0685C9E4D6DB0D4ABB417474191486C341F437A83E2F83E8000000000000000000000000000000"
+        "0000000000000000"
+    ),
+)
+
+DELIVER_GIFFGAFF_EMPTY = "0791448720003023000ED0E7B4D97C0E9BCDDD00BA0E740E9BCD2E00"
 
 
 # --------------------------------------------------------------------------
@@ -115,6 +144,27 @@ def test_alphabet_from_dcs():
     assert alphabet_from_dcs(0xF4) == "8bit"
 
 
+@pytest.mark.parametrize("pdu", DELIVER_GIFFGAFF_MALFORMED_UDH)
+def test_malformed_udh_is_treated_as_binary_instead_of_displaying_mojibake(pdu: str):
+    sms = decode_pdu(pdu)
+
+    assert sms.address == "giffgaff"
+    assert sms.dcs == 0
+    assert sms.alphabet == "gsm7"
+    assert sms.udh_malformed
+    assert sms.is_binary
+
+
+def test_zero_length_giffgaff_control_message_is_treated_as_data():
+    sms = decode_pdu(DELIVER_GIFFGAFF_EMPTY)
+
+    assert sms.address == "giffgaff"
+    assert sms.dcs == 0
+    assert sms.pid == 0xDD
+    assert sms.text == ""
+    assert sms.is_binary
+
+
 # --------------------------------------------------------------------------
 # UCS-2 byte order
 # --------------------------------------------------------------------------
@@ -166,6 +216,34 @@ def test_encode_short_ascii():
     assert decoded[0].address == "10086"
     assert decoded[0].text == "CXHF"
     assert decoded[0].alphabet == "gsm7"
+    assert decoded[0].status_report_requested
+
+
+def test_submit_can_disable_status_report_request():
+    _, decoded = _roundtrip("10086", "CXHF", request_status_report=False)
+    assert not decoded[0].status_report_requested
+
+
+@pytest.mark.parametrize(
+    "status,state",
+    [(0x00, "delivered"), (0x20, "pending"), (0x40, "failed"), (0x60, "failed")],
+)
+def test_decode_status_report(status: int, state: str):
+    pdu = encode_status_report(42, "+8613800138000", status=status)
+    report = decode_status_report(pdu)
+
+    assert report.message_reference == 42
+    assert report.recipient == "+8613800138000"
+    assert report.status == status
+    assert report.state == state
+    assert report.service_center_timestamp is not None
+    assert report.discharge_time is not None
+    assert report.raw == pdu
+
+
+def test_status_report_decoder_rejects_a_deliver_pdu():
+    with pytest.raises(PduError, match="SMS-STATUS-REPORT"):
+        decode_status_report(DELIVER_HOW_ARE_YOU)
 
 
 def test_encode_international_number():

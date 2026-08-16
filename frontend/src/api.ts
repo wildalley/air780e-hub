@@ -147,7 +147,7 @@ export interface Message {
   sim_iccid?: string
   raw_pdu?: string | null
   dcs?: number | null
-  is_binary?: number   // 1 if the payload was data, not text (8-bit DCS or port-addressed UDH)
+  is_binary?: number   // 1 for 8-bit/port data, malformed UDH, or an operator control SMS
 }
 
 /** One thread: everything exchanged with one number through one card. */
@@ -313,6 +313,9 @@ export interface AgentLog {
 export interface DiagnosticAgent {
   id: string
   version: string
+  protocol_version: number
+  version_matches: boolean
+  protocol_compatible: boolean
   connected: number
   last_seen_at: string | null
   last_seq: number
@@ -322,6 +325,7 @@ export interface DiagnosticAgent {
 export interface Diagnostics {
   server: {
     version: string
+    protocol_version: number
     python: string
     started_at: string
     uptime_seconds: number
@@ -457,6 +461,7 @@ export const api = {
       direction?: 'in' | 'out'
       peer?: string
       search?: string
+      content?: 'text' | 'data'
     }) => {
       const query = new URLSearchParams()
       Object.entries(params).forEach(([key, value]) => {
@@ -464,7 +469,8 @@ export const api = {
       })
       return get<{ items: Message[]; total: number }>(`/api/messages?${query}`)
     },
-    conversations: () => get<Conversation[]>('/api/conversations'),
+    conversations: (content?: 'text' | 'data') =>
+      get<Conversation[]>(`/api/conversations${content ? `?content=${content}` : ''}`),
     send: (device: string, number: string, body: string) =>
       post<{ refs: number[] }>('/api/messages/send', { device, number, body }),
     /** Mark one conversation's incoming messages as read. */
@@ -473,7 +479,8 @@ export const api = {
     /** Total unread across all conversations (nav badge). */
     unread: () => get<{ total: number }>('/api/messages/unread'),
     /** Download stored messages as a streamed CSV. */
-    exportCsv: () => downloadFile('/api/messages/export', 'messages.csv'),
+    exportCsv: (content?: 'text' | 'data') =>
+      downloadFile(`/api/messages/export${content ? `?content=${content}` : ''}`, 'messages.csv'),
   },
   at: (device: string, command: string) =>
     post<{ lines: string[] }>('/api/at', { device, command }),

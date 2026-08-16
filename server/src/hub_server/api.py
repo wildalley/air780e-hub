@@ -25,7 +25,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
 
-from . import __version__
+from . import PROTOCOL_VERSION, __version__
 from .alerts import SETTING_ENABLED
 from .auth import SESSION_COOKIE, AuthError, hash_agent_token
 from .config import ConfigError
@@ -475,20 +475,23 @@ def build_router(state: AppState) -> APIRouter:
         direction: Literal["in", "out"] | None = None,
         peer: str | None = None,
         search: str | None = None,
+        content: Literal["text", "data"] | None = None,
     ) -> dict[str, Any]:
         return {
             "items": state.db.messages(
                 limit=limit, offset=offset, sim_id=sim_id,
-                direction=direction, peer=peer, search=search,
+                direction=direction, peer=peer, search=search, content=content,
             ),
             "total": state.db.count_messages(
-                sim_id=sim_id, direction=direction, peer=peer, search=search
+                sim_id=sim_id, direction=direction, peer=peer, search=search,
+                content=content,
             ),
         }
 
     @router.get("/conversations", dependencies=guard)
     def list_conversations(
         limit: int = Query(200, ge=1, le=1000),
+        content: Literal["text", "data"] | None = None,
     ) -> list[dict[str, Any]]:
         """One row per (card, correspondent), newest first.
 
@@ -496,7 +499,7 @@ def build_router(state: AppState) -> APIRouter:
         rows.  Grouping here rather than in the browser keeps it correct once
         the history is longer than one page.
         """
-        return state.db.conversations(limit=limit)
+        return state.db.conversations(limit=limit, content=content)
 
     @router.post("/messages/send", dependencies=guard)
     async def send_message(body: SendSmsBody) -> dict[str, Any]:
@@ -524,6 +527,7 @@ def build_router(state: AppState) -> APIRouter:
         sim_id: int | None = None,
         peer: str | None = None,
         search: str | None = None,
+        content: Literal["text", "data"] | None = None,
     ) -> StreamingResponse:
         """Stream stored messages as CSV without materialising the export."""
         import csv
@@ -550,7 +554,8 @@ def build_router(state: AppState) -> APIRouter:
                 "is_binary", "dcs", "raw_pdu",
             ])
             for message in state.db.iter_messages(
-                limit=limit, sim_id=sim_id, peer=peer, search=search
+                limit=limit, sim_id=sim_id, peer=peer, search=search,
+                content=content,
             ):
                 yield line([
                     message["id"],
@@ -879,9 +884,20 @@ def build_router(state: AppState) -> APIRouter:
                 "SELECT COUNT(*) AS n FROM audit_events"
             )["n"],
         }
+        agents = state.db.query(
+            "SELECT a.*, COUNT(d.id) AS device_count "
+            "FROM agents a LEFT JOIN devices d ON d.agent_id = a.id "
+            "GROUP BY a.id ORDER BY a.id"
+        )
+        for agent in agents:
+            agent["version_matches"] = agent["version"] == __version__
+            agent["protocol_compatible"] = (
+                agent["protocol_version"] == PROTOCOL_VERSION
+            )
         return {
             "server": {
                 "version": __version__,
+                "protocol_version": PROTOCOL_VERSION,
                 "python": platform.python_version(),
                 "started_at": state.started_at,
                 "uptime_seconds": int(time.monotonic() - state.started_monotonic),
@@ -900,11 +916,7 @@ def build_router(state: AppState) -> APIRouter:
             },
             "counts": counts,
             "activity": state.db.activity_stats(),
-            "agents": state.db.query(
-                "SELECT a.*, COUNT(d.id) AS device_count "
-                "FROM agents a LEFT JOIN devices d ON d.agent_id = a.id "
-                "GROUP BY a.id ORDER BY a.id"
-            ),
+            "agents": agents,
         }
 
     @router.get("/operations/audit", dependencies=guard)

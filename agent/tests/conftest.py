@@ -10,7 +10,7 @@ import pytest
 from air780e_agent.at import ATClient, PipeTransport
 from air780e_agent.mock import MockAir780E
 from air780e_agent.modem import Air780E
-from air780e_agent.pdu import DecodedSms
+from air780e_agent.pdu import DecodedSms, StatusReport
 
 
 @dataclass
@@ -19,10 +19,15 @@ class Rig:
     mock: MockAir780E
     modem: Air780E | None = None
     received: list[DecodedSms] = field(default_factory=list)
+    deliveries: list[StatusReport] = field(default_factory=list)
     _event: asyncio.Event = field(default_factory=asyncio.Event)
 
     def on_sms(self, sms: DecodedSms) -> None:
         self.received.append(sms)
+        self._event.set()
+
+    def on_delivery(self, report: StatusReport) -> None:
+        self.deliveries.append(report)
         self._event.set()
 
     async def wait_for_sms(self, count: int = 1, timeout: float = 2.0) -> None:
@@ -55,6 +60,6 @@ async def rig():
 @pytest.fixture
 async def modem(rig):
     """A fully initialized :class:`Air780E` on top of the mock."""
-    rig.modem = Air780E(rig.client, on_sms=rig.on_sms)
+    rig.modem = Air780E(rig.client, on_sms=rig.on_sms, on_delivery=rig.on_delivery)
     await rig.modem.initialize()
     return rig.modem

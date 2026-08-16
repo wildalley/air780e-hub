@@ -22,16 +22,25 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from .at import ATClient, ATError, ATUrc, CmsError
-from .pdu import DecodedSms, PduError, Reassembler, decode_pdu, encode_submit
+from .pdu import (
+    DecodedSms,
+    PduError,
+    Reassembler,
+    StatusReport,
+    decode_pdu,
+    decode_status_report,
+    encode_submit,
+)
 
 log = logging.getLogger(__name__)
 
 SmsCallback = Callable[[DecodedSms], None | Awaitable[None]]
+DeliveryCallback = Callable[[StatusReport], None | Awaitable[None]]
 
 # 2 = forward URCs even while the link is reserved; 1 = store the message and
 # report only its index.  Storing (rather than +CMT push) means a message
 # survives the agent being restarted mid-delivery.
-CNMI_STORE_AND_NOTIFY = "AT+CNMI=2,1,0,0,0"
+CNMI_STORE_AND_NOTIFY = "AT+CNMI=2,1,0,1,0"
 
 # Ask the module to *push* a URC whenever registration changes, so a SIM that
 # drops off and comes back updates `registered` without waiting for the next
@@ -124,12 +133,14 @@ class Air780E:
         client: ATClient,
         *,
         on_sms: SmsCallback | None = None,
+        on_delivery: DeliveryCallback | None = None,
         storage: str = "SM",
         delete_after_read: bool = True,
         reassembly_timeout: float = 30.0,
     ) -> None:
         self.client = client
         self.on_sms = on_sms
+        self.on_delivery = on_delivery
         self.storage = storage
         self.delete_after_read = delete_after_read
         self.info = ModemInfo()
@@ -141,6 +152,7 @@ class Air780E:
 
         client.register_urc("+CMTI", self._on_cmti)
         client.register_urc("+CMT", self._on_cmt, payload_lines=1)
+        client.register_urc("+CDS", self._on_cds, payload_lines=1)
         client.register_urc("+CREG", self._on_registration)
         client.register_urc("+CEREG", self._on_registration)
 
@@ -516,6 +528,22 @@ class Air780E:
         complete = self._reassembler.push(sms)
         if complete is not None:
             await self._emit(complete)
+
+    async def _on_cds(self, urc: ATUrc) -> None:
+        # PDU mode: +CDS: <length>, followed by one SMS-STATUS-REPORT PDU.
+        if not urc.payload:
+            log.warning("+CDS arrived without a status-report PDU")
+            return
+        try:
+            report = decode_status_report(urc.payload[0])
+        except PduError as exc:
+            log.error("undecodable +CDS PDU: %s", exc)
+            return
+        if self.on_delivery is None:
+            return
+        result = self.on_delivery(report)
+        if asyncio.iscoroutine(result):
+            await result
 
     def _on_registration(self, urc: ATUrc) -> None:
         # An unsolicited +CREG/+CEREG is stat-first: "+CREG: 1" or, in mode 2,

@@ -121,6 +121,7 @@ HELLO = {
     "type": "hello",
     "agent_id": "test-agent",
     "version": "0.1.0",
+    "protocol_version": 1,
     "last_seq": 0,
     "devices": [
         {"name": "a", "label": "移动卡", "port": "/dev/air780e-a", "online": True,
@@ -212,6 +213,40 @@ def test_hello_registers_devices_and_sims(admin):
         "89860622180012345670", "89860622180012345671",
     }
 
+    agent = admin.app.state.hub.db.one(
+        "SELECT version, protocol_version FROM agents WHERE id = 'test-agent'"
+    )
+    assert agent == {"version": "0.1.0", "protocol_version": 1}
+
+
+def test_agent_version_mismatch_opens_and_then_resolves_an_incident(admin):
+    incompatible = {
+        **HELLO,
+        "version": "0.0.9",
+        "protocol_version": 99,
+    }
+    with _connect(admin) as ws:
+        ws.send_json(incompatible)
+        assert ws.receive_json()["type"] == "sync_tasks"
+
+        diagnostics = admin.get("/api/operations/diagnostics").json()
+        agent = diagnostics["agents"][0]
+        assert agent["version_matches"] is False
+        assert agent["protocol_compatible"] is False
+        incident = _items(admin.get("/api/operations/incidents"))[0]
+        assert incident["kind"] == "agent_version_mismatch"
+        assert incident["severity"] == "critical"
+        assert "协议 99" in incident["detail"]
+
+    with _connect(admin) as ws:
+        _greet(ws)
+        diagnostics = admin.get("/api/operations/diagnostics").json()
+        agent = diagnostics["agents"][0]
+        assert agent["version_matches"] is True
+        assert agent["protocol_compatible"] is True
+
+    assert _items(admin.get("/api/operations/incidents")) == []
+
 
 def test_hello_must_come_first(client):
     from starlette.websockets import WebSocketDisconnect
@@ -302,6 +337,26 @@ def test_a_binary_sms_is_stored_flagged_and_previewed_as_data(admin):
     # the mojibake even once the bubble stops.
     thread = admin.get("/api/conversations").json()[0]
     assert thread["last_is_binary"] == 1
+
+
+def test_server_reclassifies_a_data_pdu_from_an_older_agent(admin):
+    """Server-side fallback covers the window before every Agent is upgraded."""
+    pdu = "0791448720003023000ED0E7B4D97C0E9BCDDD00BA0E740E9BCD2E00"
+    with _connect(admin) as ws:
+        _greet(ws)
+        ws.send_json({
+            "type": "sms_in", "seq": 14, "device": "a",
+            "iccid": "89860622180012345670", "peer": "giffgaff",
+            "body": "", "ts": "2026-08-06T21:15:24+08:00",
+            "segments": 1, "pdu": pdu, "dcs": 0,
+            "binary": False,
+        })
+        assert ws.receive_json() == {"type": "ack", "seq": 14}
+
+    row = admin.app.state.hub.db.one(
+        "SELECT raw_pdu, is_binary FROM messages WHERE peer = 'giffgaff'"
+    )
+    assert row == {"raw_pdu": pdu, "is_binary": 1}
 
 
 def test_a_frame_with_a_malformed_dcs_still_stores_the_message(admin):
@@ -480,6 +535,36 @@ def test_message_list_total_uses_the_same_filters(admin):
     ).json()
     assert result["total"] == 1
     assert [item["body"] for item in result["items"]] == ["balance 42"]
+
+
+def test_message_content_filter_separates_text_and_data_sms(admin):
+    db = admin.app.state.hub.db
+    common = {
+        "agent_id": "home-arch", "device": "a", "direction": "in",
+        "peer": "giffgaff", "ts": _minutes_ago(1),
+        "iccid": "89860622180012345670",
+    }
+    db.insert_message(**common, body="plain text")
+    db.insert_message(**common, body="鼠S耸盘涌羹", is_binary=True)
+
+    text = admin.get("/api/messages?content=text").json()
+    data = admin.get("/api/messages?content=data").json()
+    assert text["total"] == 1
+    assert [row["body"] for row in text["items"]] == ["plain text"]
+    assert data["total"] == 1
+    assert [row["is_binary"] for row in data["items"]] == [1]
+
+    text_threads = admin.get("/api/conversations?content=text").json()
+    data_threads = admin.get("/api/conversations?content=data").json()
+    assert text_threads[0]["last_body"] == "plain text"
+    assert data_threads[0]["last_is_binary"] == 1
+
+    text_export = admin.get("/api/messages/export?content=text").text
+    data_export = admin.get("/api/messages/export?content=data").text
+    assert "plain text" in text_export and "鼠S耸盘涌羹" not in text_export
+    assert "鼠S耸盘涌羹" in data_export and "plain text" not in data_export
+
+    assert admin.get("/api/messages?content=unknown").status_code == 422
 
 
 def test_message_stats_count_each_card_for_the_requested_window(admin):
@@ -732,6 +817,198 @@ def test_agent_log_is_stored_without_message_bodies(admin):
     assert logs[0]["level"] == "warning"
 
 
+def test_delivery_report_updates_a_single_segment_message(admin):
+    sent_at = _minutes_ago(1)
+    with _connect(admin) as ws:
+        _greet(ws)
+        ws.send_json({
+            "type": "sms_out", "seq": 1, "device": "a", "peer": "10086",
+            "body": "CXHF", "status": "sent", "refs": [7], "ts": sent_at,
+        })
+        assert ws.receive_json() == {"type": "ack", "seq": 1}
+        assert admin.get("/api/messages").json()["items"][0]["status"] == "pending"
+
+        ws.send_json({
+            "type": "sms_delivery", "seq": 2, "device": "a", "reference": 7,
+            "peer": "10086", "status": "delivered", "status_code": 0,
+            "service_center_ts": sent_at, "discharge_ts": _minutes_ago(0),
+            "ts": _minutes_ago(0), "pdu": "000207",
+        })
+        assert ws.receive_json() == {"type": "ack", "seq": 2}
+
+    message = admin.get("/api/messages").json()["items"][0]
+    assert message["status"] == "delivered"
+    assert message["error"] is None
+    segment = admin.app.state.hub.db.one("SELECT * FROM sms_delivery_segments")
+    assert segment["message_id"] == message["id"]
+    assert segment["segment_index"] == 1
+    assert segment["modem_reference"] == 7
+    assert segment["status"] == "delivered"
+    assert segment["status_code"] == 0
+    assert segment["raw_pdu"] == "000207"
+
+
+def test_temporary_report_does_not_overwrite_a_terminal_receipt(admin):
+    sent_at = _minutes_ago(2)
+    delivered_at = _minutes_ago(1)
+    with _connect(admin) as ws:
+        _greet(ws)
+        ws.send_json({
+            "type": "sms_out", "seq": 1, "device": "a", "peer": "10086",
+            "body": "CXHF", "status": "sent", "refs": [8], "ts": sent_at,
+        })
+        ws.receive_json()
+        ws.send_json({
+            "type": "sms_delivery", "seq": 2, "device": "a", "reference": 8,
+            "peer": "10086", "status": "delivered", "status_code": 0,
+            "service_center_ts": sent_at, "discharge_ts": delivered_at,
+            "ts": delivered_at, "pdu": "final-report",
+        })
+        ws.receive_json()
+        terminal = admin.app.state.hub.db.one(
+            "SELECT * FROM sms_delivery_segments"
+        )
+
+        # Some networks replay an older temporary TP-ST after the final report.
+        # It must not leave terminal status paired with temporary metadata.
+        ws.send_json({
+            "type": "sms_delivery", "seq": 3, "device": "a", "reference": 8,
+            "peer": "10086", "status": "pending", "status_code": 0x20,
+            "service_center_ts": sent_at, "discharge_ts": None,
+            "ts": _minutes_ago(0), "pdu": "stale-temporary-report",
+        })
+        assert ws.receive_json() == {"type": "ack", "seq": 3}
+
+    assert admin.app.state.hub.db.one(
+        "SELECT * FROM sms_delivery_segments"
+    ) == terminal
+    message = admin.get("/api/messages").json()["items"][0]
+    assert message["status"] == "delivered"
+    assert message["error"] is None
+
+
+def test_multipart_delivery_aggregates_pending_partial_and_delivered(admin):
+    sent_at = _minutes_ago(1)
+    with _connect(admin) as ws:
+        _greet(ws)
+        ws.send_json({
+            "type": "sms_out", "seq": 1, "device": "a", "peer": "10086",
+            "body": "x" * 400, "status": "sent", "refs": [10, 11], "ts": sent_at,
+        })
+        ws.receive_json()
+
+        ws.send_json({
+            "type": "sms_delivery", "seq": 2, "device": "a", "reference": 10,
+            "peer": "10086", "status": "delivered", "status_code": 0,
+            "service_center_ts": sent_at, "ts": _minutes_ago(0),
+        })
+        ws.receive_json()
+        assert admin.get("/api/messages").json()["items"][0]["status"] == "partial"
+
+        # A temporary service-centre error leaves the outstanding segment pending.
+        ws.send_json({
+            "type": "sms_delivery", "seq": 3, "device": "a", "reference": 11,
+            "peer": "10086", "status": "pending", "status_code": 0x20,
+            "service_center_ts": sent_at, "ts": _minutes_ago(0),
+        })
+        ws.receive_json()
+        assert admin.get("/api/messages").json()["items"][0]["status"] == "partial"
+
+        ws.send_json({
+            "type": "sms_delivery", "seq": 4, "device": "a", "reference": 11,
+            "peer": "10086", "status": "delivered", "status_code": 0,
+            "service_center_ts": sent_at, "ts": _minutes_ago(0),
+        })
+        ws.receive_json()
+
+    assert admin.get("/api/messages").json()["items"][0]["status"] == "delivered"
+
+
+def test_delivery_status_code_overrides_an_incorrect_claimed_state(admin):
+    sent_at = _minutes_ago(1)
+    with _connect(admin) as ws:
+        _greet(ws)
+        ws.send_json({
+            "type": "sms_out", "seq": 1, "device": "a", "peer": "10086",
+            "body": "CXHF", "status": "sent", "refs": [12], "ts": sent_at,
+        })
+        ws.receive_json()
+        ws.send_json({
+            "type": "sms_delivery", "seq": 2, "device": "a", "reference": 12,
+            "peer": "10086", "status": "delivered", "status_code": 0x40,
+            "service_center_ts": sent_at, "ts": _minutes_ago(0),
+        })
+        ws.receive_json()
+
+    message = admin.get("/api/messages").json()["items"][0]
+    assert message["status"] == "failed"
+    assert "TP-ST 0x40" in message["error"]
+
+
+def test_delivery_report_that_arrives_before_sms_out_is_reconciled(admin):
+    sent_at = _minutes_ago(1)
+    with _connect(admin) as ws:
+        _greet(ws)
+        ws.send_json({
+            "type": "sms_delivery", "seq": 1, "device": "a", "reference": 42,
+            "peer": "+8613800138000", "status": "delivered", "status_code": 0,
+            "service_center_ts": sent_at, "ts": _minutes_ago(0),
+        })
+        ws.receive_json()
+        unmatched = admin.app.state.hub.db.one("SELECT * FROM sms_delivery_segments")
+        assert unmatched["message_id"] is None
+
+        ws.send_json({
+            "type": "sms_delivery", "seq": 2, "device": "a", "reference": 42,
+            "peer": "+8613800138000", "status": "pending", "status_code": 0x20,
+            "service_center_ts": sent_at, "ts": _minutes_ago(0),
+            "pdu": "stale-temporary-report",
+        })
+        ws.receive_json()
+        assert admin.app.state.hub.db.one(
+            "SELECT * FROM sms_delivery_segments"
+        ) == unmatched
+
+        ws.send_json({
+            "type": "sms_out", "seq": 3, "device": "a", "peer": "13800138000",
+            "body": "CXHF", "status": "sent", "refs": [42], "ts": sent_at,
+        })
+        ws.receive_json()
+
+    message = admin.get("/api/messages").json()["items"][0]
+    assert message["status"] == "delivered"
+    rows = admin.app.state.hub.db.query("SELECT * FROM sms_delivery_segments")
+    assert len(rows) == 1
+    assert rows[0]["message_id"] == message["id"]
+
+
+def test_reused_modem_reference_matches_the_closest_submission_time(admin):
+    older, newer = _minutes_ago(5), _minutes_ago(1)
+    with _connect(admin) as ws:
+        _greet(ws)
+        for seq, stamp, body in ((1, older, "older"), (2, newer, "newer")):
+            ws.send_json({
+                "type": "sms_out", "seq": seq, "device": "a", "peer": "10086",
+                "body": body, "status": "sent", "refs": [9], "ts": stamp,
+            })
+            ws.receive_json()
+
+        ws.send_json({
+            "type": "sms_delivery", "seq": 3, "device": "a", "reference": 9,
+            "peer": "10086", "status": "delivered", "status_code": 0,
+            "service_center_ts": older, "ts": _minutes_ago(0),
+        })
+        ws.receive_json()
+
+    rows = admin.app.state.hub.db.query(
+        "SELECT body, status FROM messages ORDER BY ts"
+    )
+    assert rows == [
+        {"body": "older", "status": "delivered"},
+        {"body": "newer", "status": "pending"},
+    ]
+
+
 def test_devices_go_offline_when_the_agent_disconnects(admin):
     with _connect(admin) as ws:
         _greet(ws)
@@ -955,6 +1232,7 @@ def test_each_agent_is_only_given_its_own_tasks(admin):
     """Two agents must not run each other's keep-alives."""
     other_hello = {
         "type": "hello", "agent_id": "other-agent", "version": "0.1.0",
+        "protocol_version": 1,
         "last_seq": 0,
         "devices": [{"name": "c", "label": "电信卡", "port": "/dev/air780e-c",
                      "online": True, "iccid": "89860622180012345672"}],
@@ -1147,6 +1425,7 @@ def test_operations_diagnostics_and_audit_are_available_to_admin(admin):
     assert diagnostics.status_code == 200
     body = diagnostics.json()
     assert body["server"]["version"] == "0.1.0"
+    assert body["server"]["protocol_version"] == 1
     assert body["runtime"]["agents_connected"] == 0
     assert body["storage"]["disk_free_bytes"] > 0
 
@@ -1560,32 +1839,45 @@ def test_restore_rejects_unrelated_sqlite(admin, tmp_path):
     assert "缺少表" in response.json()["detail"]
 
 
-def test_restore_reports_the_snapshot_when_migrating_the_backup_fails(admin, monkeypatch):
+def test_restore_reports_the_snapshot_when_migrating_the_backup_fails(
+    admin, monkeypatch, tmp_path
+):
     """A failed post-restore migration must name the copy that can undo it.
 
     By this point the uploaded data already overwrote the live database, so a
     bare 500 would leave the operator with a half-migrated file and no hint
     that a recoverable snapshot exists.
     """
-    from hub_server.db import Database, MigrationFailed
+    import sqlite3
+
+    from hub_server.db import Database
 
     snapshot = admin.get("/api/system/backup")
     assert snapshot.status_code == 200
+    legacy = tmp_path / "legacy.db"
+    legacy.write_bytes(snapshot.content)
+    connection = sqlite3.connect(legacy)
+    try:
+        connection.execute("PRAGMA user_version = 4")
+    finally:
+        connection.close()
 
-    def explode(self, *, pre_existing: bool) -> None:
-        raise MigrationFailed("boom", snapshot=Path("/tmp/hub.db.v0.bak"))
+    def explode(self) -> None:
+        raise sqlite3.OperationalError("boom")
 
-    monkeypatch.setattr(Database, "_migrate", explode)
+    monkeypatch.setattr(Database, "_migration_data_messages", explode)
 
     response = admin.post(
         "/api/system/restore",
-        content=snapshot.content,
+        content=legacy.read_bytes(),
         headers={"Content-Type": "application/octet-stream"},
     )
     assert response.status_code == 500
     detail = response.json()["detail"]
     assert "迁移失败" in detail
-    assert "/tmp/hub.db.v0.bak" in detail
+    expected = admin.app.state.hub.db.path.with_name("hub.db.v4.bak")
+    assert str(expected) in detail
+    assert expected.exists()
 
 
 def test_restore_rejects_garbage_and_empty_uploads(admin):

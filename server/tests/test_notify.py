@@ -120,11 +120,13 @@ def add_rule(
 
 
 def add_message(
-    db, *, body="验证码 123456", peer="10086", iccid=ICCID, device="a"
+    db, *, body="验证码 123456", peer="10086", iccid=ICCID, device="a",
+    is_binary=False,
 ) -> int:
     return db.insert_message(
         agent_id="home-arch", device=device, direction="in", peer=peer,
         body=body, ts="2026-08-02T18:00:00+08:00", iccid=iccid,
+        is_binary=is_binary,
     )
 
 
@@ -262,6 +264,18 @@ async def test_one_sms_fans_out_to_every_matched_channel(db, settings):
 
 async def test_no_rules_means_no_push(db, settings):
     message_id = add_message(db)
+    recorder = Recorder()
+    notifier = make_notifier(db, settings, recorder)
+
+    assert await notifier.deliver(message_id) == []
+    assert recorder.requests == []
+    assert notify_logs(db) == []
+
+
+async def test_data_sms_is_never_forwarded_by_notification_rules(db, settings):
+    channel = add_channel(db)
+    add_rule(db, channel_id=channel, match="all")
+    message_id = add_message(db, body="鼠S耸盘涌羹", is_binary=True)
     recorder = Recorder()
     notifier = make_notifier(db, settings, recorder)
 
@@ -835,6 +849,7 @@ HELLO = {
     "type": "hello",
     "agent_id": "home-arch",
     "version": "0.1.0",
+    "protocol_version": 1,
     "last_seq": 0,
     "devices": [
         {"name": "a", "label": "移动卡", "port": "/dev/air780e-a", "online": True,

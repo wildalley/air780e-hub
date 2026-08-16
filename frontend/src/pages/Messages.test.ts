@@ -1,4 +1,11 @@
-import { detectOtp, hasOlderMessages, resolveThread, threadPreview } from '../messages'
+import {
+  deliveryStatusLabel,
+  detectOtp,
+  hasOlderMessages,
+  messagePreview,
+  resolveThread,
+  threadPreview,
+} from '../messages'
 import { describe, expect, it } from 'vitest'
 import type { Conversation } from '../api'
 
@@ -176,5 +183,32 @@ describe('threadPreview', () => {
     // Not binary, genuinely empty — keep the old placeholder rather than
     // claiming it was data.
     expect(threadPreview({ last_body: '' })).toBe('(空)')
+  })
+})
+
+describe('messagePreview', () => {
+  it('hides decoded bytes everywhere a data message is summarized', () => {
+    expect(messagePreview({ body: '鼠S耸盘涌羹', is_binary: 1 })).toBe(
+      '运营商数据短信',
+    )
+  })
+
+  it('keeps text and the empty-message fallback', () => {
+    expect(messagePreview({ body: '验证码 123456', is_binary: 0 })).toBe('验证码 123456')
+    expect(messagePreview({ body: '' })).toBe('(空)')
+  })
+})
+
+describe('deliveryStatusLabel', () => {
+  it('labels every aggregate delivery state', () => {
+    expect(deliveryStatusLabel('pending')).toBe('等待回执')
+    expect(deliveryStatusLabel('partial')).toBe('部分送达')
+    expect(deliveryStatusLabel('delivered')).toBe('已送达')
+    expect(deliveryStatusLabel('failed')).toBe('投递失败')
+  })
+
+  it('does not invent a receipt for legacy sent messages', () => {
+    expect(deliveryStatusLabel('sent')).toBeNull()
+    expect(deliveryStatusLabel('received')).toBeNull()
   })
 })

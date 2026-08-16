@@ -289,7 +289,29 @@ export function OperationsPage() {
                       <TableRow key={agent.id}>
                         <TableCell>{agent.id}</TableCell>
                         <TableCell><OnlineChip online={Boolean(agent.connected)} /></TableCell>
-                        <TableCell>{agent.version || '—'}</TableCell>
+                        <TableCell>
+                          <Stack direction="row" spacing={1} sx={{ alignItems: 'center' }}>
+                            <Typography variant="body2">{agent.version || '—'}</Typography>
+                            <Chip
+                              size="small"
+                              variant="outlined"
+                              color={
+                                !agent.protocol_compatible
+                                  ? 'error'
+                                  : agent.version_matches
+                                    ? 'success'
+                                    : 'warning'
+                              }
+                              label={
+                                agent.version_matches && agent.protocol_compatible
+                                  ? `协议 v${agent.protocol_version}`
+                                  : agent.protocol_compatible
+                                    ? '版本不同'
+                                    : '协议不兼容'
+                              }
+                            />
+                          </Stack>
+                        </TableCell>
                         <TableCell>{agent.device_count}</TableCell>
                         <TableCell sx={{ whiteSpace: 'nowrap' }}>{formatTs(agent.last_seen_at)}</TableCell>
                         <TableCell>{agent.last_seq}</TableCell>

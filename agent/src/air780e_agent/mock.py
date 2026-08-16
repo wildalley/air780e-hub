@@ -86,6 +86,7 @@ class MockAir780E:
     _echo: bool = False
     _cmee: int = 2
     _cmgf: int = 0
+    _cnmi: str = ""
     _pending_send: int | None = None
     _send_buffer: str = ""
     _buffer: bytearray = field(default_factory=bytearray)
@@ -131,6 +132,15 @@ class MockAir780E:
         """Preload junk so tests can drive the near-full boundary."""
         for i in range(count):
             self.deliver("10086", f"filler {i}")
+
+    def report_delivery(
+        self, reference: int, recipient: str, *, status: int = 0
+    ) -> None:
+        """Emit a PDU-mode ``+CDS`` delivery report."""
+        pdu = codec.encode_status_report(reference, recipient, status=status)
+        tpdu_len = len(bytes.fromhex(pdu)) - 1 - bytes.fromhex(pdu)[0]
+        self._urc(f"+CDS: {tpdu_len}")
+        self._write(f"{pdu}{CRLF}")
 
     # -- wire --------------------------------------------------------------
 
@@ -207,6 +217,7 @@ class MockAir780E:
             self._cmgf = int(upper.split("=", 1)[1] or 0)
             return self._reply()
         if upper.startswith("AT+CNMI="):
+            self._cnmi = line
             return self._reply()
         if upper.startswith("AT+CSCS="):
             return self._reply()

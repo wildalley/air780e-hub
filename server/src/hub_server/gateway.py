@@ -20,9 +20,10 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
+from . import PROTOCOL_VERSION, __version__
 from .auth import verify_agent_token, verify_agent_token_hash
 from .config import Settings
-from .db import Database, utcnow
+from .db import Database, _pdu_is_data, utcnow
 
 log = logging.getLogger(__name__)
 
@@ -71,6 +72,7 @@ class AgentConnection:
     agent_id: str
     websocket: Any
     version: str = ""
+    protocol_version: int = 0
     devices: list[dict[str, Any]] = field(default_factory=list)
     connected_at: str = field(default_factory=utcnow)
 
@@ -198,11 +200,35 @@ class Gateway:
 
     def _register(self, agent_id: str, websocket: Any, frame: dict[str, Any]) -> None:
         version = str(frame.get("version", ""))
+        protocol_version = _optional_int(frame.get("protocol_version")) or 0
         devices = frame.get("devices") or []
         self.connections[agent_id] = AgentConnection(
-            agent_id=agent_id, websocket=websocket, version=version, devices=devices
+            agent_id=agent_id,
+            websocket=websocket,
+            version=version,
+            protocol_version=protocol_version,
+            devices=devices,
         )
-        self.db.upsert_agent(agent_id, version, connected=True)
+        self.db.upsert_agent(agent_id, version, protocol_version, connected=True)
+        fingerprint = f"agent-version:{agent_id}"
+        problems = []
+        if version != __version__:
+            problems.append(f"Agent {version or '未上报'}，Server {__version__}")
+        if protocol_version != PROTOCOL_VERSION:
+            problems.append(
+                f"Agent 协议 {protocol_version or '未上报'}，Server 协议 {PROTOCOL_VERSION}"
+            )
+        if problems:
+            self.db.open_incident(
+                fingerprint,
+                kind="agent_version_mismatch",
+                severity=("critical" if protocol_version != PROTOCOL_VERSION else "warning"),
+                source=agent_id,
+                title="Agent 与 Server 版本不一致",
+                detail="；".join(problems),
+            )
+        else:
+            self.db.resolve_incident(fingerprint, detail="Agent 与 Server 版本已一致")
         for device in devices:
             if isinstance(device, dict):
                 self.db.upsert_device(agent_id, device)
@@ -210,8 +236,9 @@ class Gateway:
                     self._note_device(agent_id, device.get("name", ""),
                                       bool(device.get("online")))
         log.info(
-            "agent %s connected (v%s, %d device(s), last_seq=%s)",
-            agent_id, version or "?", len(devices), frame.get("last_seq"),
+            "agent %s connected (v%s, protocol=%s, %d device(s), last_seq=%s)",
+            agent_id, version or "?", protocol_version or "?", len(devices),
+            frame.get("last_seq"),
         )
 
     def _unregister(self, agent_id: str) -> None:
@@ -261,6 +288,8 @@ class Gateway:
             await self._apply_sms_in(agent_id, frame)
         elif kind == "sms_out":
             self._apply_sms_out(agent_id, frame)
+        elif kind == "sms_delivery":
+            self._apply_sms_delivery(agent_id, frame)
         elif kind == "status":
             self._apply_status(agent_id, frame)
         elif kind == "log":
@@ -273,6 +302,7 @@ class Gateway:
             log.debug("ignoring unknown event kind %r", kind)
 
     async def _apply_sms_in(self, agent_id: str, frame: dict[str, Any]) -> None:
+        raw_pdu = frame.get("pdu") or None
         message_id = self.db.insert_message(
             agent_id=agent_id,
             device=frame.get("device", ""),
@@ -286,15 +316,24 @@ class Gateway:
             seq=frame.get("seq"),
             # The agent has always sent these; dropping them left a garbled
             # message undiagnosable once the modem's copy was deleted.
-            raw_pdu=frame.get("pdu") or None,
+            raw_pdu=raw_pdu,
             dcs=_optional_int(frame.get("dcs")),
-            is_binary=bool(frame.get("binary")),
+            # Recheck the PDU so a stale Agent cannot reintroduce mojibake
+            # during a Server-first rolling upgrade.
+            is_binary=bool(frame.get("binary"))
+            or bool(raw_pdu and _pdu_is_data(raw_pdu)),
         )
         if self.on_message is not None:
             await self.on_message(message_id, frame)
 
     def _apply_sms_out(self, agent_id: str, frame: dict[str, Any]) -> None:
-        self.db.insert_message(
+        references = [
+            value for raw in (frame.get("refs") or [])
+            if (value := _optional_int(raw)) is not None
+        ]
+        frame_status = str(frame.get("status") or "sent")
+        stored_status = "pending" if frame_status == "sent" and references else frame_status
+        message_id = self.db.insert_message(
             agent_id=agent_id,
             device=frame.get("device", ""),
             direction="out",
@@ -302,16 +341,25 @@ class Gateway:
             body=frame.get("body", ""),
             ts=frame.get("ts") or utcnow(),
             iccid=frame.get("iccid", "") or "",
-            status=frame.get("status", "sent"),
-            segments=len(frame.get("refs") or []) or 1,
+            status=stored_status,
+            segments=len(references) or 1,
             seq=frame.get("seq"),
             error=frame.get("error"),
         )
+        if references:
+            self.db.attach_sms_segments(
+                message_id=message_id,
+                agent_id=agent_id,
+                device=str(frame.get("device") or ""),
+                recipient=str(frame.get("peer") or ""),
+                references=references,
+                submitted_at=str(frame.get("ts") or utcnow()),
+            )
         # Aggregate per module, not per message: a fingerprint carrying
         # message_id could never recover, so every failed send would leave a
         # permanently active incident behind.
         fingerprint = f"sms-send:{agent_id}:{frame.get('device', '')}"
-        status = frame.get("status")
+        status = frame_status
         if status == "failed":
             self.db.open_incident(
                 fingerprint,
@@ -323,6 +371,32 @@ class Gateway:
             )
         elif status in {"sent", "delivered"}:
             self.db.resolve_incident(fingerprint, detail="短信发送已恢复")
+
+    def _apply_sms_delivery(self, agent_id: str, frame: dict[str, Any]) -> None:
+        reference = _optional_int(frame.get("reference"))
+        if reference is None or not 0 <= reference <= 255:
+            log.warning(
+                "invalid SMS delivery reference from %s: %r",
+                agent_id,
+                frame.get("reference"),
+            )
+            return
+        status_code = _optional_int(frame.get("status_code"))
+        if status_code is not None and not 0 <= status_code <= 255:
+            status_code = None
+        self.db.record_sms_delivery(
+            agent_id=agent_id,
+            device=str(frame.get("device") or ""),
+            reference=reference,
+            recipient=str(frame.get("peer") or ""),
+            status_code=status_code,
+            status=str(frame.get("status") or "pending"),
+            service_center_ts=frame.get("service_center_ts"),
+            discharge_ts=frame.get("discharge_ts"),
+            reported_at=str(frame.get("ts") or utcnow()),
+            raw_pdu=frame.get("pdu") or None,
+            event_seq=_optional_int(frame.get("seq")),
+        )
 
     def _apply_status(self, agent_id: str, frame: dict[str, Any]) -> None:
         payload = dict(frame)

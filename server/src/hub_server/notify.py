@@ -627,6 +627,13 @@ class Notifier:
             (message_id,),
         ) or {}
 
+        # Data SMS (OTA provisioning, WAP push, SIM toolkit, malformed UDH)
+        # is retained for diagnosis but has no human-readable notification
+        # body. Suppress it before matching even an `all` rule.
+        if message.get("is_binary") or frame.get("binary"):
+            log.debug("suppressing notification for data SMS %s", message_id)
+            return []
+
         body = message.get("body") or frame.get("body") or ""
         targets = match_rules(self.db, sim_id=message.get("sim_id"), body=body)
         if not targets:

@@ -6,6 +6,23 @@
 小节显式标注并给出升级步骤。**Agent 与 Server 必须同版本部署**，跨版本混用不受
 支持。详见 [deploy.md](docs/deploy.md) §0。
 
+## [Unreleased]
+
+### Added
+
+- 出站短信逐分段请求运营商送达回执，Agent 持久化上报 `sms_delivery`，Server 按模块、号码、TP-MR 与短信中心时间关联并聚合为“等待回执 / 部分送达 / 已送达 / 投递失败”；打开的会话自动刷新状态。
+- Agent `hello` 上报软件版本和协议版本。运维中心显示两端是否一致，版本不同创建 warning 事件，协议不兼容创建 critical 事件，升级一致后自动解决。
+- 短信列表、会话和 CSV 导出支持“文本 / 数据”筛选，原始运营商数据短信仍保留用于诊断。
+
+### Fixed
+
+- Agent 与 Server 双重检查 UDH 边界；giffgaff 等运营商发送的损坏 UDH 和空控制短信不再按 GSM-7 渲染成乱码，也不会进入通知渠道，滚动升级期间旧 Agent 的错误标记也会被 Server 纠正。
+- 迟到的临时 TP-ST 不再覆盖已保存的终态回执、状态码、时间或原始 PDU。
+
+### Upgrade Notes
+
+- Server 数据库 schema 从 v2 顺序迁移到 v5，启动前自动写入 `hub.db.v<旧版本>.bak` 快照，并重新标记库内已有的数据短信。该版本新增 Agent/Server 协议 v1，部署时必须从同一提交升级并重启 Server 与 Agent；只同步 Agent 源码而不重新执行 `pip install` 仍会运行旧副本。
+
 ## [0.1.0] — 2026-08-08
 
 首个公开发布版本。此前所有开发内容合入本版，不单独追溯历史小节。

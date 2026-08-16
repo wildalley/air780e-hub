@@ -5,7 +5,7 @@
  * component, and so these stay directly testable — each one has edge cases
  * that are user-visible if they regress.
  */
-import type { Conversation } from './api'
+import type { Conversation, Message } from './api'
 
 /**
  * The last 4–8 digit run in the body, if any.  This is the whole point of the
@@ -43,11 +43,30 @@ export function hasOlderMessages(total: number, fetched: number): boolean {
  * — the list used to show a run of CJK garbage, or "(空)" for the ones that
  * decoded to nothing at all. Naming what it is beats showing either.
  */
+export function messagePreview(
+  message: Pick<Message, 'body' | 'is_binary'>,
+): string {
+  if (message.is_binary) return '运营商数据短信'
+  return message.body || '(空)'
+}
+
 export function threadPreview(
   thread: Pick<Conversation, 'last_body'> & { last_is_binary?: number },
 ): string {
-  if (thread.last_is_binary) return '运营商数据短信'
-  return thread.last_body || '(空)'
+  return messagePreview({
+    body: thread.last_body,
+    is_binary: thread.last_is_binary,
+  })
+}
+
+/** Human-readable aggregate delivery state for an outbound bubble. */
+export function deliveryStatusLabel(status: string): string | null {
+  return {
+    pending: '等待回执',
+    partial: '部分送达',
+    delivered: '已送达',
+    failed: '投递失败',
+  }[status] ?? null
 }
 
 /**

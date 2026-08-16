@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from .at import ATClient, ATError, SerialTransport, Transport
 from .config import DeviceConfig
 from .modem import Air780E, Signal
-from .pdu import DecodedSms
+from .pdu import DecodedSms, StatusReport
 from .store import LocalStore
 
 if TYPE_CHECKING:  # imported for typing only — discovery imports config, not us
@@ -189,6 +189,7 @@ class DeviceWorker:
         modem = Air780E(
             client,
             on_sms=self._on_sms,
+            on_delivery=self._on_delivery,
             storage=self.config.storage,
             delete_after_read=self.config.delete_after_read,
         )
@@ -385,6 +386,33 @@ class DeviceWorker:
         )
         # Deliberately no message body in logs: verification codes are sensitive.
         log.info("[%s] sms from %s (%d chars)", self.name, sms.address, len(sms.text))
+
+    def _on_delivery(self, report: StatusReport) -> None:
+        """Persist a modem delivery report in the outbound event queue."""
+        self.emit(
+            "sms_delivery",
+            {
+                "device": self.name,
+                "iccid": self.state.iccid,
+                "reference": report.message_reference,
+                "peer": report.recipient,
+                "status": report.state,
+                "status_code": report.status,
+                "service_center_ts": (
+                    report.service_center_timestamp.isoformat()
+                    if report.service_center_timestamp else None
+                ),
+                "discharge_ts": (
+                    report.discharge_time.isoformat() if report.discharge_time else None
+                ),
+                "ts": _now(),
+                "pdu": report.raw,
+            },
+        )
+        log.info(
+            "[%s] delivery report mr=%d status=0x%02X (%s)",
+            self.name, report.message_reference, report.status, report.state,
+        )
 
     # -- commands ----------------------------------------------------------
 

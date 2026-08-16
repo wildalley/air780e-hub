@@ -29,6 +29,7 @@ async def test_initialize_reads_identity(modem, rig):
 async def test_initialize_selects_pdu_mode(modem, rig):
     assert rig.mock._cmgf == 0, "text mode mangles non-ASCII content"
     assert rig.mock._echo is False
+    assert rig.mock._cnmi.upper() == "AT+CNMI=2,1,0,1,0"
 
 
 async def test_read_signal(modem, rig):
@@ -229,6 +230,19 @@ async def test_send_long_message_splits(modem, rig):
     assert len(refs) == 3
     assert len(rig.mock.sent) == 3
     assert "".join(part.text for part in rig.mock.sent) == text
+
+
+async def test_delivery_report_surfaces_from_cds(modem, rig):
+    refs = await modem.send_sms("10086", "CXHF")
+    rig.mock.report_delivery(refs[0], "10086", status=0)
+
+    async with asyncio.timeout(1.0):
+        while not rig.deliveries:
+            await asyncio.sleep(0.01)
+    report = rig.deliveries[0]
+    assert report.message_reference == refs[0]
+    assert report.recipient == "10086"
+    assert report.state == "delivered"
 
 
 async def test_send_failure_propagates(modem, rig):

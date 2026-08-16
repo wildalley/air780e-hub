@@ -145,13 +145,28 @@ def test_reopening_an_up_to_date_database_migrates_nothing(tmp_path):
     assert list(tmp_path.glob("*.bak")) == []
 
 
-def test_a_database_from_a_newer_server_is_refused(tmp_path):
+def test_a_database_from_a_newer_server_is_refused_before_schema_writes(tmp_path):
     path = tmp_path / "hub.db"
     Database(path).close()
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("DROP TABLE sms_delivery_segments")
+        connection.commit()
+    finally:
+        connection.close()
     _set_user_version(path, SCHEMA_VERSION + 1)
 
     with pytest.raises(SchemaTooNew):
         Database(path)
+
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'sms_delivery_segments'"
+        ).fetchone() is None
+    finally:
+        connection.close()
 
 
 def test_a_failing_migration_reports_the_snapshot_and_keeps_the_old_version(
@@ -299,6 +314,14 @@ def test_a_fresh_database_is_stamped_rather_than_migrated(tmp_path):
         assert _user_version(path) == SCHEMA_VERSION
         columns = {row["name"] for row in database.query("PRAGMA table_info(messages)")}
         assert {"raw_pdu", "dcs", "is_binary"} <= columns
+        delivery_columns = {
+            row["name"]
+            for row in database.query("PRAGMA table_info(sms_delivery_segments)")
+        }
+        assert {
+            "message_id", "modem_reference", "status_code", "service_center_ts",
+            "discharge_ts", "raw_pdu",
+        } <= delivery_columns
     finally:
         database.close()
 
@@ -367,6 +390,104 @@ def test_an_upgrade_adds_the_diagnostic_columns_and_keeps_the_messages(tmp_path)
 
     snapshot = path.with_name(f"{path.name}.v1.bak")
     assert snapshot.exists(), "an upgrade of a populated database must snapshot it"
+
+
+def test_v2_upgrade_adds_agent_protocol_and_delivery_segments(tmp_path):
+    path = tmp_path / "hub.db"
+    Database(path).close()
+
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "INSERT INTO agents (id, version) VALUES ('agent-a', '0.1.0')"
+        )
+        connection.execute("ALTER TABLE agents DROP COLUMN protocol_version")
+        connection.execute("DROP TABLE sms_delivery_segments")
+        connection.execute("PRAGMA user_version = 2")
+        connection.commit()
+    finally:
+        connection.close()
+
+    database = Database(path)
+    try:
+        assert _user_version(path) == SCHEMA_VERSION
+        agent = database.one(
+            "SELECT id, version, protocol_version FROM agents WHERE id = 'agent-a'"
+        )
+        assert agent == {
+            "id": "agent-a", "version": "0.1.0", "protocol_version": 0,
+        }
+        assert database.one(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'sms_delivery_segments'"
+        ) == {"name": "sms_delivery_segments"}
+    finally:
+        database.close()
+
+    assert path.with_name(f"{path.name}.v2.bak").exists()
+    snapshot = sqlite3.connect(path.with_name(f"{path.name}.v2.bak"))
+    try:
+        agent_columns = {
+            row[1] for row in snapshot.execute("PRAGMA table_info(agents)")
+        }
+        assert "protocol_version" not in agent_columns
+        assert snapshot.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'table' AND name = 'sms_delivery_segments'"
+        ).fetchone() is None
+    finally:
+        snapshot.close()
+
+
+def test_v4_upgrade_reclassifies_stored_data_pdus(tmp_path):
+    path = tmp_path / "hub.db"
+    database = Database(path)
+    # UDHL declares one three-octet concatenation element but only carries one
+    # payload octet. This is the compact form of the real giffgaff failure.
+    malformed = bytes([
+        0x00, 0x40, 0x01, 0x81, 0xF1, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x05, 0x03, 0x00, 0x03, 0x01,
+    ]).hex()
+    bad_id = database.insert_message(
+        agent_id="agent-a", device="a", direction="in", peer="giffgaff",
+        body="decoded noise", ts=utcnow(), raw_pdu=malformed, dcs=0,
+    )
+    operator_control = bytes([
+        0x00, 0x00, 0x01, 0x81, 0xF1, 0xDD, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]).hex()
+    control_id = database.insert_message(
+        agent_id="agent-a", device="a", direction="in", peer="giffgaff",
+        body="", ts=utcnow(), raw_pdu=operator_control, dcs=0,
+    )
+    good_id = database.insert_message(
+        agent_id="agent-a", device="a", direction="in", peer="10086",
+        body="plain text", ts=utcnow(), raw_pdu="0000", dcs=0,
+    )
+    database.close()
+    _set_user_version(path, 4)
+
+    database = Database(path)
+    try:
+        rows = database.query(
+            "SELECT id, is_binary FROM messages ORDER BY id"
+        )
+        assert rows == [
+            {"id": bad_id, "is_binary": 1},
+            {"id": control_id, "is_binary": 1},
+            {"id": good_id, "is_binary": 0},
+        ]
+    finally:
+        database.close()
+
+    snapshot = sqlite3.connect(path.with_name(f"{path.name}.v4.bak"))
+    try:
+        assert snapshot.execute(
+            "SELECT is_binary FROM messages WHERE id = ?", (bad_id,)
+        ).fetchone() == (0,)
+    finally:
+        snapshot.close()
 
 
 def test_the_cli_reports_a_too_new_database_without_a_traceback(

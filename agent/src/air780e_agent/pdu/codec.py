@@ -5,6 +5,7 @@ Covers what the Air780E actually hands us in PDU mode:
 * ``SMS-DELIVER``  — incoming messages from ``+CMT``/``+CMGR``/``+CMGL``
 * ``SMS-SUBMIT``   — outgoing messages for ``AT+CMGS``, and stored drafts/sent
   items that ``+CMGL`` can also return
+* ``SMS-STATUS-REPORT`` — network delivery receipts from ``+CDS``
 
 Text mode is deliberately not used anywhere in this project: it mangles
 non-ASCII content and gives no access to the concatenation headers.
@@ -28,6 +29,7 @@ MAX_UCS2_CONCAT_BYTES = 134
 # TP-MTI values in the first TPDU octet.
 MTI_DELIVER = 0
 MTI_SUBMIT = 1
+MTI_STATUS_REPORT = 2
 
 _TOA_INTERNATIONAL = 0x91
 _TOA_NATIONAL = 0x81
@@ -60,6 +62,12 @@ class DecodedSms:
     raw: str = ""
     #: Destination/source ports from a port-addressing UDH, when present.
     ports: tuple[int, int] | None = None
+    #: The declared UDH or one of its information elements overran available data.
+    udh_malformed: bool = False
+    #: TP-SRR on SMS-SUBMIT; asks the service centre for a delivery report.
+    status_report_requested: bool = False
+    #: TP-PID, retained so operator-specific empty control messages stay data.
+    pid: int = 0
 
     @property
     def is_multipart(self) -> bool:
@@ -69,17 +77,26 @@ class DecodedSms:
     def is_binary(self) -> bool:
         """True when this carries data rather than a message for a person.
 
-        Two independent signals, either of which is enough:
+        Any of these independent signals is enough:
 
         * an 8-bit TP-DCS — the payload is octets, not characters;
         * a port-addressing UDH — the content is addressed to an application
-          (OTA provisioning, WAP push, SIM toolkit), not to the inbox.
+          (OTA provisioning, WAP push, SIM toolkit), not to the inbox;
+        * a structurally invalid UDH — its payload boundary cannot be trusted,
+          so rendering the remaining octets as text only produces mojibake;
+        * an empty service-centre-specific TP-PID message — an operator control
+          frame with no text to show or forward.
 
         Worth surfacing because such a payload decoded as text becomes a wall of
         mojibake in a conversation.  ``text`` is still whatever the decode
         produced; the caller decides whether to show it.
         """
-        return self.alphabet == "8bit" or self.ports is not None
+        return (
+            self.alphabet == "8bit"
+            or self.ports is not None
+            or self.udh_malformed
+            or (not self.text and self.pid >= 0xC0)
+        )
 
 
 @dataclass
@@ -90,6 +107,30 @@ class EncodedPdu:
     tpdu_len: int
     seq: int = 1
     total: int = 1
+
+
+@dataclass(frozen=True)
+class StatusReport:
+    """The mandatory fields of an SMS-STATUS-REPORT TPDU."""
+
+    message_reference: int
+    recipient: str
+    service_center_timestamp: datetime | None
+    discharge_time: datetime | None
+    status: int
+    smsc: str | None = None
+    raw: str = ""
+
+    @property
+    def state(self) -> str:
+        """Aggregate-friendly state from TP-ST (TS 23.040 section 9.2.3.15)."""
+        if 0x00 <= self.status <= 0x1F:
+            return "delivered"
+        if 0x20 <= self.status <= 0x3F:
+            return "pending"  # temporary error; the service centre is retrying
+        if 0x40 <= self.status <= 0x7F:
+            return "failed"
+        return "pending"  # reserved values must not become a false failure
 
 
 # --------------------------------------------------------------------------
@@ -181,6 +222,16 @@ def _encode_address(number: str) -> bytes:
     return bytes([len(digits), toa]) + _encode_digits(digits)
 
 
+def _decode_smsc(reader: _Reader) -> str | None:
+    sca_len = reader.byte()
+    if not sca_len:
+        return None
+    sca = reader.take(sca_len)
+    toa = sca[0]
+    digits = _decode_digits(sca[1:], (sca_len - 1) * 2)
+    return ("+" + digits) if (toa & 0x70) == 0x10 else digits
+
+
 def _decode_scts(data: bytes) -> datetime | None:
     """Decode the 7-octet service-centre timestamp."""
     try:
@@ -209,21 +260,27 @@ def _decode_scts(data: bytes) -> datetime | None:
         return None
 
 
-def _parse_udh(udh: bytes) -> tuple[Concat | None, tuple[int, int] | None]:
+def _parse_udh(udh: bytes) -> tuple[Concat | None, tuple[int, int] | None, bool]:
     """Pull the concatenation and port-addressing IEs out of a user-data header.
 
     Both are returned because they answer different questions and either can
     appear without the other: concatenation says how to reassemble, ports say
     the payload was never meant for a human reader.  The loop keeps walking
-    after a match — a real UDH often carries both IEs.
+    after a match — a real UDH often carries both IEs.  The final boolean says
+    whether an element crossed the boundary declared by TP-UDHL.
     """
     concat: Concat | None = None
     ports: tuple[int, int] | None = None
     pos = 0
-    while pos + 2 <= len(udh):
+    while pos < len(udh):
+        if pos + 2 > len(udh):
+            return concat, ports, True
         iei = udh[pos]
         ie_len = udh[pos + 1]
-        payload = udh[pos + 2 : pos + 2 + ie_len]
+        end = pos + 2 + ie_len
+        if end > len(udh):
+            return concat, ports, True
+        payload = udh[pos + 2 : end]
         if iei == 0x00 and len(payload) >= 3:  # 8-bit reference
             concat = concat or Concat(ref=payload[0], total=payload[1], seq=payload[2])
         elif iei == 0x08 and len(payload) >= 4:  # 16-bit reference
@@ -239,8 +296,8 @@ def _parse_udh(udh: bytes) -> tuple[Concat | None, tuple[int, int] | None]:
                 (payload[0] << 8) | payload[1],
                 (payload[2] << 8) | payload[3],
             )
-        pos += 2 + ie_len
-    return concat, ports
+        pos = end
+    return concat, ports, False
 
 
 def _decode_ucs2(payload: bytes) -> str:
@@ -262,10 +319,11 @@ def _decode_ucs2(payload: bytes) -> str:
 
 def _decode_user_data(
     body: bytes, udl: int, dcs: int, has_udh: bool
-) -> tuple[str, Concat | None, str, tuple[int, int] | None]:
+) -> tuple[str, Concat | None, str, tuple[int, int] | None, bool]:
     alphabet = alphabet_from_dcs(dcs)
     concat: Concat | None = None
     ports: tuple[int, int] | None = None
+    udh_malformed = False
     udh_octets = 0
 
     if has_udh:
@@ -273,7 +331,9 @@ def _decode_user_data(
             raise PduError("UDHI set but user data is empty")
         udhl = body[0]
         udh_octets = udhl + 1
-        concat, ports = _parse_udh(body[1:udh_octets])
+        udh_malformed = udh_octets > len(body)
+        concat, ports, invalid_elements = _parse_udh(body[1:udh_octets])
+        udh_malformed = udh_malformed or invalid_elements
 
     if alphabet == "gsm7":
         # The 7-bit stream is realigned so it starts on a septet boundary.
@@ -288,7 +348,7 @@ def _decode_user_data(
         payload = body[udh_octets:udl] if udl <= len(body) else body[udh_octets:]
         text = payload.decode("latin-1", errors="replace")
 
-    return text, concat, alphabet, ports
+    return text, concat, alphabet, ports, udh_malformed
 
 
 # --------------------------------------------------------------------------
@@ -306,28 +366,24 @@ def decode_pdu(pdu_hex: str) -> DecodedSms:
 
     reader = _Reader(data)
 
-    sca_len = reader.byte()
-    smsc = None
-    if sca_len:
-        sca = reader.take(sca_len)
-        toa = sca[0]
-        digits = _decode_digits(sca[1:], (sca_len - 1) * 2)
-        smsc = ("+" + digits) if (toa & 0x70) == 0x10 else digits
+    smsc = _decode_smsc(reader)
 
     first = reader.byte()
     mti = first & 0x03
     has_udh = bool(first & 0x40)
+    status_report_requested = False
 
     if mti == MTI_DELIVER:
         address = _decode_address(reader)
-        reader.byte()  # TP-PID
+        pid = reader.byte()
         dcs = reader.byte()
         timestamp = _decode_scts(reader.take(7))
         kind = "deliver"
     elif mti == MTI_SUBMIT:
+        status_report_requested = bool(first & 0x20)
         reader.byte()  # TP-MR
         address = _decode_address(reader)
-        reader.byte()  # TP-PID
+        pid = reader.byte()
         dcs = reader.byte()
         vpf = (first >> 3) & 0x03
         if vpf == 0x02:  # relative
@@ -340,7 +396,9 @@ def decode_pdu(pdu_hex: str) -> DecodedSms:
         raise PduError(f"unsupported TP-MTI {mti} (first octet 0x{first:02X})")
 
     udl = reader.byte()
-    text, concat, alphabet, ports = _decode_user_data(reader.rest(), udl, dcs, has_udh)
+    text, concat, alphabet, ports, udh_malformed = _decode_user_data(
+        reader.rest(), udl, dcs, has_udh
+    )
 
     return DecodedSms(
         kind=kind,
@@ -353,6 +411,41 @@ def decode_pdu(pdu_hex: str) -> DecodedSms:
         concat=concat,
         raw=cleaned.upper(),
         ports=ports,
+        udh_malformed=udh_malformed,
+        status_report_requested=status_report_requested,
+        pid=pid,
+    )
+
+
+def decode_status_report(pdu_hex: str) -> StatusReport:
+    """Decode an SMS-STATUS-REPORT PDU carried by a ``+CDS`` URC."""
+    cleaned = re.sub(r"\s", "", pdu_hex)
+    try:
+        data = bytes.fromhex(cleaned)
+    except ValueError as exc:
+        raise PduError(f"not valid hex: {exc}") from exc
+
+    reader = _Reader(data)
+    smsc = _decode_smsc(reader)
+    first = reader.byte()
+    if (first & 0x03) != MTI_STATUS_REPORT:
+        raise PduError(
+            f"expected SMS-STATUS-REPORT, got TP-MTI {first & 0x03} "
+            f"(first octet 0x{first:02X})"
+        )
+    message_reference = reader.byte()
+    recipient = _decode_address(reader)
+    service_center_timestamp = _decode_scts(reader.take(7))
+    discharge_time = _decode_scts(reader.take(7))
+    status = reader.byte()
+    return StatusReport(
+        message_reference=message_reference,
+        recipient=recipient,
+        service_center_timestamp=service_center_timestamp,
+        discharge_time=discharge_time,
+        status=status,
+        smsc=smsc,
+        raw=cleaned.upper(),
     )
 
 
@@ -403,6 +496,7 @@ def encode_submit(
     ref: int | None = None,
     validity_period: int = 0xAA,
     force_ucs2: bool = False,
+    request_status_report: bool = True,
 ) -> list[EncodedPdu]:
     """Build the ``SMS-SUBMIT`` segments for one outgoing message.
 
@@ -439,6 +533,8 @@ def encode_submit(
         udh = _build_udh(ref, total, index) if total > 1 else b""
 
         first_octet = 0x01 | 0x10  # SUBMIT + relative validity period
+        if request_status_report:
+            first_octet |= 0x20  # TP-SRR
         if udh:
             first_octet |= 0x40  # UDHI
 
@@ -503,6 +599,32 @@ def _encode_scts(when: datetime) -> bytes:
             tz_octet,
         ]
     )
+
+
+def encode_status_report(
+    message_reference: int,
+    recipient: str,
+    *,
+    status: int = 0,
+    submitted_at: datetime | None = None,
+    discharged_at: datetime | None = None,
+    smsc: str = "+8613800210500",
+) -> str:
+    """Build a network delivery report for the mock modem and tests."""
+    now = datetime.now(timezone(timedelta(hours=8)))
+    submitted_at = submitted_at or now
+    discharged_at = discharged_at or now
+    sca_digits = re.sub(r"\D", "", smsc)
+    sca = bytes([0x91]) + _encode_digits(sca_digits)
+    sca_field = bytes([len(sca)]) + sca
+    tpdu = (
+        bytes([MTI_STATUS_REPORT, message_reference & 0xFF])
+        + _encode_address(recipient)
+        + _encode_scts(submitted_at)
+        + _encode_scts(discharged_at)
+        + bytes([status & 0xFF])
+    )
+    return (sca_field + tpdu).hex().upper()
 
 
 def encode_deliver(

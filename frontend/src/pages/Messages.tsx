@@ -20,6 +20,8 @@ import {
   Stack,
   TextField,
   Tooltip,
+  ToggleButton,
+  ToggleButtonGroup,
   Typography,
   useMediaQuery,
 } from '@mui/material'
@@ -34,7 +36,15 @@ import DownloadIcon from '@mui/icons-material/FileDownloadOutlined'
 import ContentCopyIcon from '@mui/icons-material/ContentCopyOutlined'
 import DataIcon from '@mui/icons-material/DataObjectOutlined'
 import CheckIcon from '@mui/icons-material/CheckOutlined'
-import { detectOtp, hasOlderMessages, OTP_RE, resolveThread, threadPreview } from '../messages'
+import {
+  deliveryStatusLabel,
+  detectOtp,
+  hasOlderMessages,
+  messagePreview,
+  OTP_RE,
+  resolveThread,
+  threadPreview,
+} from '../messages'
 import { api, ApiError, type Conversation, type Device, type Message } from '../api'
 import { useToast } from '../toast'
 import { Loading } from '../components/common'
@@ -55,6 +65,7 @@ import { STATUS } from '../tokens'
  */
 
 const THREAD_PAGE = 200
+type MessageContent = 'all' | 'text' | 'data'
 // Roughly where a GSM-7 message splits.  Only a hint: the agent does the real
 // segmentation, and Unicode content splits far earlier.
 const SINGLE_SEGMENT = 70
@@ -106,10 +117,11 @@ export function MessagesPage() {
   const [search, setSearch] = useState('')
   const [searchOpen, setSearchOpen] = useState(false)
   const [composeOpen, setComposeOpen] = useState(false)
+  const [content, setContent] = useState<MessageContent>('all')
 
   const { data: threads, mutate: loadThreads } = useSWR(
-    '/api/messages/conversations',
-    () => api.messages.conversations(),
+    ['/api/messages/conversations', content],
+    () => api.messages.conversations(content === 'all' ? undefined : content),
     { refreshInterval: 10_000 }
   )
   const { data: devices = [] } = useSWR('/api/devices', () => api.devices.list(), {
@@ -153,7 +165,10 @@ export function MessagesPage() {
               </IconButton>
             </Tooltip>
             <Tooltip title="导出 CSV">
-              <IconButton onClick={() => void api.messages.exportCsv()} size="small">
+              <IconButton
+                onClick={() => void api.messages.exportCsv(content === 'all' ? undefined : content)}
+                size="small"
+              >
                 <DownloadIcon />
               </IconButton>
             </Tooltip>
@@ -189,20 +204,27 @@ export function MessagesPage() {
             onSelect={setSelected}
             search={search}
             onSearch={setSearch}
+            content={content}
+            onContent={(next) => {
+              setContent(next)
+              setSelected(null)
+            }}
             fullWidth={narrow}
           />
         )}
         {showList && showThread && <Divider orientation="vertical" flexItem />}
         {showThread && (
           <ThreadView
-            key={selected ? `${selected.sim_id}:${selected.peer}` : 'empty'}
+            key={selected ? `${selected.sim_id}:${selected.peer}:${content}` : 'empty'}
             thread={selected}
+            content={content}
             devices={devices}
             onBack={narrow ? () => setSelected(null) : undefined}
             onRead={() => void loadThreads()}
             onSent={async () => {
               toast.show('已发送', 'success')
-              await loadThreads()
+              if (content === 'all') await loadThreads()
+              else setContent('all')
             }}
             onError={(msg) => toast.show(msg, 'error')}
           />
@@ -216,6 +238,9 @@ export function MessagesPage() {
           onClose={() => setSearchOpen(false)}
           onOpenThread={(thread) => {
             setSearchOpen(false)
+            // Search spans both text and data regardless of the list filter.
+            // Show the result the operator actually chose.
+            setContent('all')
             setSelected(thread)
           }}
         />
@@ -228,7 +253,10 @@ export function MessagesPage() {
         onSent={async (peer) => {
           setComposeOpen(false)
           toast.show('已发送', 'success')
-          const rows = await loadThreads()
+          const rows = content === 'all'
+            ? await loadThreads()
+            : await api.messages.conversations()
+          setContent('all')
           const thread = rows?.find((t) => t.peer === peer)
           if (thread) setSelected(thread)
         }}
@@ -249,6 +277,8 @@ function ThreadList({
   onSelect,
   search,
   onSearch,
+  content,
+  onContent,
   fullWidth,
 }: {
   threads: Conversation[] | null
@@ -256,11 +286,25 @@ function ThreadList({
   onSelect: (thread: Conversation) => void
   search: string
   onSearch: (value: string) => void
+  content: MessageContent
+  onContent: (value: MessageContent) => void
   fullWidth: boolean
 }) {
   return (
     <Stack sx={{ width: fullWidth ? '100%' : 340, flexShrink: 0, minHeight: 0 }}>
-      <Box sx={{ p: 1.5 }}>
+      <Stack spacing={1} sx={{ p: 1.5 }}>
+        <ToggleButtonGroup
+          exclusive
+          size="small"
+          value={content}
+          onChange={(_, value: MessageContent | null) => value && onContent(value)}
+          aria-label="短信内容类型"
+          sx={{ '& .MuiToggleButton-root': { flex: 1 } }}
+        >
+          <ToggleButton value="all">全部</ToggleButton>
+          <ToggleButton value="text">文本</ToggleButton>
+          <ToggleButton value="data">数据</ToggleButton>
+        </ToggleButtonGroup>
         <TextField
           size="small"
           fullWidth
@@ -277,7 +321,7 @@ function ThreadList({
             }
           }}
         />
-      </Box>
+      </Stack>
       <Divider />
       <Box sx={{ overflowY: 'auto', flexGrow: 1 }}>
         {threads === null ? (
@@ -391,6 +435,7 @@ function PeerAvatar({ peer }: { peer: string }) {
 
 function ThreadView({
   thread,
+  content,
   devices,
   onBack,
   onRead,
@@ -398,6 +443,7 @@ function ThreadView({
   onError,
 }: {
   thread: Conversation | null
+  content: MessageContent
   devices: Device[]
   onBack?: () => void
   /** Fired after this thread's incoming messages are marked read. */
@@ -418,12 +464,13 @@ function ThreadView({
   const [reach, setReach] = useState(THREAD_PAGE)
 
   const { data, mutate } = useSWR(
-    thread ? ['/api/messages', thread.sim_id, thread.peer, reach] : null,
+    thread ? ['/api/messages', thread.sim_id, thread.peer, reach, content] : null,
     async () => {
       const data = await api.messages.list({
         peer: thread!.peer,
         sim_id: thread!.sim_id ?? undefined,
         limit: reach,
+        content: content === 'all' ? undefined : content,
       })
       // Opening a conversation is the read receipt.
       if (data.items.some((m) => m.direction === 'in' && !m.read_at)) {
@@ -433,7 +480,12 @@ function ThreadView({
       // The API returns newest first; a conversation reads oldest first.
       return { messages: [...data.items].reverse(), total: data.total }
     },
-    { keepPreviousData: true },
+    {
+      keepPreviousData: true,
+      // Delivery reports arrive independently from the send request. Keep the
+      // open transcript live so pending bubbles settle without a manual refresh.
+      refreshInterval: 5_000,
+    },
   )
 
   const messages = data?.messages
@@ -629,10 +681,18 @@ function Bubble({
 }) {
   const outgoing = message.direction === 'out'
   const failed = message.status === 'failed'
-  // Data, not text: an 8-bit TP-DCS or a port-addressing UDH (OTA
-  // provisioning, WAP push, SIM toolkit). Decoding it as characters is what
-  // produced the wall of mojibake this replaces, and an OTP search over it
-  // would only ever find noise.
+  const deliveryLabel = outgoing ? deliveryStatusLabel(message.status) : null
+  const deliveryColor = message.status === 'delivered'
+    ? STATUS.good
+    : message.status === 'partial'
+      ? STATUS.warning
+      : message.status === 'failed'
+        ? STATUS.critical
+        : 'text.secondary'
+  // Data, not text: an 8-bit TP-DCS, a port-addressing UDH (OTA provisioning,
+  // WAP push, SIM toolkit), a malformed UDH with no trustworthy payload
+  // boundary, or an empty operator control message. Decoding data as characters
+  // is what produced the wall of mojibake this replaces.
   const binary = Boolean(message.is_binary)
   const code = binary ? null : detectOtp(message.body)
   const [copied, setCopied] = useState(false)
@@ -740,6 +800,11 @@ function Bubble({
                 · {message.segments} 段
               </Typography>
             )}
+            {deliveryLabel && !failed && (
+              <Typography variant="caption" sx={{ color: deliveryColor, fontWeight: 600 }}>
+                · {deliveryLabel}
+              </Typography>
+            )}
             {message.raw_pdu && (
               <Tooltip title={pduCopied ? '已复制' : '复制原始 PDU(排查用)'}>
                 <IconButton
@@ -763,7 +828,7 @@ function Bubble({
                   }}>
                     <ErrorIcon sx={{ fontSize: 14, color: STATUS.critical }} />
                     <Typography variant="caption" sx={{ color: STATUS.critical }}>
-                      发送失败
+                      {deliveryLabel ?? '发送失败'}
                     </Typography>
                   </Stack>
                 </Tooltip>
@@ -974,6 +1039,7 @@ function SearchDialog({
       device: message.device,
       last_id: message.id,
       last_body: message.body,
+      last_is_binary: message.is_binary,
       last_direction: message.direction,
       last_status: message.status,
       last_ts: message.ts,
@@ -1052,7 +1118,7 @@ function SearchDialog({
                       color: 'text.secondary'
                     }}>
                       {message.direction === 'out' ? '你:' : '收到:'}
-                      {message.body}
+                      {messagePreview(message)}
                     </Typography>
                   </Box>
                 </ListItemButton>

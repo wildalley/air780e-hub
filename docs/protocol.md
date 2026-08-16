@@ -9,6 +9,10 @@ JSON over WebSocket。**连接方向始终是 agent 主动拨出**,Server 不向
 - 编码:每帧一个 JSON 对象,UTF-8
 - 心跳:WebSocket ping/pong,30 秒一次;90 秒无 pong 视为断开
 
+当前线协议版本为 `1`。Agent 在 `hello.protocol_version` 中声明版本；Server 将其与
+自身版本比较并在运维中心显示。软件版本不同会创建 warning 事件，协议版本不同会
+创建 critical 事件。`0.x` 阶段不支持跨版本混用，部署时仍须同步升级两端。
+
 部署自检可连接 `/ws?self_check=1`,仍需提供相同的 Bearer Token。认证成功后
 Server 返回 `{"type":"self_check","ok":true}` 并正常关闭连接,且不会登记临时
 Agent 或修改业务数据。该参数只用于连通性检查,正式 Agent 不应携带。
@@ -42,6 +46,7 @@ Agent 或修改业务数据。该参数只用于连通性检查,正式 Agent 不
   "type": "hello",
   "agent_id": "site-a",
   "version": "0.1.0",
+  "protocol_version": 1,
   "last_seq": 1420,
   "devices": [
     {
@@ -58,6 +63,9 @@ Agent 或修改业务数据。该参数只用于连通性检查,正式 Agent 不
 }
 ```
 
+`version` 是发布版本，`protocol_version` 是 JSON 帧契约版本；两者用途不同，均须
+上报。旧 Agent 未携带协议字段时按 `0` 处理，因此会明确显示为协议不兼容。
+
 ### `sms_in` —— 收到短信
 
 ```json
@@ -70,11 +78,17 @@ Agent 或修改业务数据。该参数只用于连通性检查,正式 Agent 不
   "body": "测试消息 123456",
   "ts": "2026-01-02T09:30:00+08:00",
   "segments": 1,
+  "dcs": 0,
+  "alphabet": "gsm7",
+  "binary": false,
   "pdu": "0891683108200105F0..."
 }
 ```
 
 `ts` 取短信中心时间戳(SCTS);缺失时用 agent 收到的时间,并置 `"ts_source": "local"`。
+`binary=true` 表示 8-bit DCS、端口寻址数据、UDH 损坏且正文边界不可信，或无正文的
+短信中心专用 PID 控制消息。Server 保留其 PDU 用于诊断，但不会把内容当作可读文本
+发送到通知渠道。
 
 ### `sms_out` —— 发送结果
 
@@ -95,6 +109,33 @@ Agent 或修改业务数据。该参数只用于连通性检查,正式 Agent 不
 ```
 
 `status`:`sent` | `failed`。`cmd_id` 在由下行命令触发时带上,保号任务自发的则为 null。
+`refs` 是各分段 `AT+CMGS` 返回的 TP-MR，顺序与短信分段一致。Agent 默认在每个
+SMS-SUBMIT 上设置 TP-SRR，请求短信中心返回状态报告。
+
+### `sms_delivery` —— 运营商送达回执
+
+```json
+{
+  "type": "sms_delivery",
+  "seq": 1423,
+  "device": "a",
+  "iccid": "8986...",
+  "reference": 12,
+  "peer": "10086",
+  "status": "delivered",
+  "status_code": 0,
+  "service_center_ts": "2026-08-02T18:00:00+08:00",
+  "discharge_ts": "2026-08-02T18:00:05+08:00",
+  "ts": "2026-08-02T18:00:06+08:00",
+  "pdu": "0791..."
+}
+```
+
+Agent 通过 `AT+CNMI=2,1,0,1,0` 接收 `+CDS`，解码 SMS-STATUS-REPORT 后持久化到
+事件队列。`reference` 是 TP-MR，`status_code` 是原始 TP-ST；`0x00–0x1F` 映射为
+`delivered`，`0x20–0x3F` 为短信中心仍会重试的 `pending`，`0x40–0x7F` 为
+`failed`。Server 以原始 TP-ST 为准，并用短信中心提交时间处理 TP-MR 循环复用。
+多分段短信在 Server 聚合为 `pending`、`partial`、`delivered` 或 `failed`。
 
 ### `status` —— 设备状态采样
 

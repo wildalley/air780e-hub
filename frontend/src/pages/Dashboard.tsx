@@ -39,6 +39,7 @@ import { StatTile } from '../components/StatTile'
 import { StorageMeter } from '../components/StorageMeter'
 import { SignalChart, type SignalSeries } from '../components/SignalChart'
 import { formatTs, relativeTs } from '../format'
+import { messagePreview } from '../messages'
 import { entranceStyle } from '../motion'
 import { Loading, OnlineChip } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
@@ -294,7 +295,7 @@ export function DashboardPage() {
                             whiteSpace: 'nowrap',
                           }}
                         >
-                          {message.body}
+                          {messagePreview(message)}
                         </TableCell>
                       </TableRow>
                     ))}

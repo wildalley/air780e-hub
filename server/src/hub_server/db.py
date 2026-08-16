@@ -32,6 +32,9 @@ log = logging.getLogger(__name__)
 # as 0 and are reconciled to 1 on first open; see ``Database._migrate``.
 #
 # Version 2 adds ``messages.raw_pdu`` and ``messages.dcs``.
+# Version 3 records the Agent/Server WebSocket protocol version.
+# Version 4 adds per-segment SMS delivery reports.
+# Version 5 reclassifies stored data PDUs that predate the current checks.
 #
 # To add a migration: append one entry to ``MIGRATIONS`` with the next integer
 # and bump this constant, and add the same columns/tables to SCHEMA so a brand
@@ -41,7 +44,7 @@ log = logging.getLogger(__name__)
 # Never renumber or edit a released entry — a database that already ran it will
 # not run it again, so an edit only affects databases that have not, and the two
 # then disagree about what version N means.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 5
 
 # Persisted (settings table) key for the SMS retention window, in days.  The
 # operator edits it on the Notify page; when unset the env default applies.
@@ -73,6 +76,7 @@ PRAGMA foreign_keys = ON;
 CREATE TABLE IF NOT EXISTS agents (
     id           TEXT PRIMARY KEY,
     version      TEXT NOT NULL DEFAULT '',
+    protocol_version INTEGER NOT NULL DEFAULT 0,
     last_seen_at TEXT,
     connected    INTEGER NOT NULL DEFAULT 0,
     last_seq     INTEGER NOT NULL DEFAULT 0
@@ -146,16 +150,44 @@ CREATE TABLE IF NOT EXISTS messages (
     -- to tell a decoder bug from a message that was never text to begin with.
     raw_pdu    TEXT,
     dcs        INTEGER,
-    -- Set when the payload was data rather than text: an 8-bit TP-DCS, or a
-    -- port-addressing UDH (OTA provisioning, WAP push, SIM toolkit).  Such a
-    -- payload decoded as text is a wall of mojibake, so the UI renders it as
-    -- what it is instead of pretending someone sent it.
+    -- Set when the payload was data rather than text: an 8-bit TP-DCS, a
+    -- port-addressing UDH (OTA provisioning, WAP push, SIM toolkit), a
+    -- malformed UDH whose payload boundary cannot be trusted, or an empty
+    -- service-centre-specific PID message. The UI renders what it is.
     is_binary  INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_sim ON messages(sim_id, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_peer ON messages(peer, ts DESC);
+
+-- One row per outbound segment. Rows with no message_id are status reports
+-- that beat their sms_out event to the Server and will be reconciled later.
+CREATE TABLE IF NOT EXISTS sms_delivery_segments (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id        INTEGER REFERENCES messages(id) ON DELETE CASCADE,
+    agent_id          TEXT NOT NULL,
+    device            TEXT NOT NULL,
+    segment_index     INTEGER,
+    modem_reference   INTEGER NOT NULL,
+    recipient         TEXT NOT NULL DEFAULT '',
+    recipient_key     TEXT NOT NULL DEFAULT '',
+    submitted_at      TEXT,
+    status            TEXT NOT NULL DEFAULT 'pending',
+    status_code       INTEGER,
+    service_center_ts TEXT,
+    discharge_ts      TEXT,
+    reported_at       TEXT,
+    raw_pdu           TEXT,
+    event_seq         INTEGER,
+    created_at        TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sms_delivery_message_segment
+    ON sms_delivery_segments(message_id, segment_index);
+CREATE INDEX IF NOT EXISTS idx_sms_delivery_match
+    ON sms_delivery_segments(agent_id, device, modem_reference, submitted_at DESC);
+CREATE INDEX IF NOT EXISTS idx_sms_delivery_unmatched
+    ON sms_delivery_segments(message_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS device_status (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -328,6 +360,65 @@ def to_utc_iso(value: str | None) -> str:
     return parsed.astimezone(UTC).isoformat(timespec="seconds")
 
 
+def _pdu_is_data(raw_pdu: str) -> bool:
+    """Classify a stored inbound PDU without decoding its user data as text."""
+    try:
+        data = bytes.fromhex("".join(raw_pdu.split()))
+    except ValueError:
+        return False
+    if not data:
+        return False
+
+    tpdu = 1 + data[0]  # SMSC length excludes its own length octet.
+    if tpdu >= len(data):
+        return False
+    first = data[tpdu]
+    if (first & 0x03) != 0:  # only stored inbound SMS-DELIVER PDUs
+        return False
+
+    pos = tpdu + 1
+    if pos + 2 > len(data):
+        return False
+    address_digits = data[pos]
+    pos += 2 + (address_digits + 1) // 2
+    # TP-PID, TP-DCS, TP-SCTS (7 octets), TP-UDL.
+    if pos + 10 > len(data):
+        return False
+    pid = data[pos]
+    dcs = data[pos + 1]
+    udl = data[pos + 9]
+    body = data[pos + 10 :]
+
+    if (dcs & 0xC0) == 0x00:
+        uses_8bit = ((dcs >> 2) & 0x03) == 1
+    elif (dcs & 0xF0) == 0xF0:
+        uses_8bit = bool(dcs & 0x04)
+    else:
+        uses_8bit = False
+    if uses_8bit or (udl == 0 and pid >= 0xC0):
+        return True
+    if not (first & 0x40):
+        return False
+    if not body:
+        return True
+
+    header_end = body[0] + 1
+    if header_end > len(body):
+        return True
+    header = body[1:header_end]
+    cursor = 0
+    while cursor < len(header):
+        if cursor + 2 > len(header):
+            return True
+        element_end = cursor + 2 + header[cursor + 1]
+        if element_end > len(header):
+            return True
+        if header[cursor] in {0x04, 0x05}:  # application port addressing
+            return True
+        cursor = element_end
+    return False
+
+
 class Database:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -344,8 +435,7 @@ class Database:
         self._db.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         with self._lock:
-            self._db.executescript(SCHEMA)
-            self._migrate(pre_existing=pre_existing)
+            self._prepare_schema(pre_existing=pre_existing)
 
     def _has_schema(self) -> bool:
         """True if the file exists and already contains hub tables."""
@@ -374,6 +464,25 @@ class Database:
         # PRAGMA takes no parameters, hence the interpolation; the value is an
         # int from MIGRATIONS, never external input.
         self._db.execute(f"PRAGMA user_version = {int(version)}")
+
+    def _prepare_schema(self, *, pre_existing: bool) -> None:
+        """Snapshot and validate an old database before any schema writes."""
+        version = self._user_version()
+        if version > SCHEMA_VERSION:
+            raise SchemaTooNew(
+                f"database schema version {version} is newer than this server "
+                f"supports ({SCHEMA_VERSION}); upgrade the server or restore a "
+                f"backup taken from this version"
+            )
+        snapshot = (
+            self._snapshot_before_migration(version)
+            if pre_existing and version < SCHEMA_VERSION
+            else None
+        )
+        # SCHEMA also supplies tables that existed before formal versioning.
+        # It is intentionally applied only after the snapshot is durable.
+        self._db.executescript(SCHEMA)
+        self._migrate(pre_existing=pre_existing, snapshot=snapshot)
 
     def _reconcile_to_baseline(self) -> None:
         """Bring a pre-versioning database up to schema version 1.
@@ -406,6 +515,12 @@ class Database:
     MIGRATIONS: tuple[tuple[int, str, str], ...] = (
         (2, "keep the raw PDU, TP-DCS and binary flag of every message",
          "_migration_message_diagnostics"),
+        (3, "record the Agent WebSocket protocol version",
+         "_migration_agent_protocol_version"),
+        (4, "track delivery reports for each outbound SMS segment",
+         "_migration_sms_delivery_segments"),
+        (5, "reclassify stored data-message PDUs",
+         "_migration_data_messages"),
     )
 
     def _add_columns_if_missing(self, table: str, columns: dict[str, str]) -> None:
@@ -441,6 +556,59 @@ class Database:
             },
         )
 
+    def _migration_agent_protocol_version(self) -> None:
+        """v2 -> v3: make wire compatibility observable after disconnect."""
+        self._add_columns_if_missing(
+            "agents", {"protocol_version": "INTEGER NOT NULL DEFAULT 0"}
+        )
+
+    def _migration_sms_delivery_segments(self) -> None:
+        """v3 -> v4: normalized modem references and their delivery state."""
+        self._db.execute(
+            "CREATE TABLE IF NOT EXISTS sms_delivery_segments ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "message_id INTEGER REFERENCES messages(id) ON DELETE CASCADE, "
+            "agent_id TEXT NOT NULL, device TEXT NOT NULL, segment_index INTEGER, "
+            "modem_reference INTEGER NOT NULL, recipient TEXT NOT NULL DEFAULT '', "
+            "recipient_key TEXT NOT NULL DEFAULT '', submitted_at TEXT, "
+            "status TEXT NOT NULL DEFAULT 'pending', status_code INTEGER, "
+            "service_center_ts TEXT, discharge_ts TEXT, reported_at TEXT, "
+            "raw_pdu TEXT, event_seq INTEGER, created_at TEXT NOT NULL)"
+        )
+        self._db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sms_delivery_message_segment "
+            "ON sms_delivery_segments(message_id, segment_index)"
+        )
+        self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sms_delivery_match "
+            "ON sms_delivery_segments"
+            "(agent_id, device, modem_reference, submitted_at DESC)"
+        )
+        self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sms_delivery_unmatched "
+            "ON sms_delivery_segments(message_id, created_at DESC)"
+        )
+
+    def _migration_data_messages(self) -> None:
+        """v4 -> v5: hide already-stored data PDUs fixed by the new Agent."""
+        last_id = 0
+        while rows := self._db.execute(
+            "SELECT id, raw_pdu FROM messages "
+            "WHERE id > ? AND direction = 'in' AND is_binary = 0 "
+            "AND raw_pdu IS NOT NULL ORDER BY id LIMIT 500",
+            (last_id,),
+        ).fetchall():
+            malformed = [
+                (row["id"],)
+                for row in rows
+                if _pdu_is_data(row["raw_pdu"])
+            ]
+            if malformed:
+                self._db.executemany(
+                    "UPDATE messages SET is_binary = 1 WHERE id = ?", malformed
+                )
+            last_id = int(rows[-1]["id"])
+
     def _snapshot_before_migration(self, from_version: int) -> Path | None:
         """Copy the database aside before migrating it.
 
@@ -464,7 +632,9 @@ class Database:
         log.info("pre-migration snapshot written to %s", dest)
         return dest
 
-    def _migrate(self, *, pre_existing: bool) -> None:
+    def _migrate(
+        self, *, pre_existing: bool, snapshot: Path | None
+    ) -> None:
         version = self._user_version()
         if version > SCHEMA_VERSION:
             raise SchemaTooNew(
@@ -485,15 +655,6 @@ class Database:
             # forward, and this one has no past.
             self._set_user_version(SCHEMA_VERSION)
             return
-
-        # Only an existing database needs protecting.  A file we just created is
-        # empty, and snapshotting it would litter the data directory on every
-        # first start.
-        snapshot = (
-            self._snapshot_before_migration(version)
-            if pre_existing and version < SCHEMA_VERSION
-            else None
-        )
 
         if version == 0:
             self._run_step(
@@ -585,13 +746,17 @@ class Database:
 
     # -- agents and devices ------------------------------------------------
 
-    def upsert_agent(self, agent_id: str, version: str, connected: bool) -> None:
+    def upsert_agent(
+        self, agent_id: str, version: str, protocol_version: int, connected: bool
+    ) -> None:
         self.execute(
-            "INSERT INTO agents (id, version, last_seen_at, connected) "
-            "VALUES (?, ?, ?, ?) "
+            "INSERT INTO agents "
+            "(id, version, protocol_version, last_seen_at, connected) "
+            "VALUES (?, ?, ?, ?, ?) "
             "ON CONFLICT(id) DO UPDATE SET version = excluded.version, "
+            "protocol_version = excluded.protocol_version, "
             "last_seen_at = excluded.last_seen_at, connected = excluded.connected",
-            (agent_id, version, utcnow(), int(connected)),
+            (agent_id, version, protocol_version, utcnow(), int(connected)),
         )
 
     def set_agent_connected(self, agent_id: str, connected: bool) -> None:
@@ -783,7 +948,250 @@ class Database:
         )
         return int(cursor.lastrowid)
 
-    def conversations(self, *, limit: int = 200) -> list[dict[str, Any]]:
+    @staticmethod
+    def _recipient_key(recipient: str) -> str:
+        return "".join(char for char in str(recipient) if char.isdigit())
+
+    @classmethod
+    def _same_recipient(cls, left: str, right: str) -> bool:
+        """Match E.164 and local forms without guessing short service numbers."""
+        a, b = cls._recipient_key(left), cls._recipient_key(right)
+        if not a or not b:
+            return not a and not b
+        if a == b:
+            return True
+        return min(len(a), len(b)) >= 7 and (a.endswith(b) or b.endswith(a))
+
+    @staticmethod
+    def _delivery_state(status_code: int | None, claimed: str | None) -> str:
+        if status_code is not None:
+            if 0x00 <= status_code <= 0x1F:
+                return "delivered"
+            if 0x20 <= status_code <= 0x3F:
+                return "pending"
+            if 0x40 <= status_code <= 0x7F:
+                return "failed"
+        return claimed if claimed in {"pending", "delivered", "failed"} else "pending"
+
+    @staticmethod
+    def _terminal_delivery_state(current: str, incoming: str) -> str:
+        """An old temporary report must not regress a terminal outcome."""
+        if incoming == "pending" and current in {"delivered", "failed"}:
+            return current
+        if incoming == "failed" and current == "delivered":
+            return current
+        return incoming
+
+    @staticmethod
+    def _timestamp_distance(left: str | None, right: str | None) -> float:
+        if not left or not right:
+            return float("inf")
+        try:
+            return abs(
+                (datetime.fromisoformat(left) - datetime.fromisoformat(right)).total_seconds()
+            )
+        except (TypeError, ValueError):
+            return float("inf")
+
+    def attach_sms_segments(
+        self,
+        *,
+        message_id: int,
+        agent_id: str,
+        device: str,
+        recipient: str,
+        references: list[int],
+        submitted_at: str,
+    ) -> None:
+        """Attach modem references, reconciling reports that arrived first."""
+        submitted = to_utc_iso(submitted_at)
+        key = self._recipient_key(recipient)
+        cutoff = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+        with self._lock:
+            for segment_index, reference in enumerate(references, start=1):
+                candidates = self._db.execute(
+                    "SELECT * FROM sms_delivery_segments "
+                    "WHERE message_id IS NULL AND agent_id = ? AND device = ? "
+                    "AND modem_reference = ? AND created_at >= ? ORDER BY id DESC",
+                    (agent_id, device, reference, cutoff),
+                ).fetchall()
+                early = next(
+                    (
+                        row for row in candidates
+                        if self._same_recipient(row["recipient"], recipient)
+                    ),
+                    None,
+                )
+                if early is not None:
+                    self._db.execute(
+                        "UPDATE sms_delivery_segments SET message_id = ?, "
+                        "segment_index = ?, submitted_at = ?, recipient = ?, "
+                        "recipient_key = ? WHERE id = ?",
+                        (message_id, segment_index, submitted, recipient, key, early["id"]),
+                    )
+                else:
+                    self._db.execute(
+                        "INSERT INTO sms_delivery_segments "
+                        "(message_id, agent_id, device, segment_index, modem_reference, "
+                        "recipient, recipient_key, submitted_at, status, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+                        (
+                            message_id, agent_id, device, segment_index, reference,
+                            recipient, key, submitted, utcnow(),
+                        ),
+                    )
+            self._update_message_delivery_status(message_id)
+
+    def record_sms_delivery(
+        self,
+        *,
+        agent_id: str,
+        device: str,
+        reference: int,
+        recipient: str,
+        status_code: int | None,
+        status: str | None,
+        service_center_ts: str | None,
+        discharge_ts: str | None,
+        reported_at: str,
+        raw_pdu: str | None,
+        event_seq: int | None,
+    ) -> int | None:
+        """Store a report and return the correlated outbound message, if any."""
+        report_state = self._delivery_state(status_code, status)
+        service_ts = to_utc_iso(service_center_ts) if service_center_ts else None
+        discharge = to_utc_iso(discharge_ts) if discharge_ts else None
+        reported = to_utc_iso(reported_at)
+        key = self._recipient_key(recipient)
+        unmatched_cutoff = (datetime.now(UTC) - timedelta(days=14)).isoformat()
+
+        with self._lock:
+            candidates = self._db.execute(
+                "SELECT * FROM sms_delivery_segments "
+                "WHERE message_id IS NOT NULL AND agent_id = ? AND device = ? "
+                "AND modem_reference = ? "
+                "ORDER BY submitted_at DESC, id DESC",
+                (agent_id, device, reference),
+            ).fetchall()
+            candidates = [
+                row for row in candidates
+                if self._same_recipient(row["recipient"], recipient)
+            ]
+            matched = None
+            if candidates:
+                matched = (
+                    min(
+                        candidates,
+                        key=lambda row: self._timestamp_distance(
+                            row["submitted_at"], service_ts
+                        ),
+                    )
+                    if service_ts else candidates[0]
+                )
+
+            if matched is not None:
+                effective = self._terminal_delivery_state(matched["status"], report_state)
+                if effective != report_state:
+                    # This is a stale temporary/failure report rejected by the
+                    # state machine. Do not pair a retained terminal state with
+                    # the rejected report's TP-ST, timestamps, or raw PDU.
+                    message_id = int(matched["message_id"])
+                    self._update_message_delivery_status(message_id)
+                    return message_id
+                self._db.execute(
+                    "UPDATE sms_delivery_segments SET status = ?, status_code = ?, "
+                    "service_center_ts = ?, discharge_ts = ?, reported_at = ?, "
+                    "raw_pdu = ?, event_seq = ? WHERE id = ?",
+                    (
+                        effective, status_code, service_ts, discharge, reported,
+                        raw_pdu, event_seq, matched["id"],
+                    ),
+                )
+                message_id = int(matched["message_id"])
+                self._update_message_delivery_status(message_id)
+                return message_id
+
+            # A second report can supersede a temporary report before sms_out
+            # arrives. Keep one unmatched row per recent logical segment.
+            unmatched = self._db.execute(
+                "SELECT * FROM sms_delivery_segments "
+                "WHERE message_id IS NULL AND agent_id = ? AND device = ? "
+                "AND modem_reference = ? AND created_at >= ? ORDER BY id DESC",
+                (agent_id, device, reference, unmatched_cutoff),
+            ).fetchall()
+            existing = next(
+                (
+                    row for row in unmatched
+                    if self._same_recipient(row["recipient"], recipient)
+                ),
+                None,
+            )
+            if existing is not None:
+                effective = self._terminal_delivery_state(existing["status"], report_state)
+                if effective == report_state:
+                    self._db.execute(
+                        "UPDATE sms_delivery_segments SET recipient = ?, "
+                        "recipient_key = ?, status = ?, status_code = ?, "
+                        "service_center_ts = ?, discharge_ts = ?, reported_at = ?, "
+                        "raw_pdu = ?, event_seq = ? WHERE id = ?",
+                        (
+                            recipient, key, effective, status_code, service_ts,
+                            discharge, reported, raw_pdu, event_seq, existing["id"],
+                        ),
+                    )
+            else:
+                self._db.execute(
+                    "INSERT INTO sms_delivery_segments "
+                    "(message_id, agent_id, device, modem_reference, recipient, "
+                    "recipient_key, status, status_code, service_center_ts, "
+                    "discharge_ts, reported_at, raw_pdu, event_seq, created_at) "
+                    "VALUES (NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        agent_id, device, reference, recipient, key, report_state,
+                        status_code, service_ts, discharge, reported, raw_pdu,
+                        event_seq, utcnow(),
+                    ),
+                )
+            return None
+
+    def _update_message_delivery_status(self, message_id: int) -> None:
+        message = self._db.execute(
+            "SELECT segments FROM messages WHERE id = ?", (message_id,)
+        ).fetchone()
+        if message is None:
+            return
+        rows = self._db.execute(
+            "SELECT status, status_code FROM sms_delivery_segments "
+            "WHERE message_id = ? ORDER BY segment_index",
+            (message_id,),
+        ).fetchall()
+        if not rows:
+            return
+        expected = max(int(message["segments"] or 1), len(rows))
+        delivered = sum(row["status"] == "delivered" for row in rows)
+        failed = [row for row in rows if row["status"] == "failed"]
+        if delivered >= expected:
+            aggregate, error = "delivered", None
+        elif delivered:
+            aggregate = "partial"
+            error = "部分分段投递失败" if failed else None
+        elif failed:
+            aggregate = "failed"
+            codes = ", ".join(
+                f"0x{row['status_code']:02X}"
+                for row in failed if row["status_code"] is not None
+            )
+            error = f"短信投递失败{f' (TP-ST {codes})' if codes else ''}"
+        else:
+            aggregate, error = "pending", None
+        self._db.execute(
+            "UPDATE messages SET status = ?, error = ? WHERE id = ?",
+            (aggregate, error, message_id),
+        )
+
+    def conversations(
+        self, *, limit: int = 200, content: str | None = None
+    ) -> list[dict[str, Any]]:
         """Threads: one row per (card, correspondent), newest activity first.
 
         The bare ``m.body`` / ``m.direction`` / ``m.id`` columns alongside
@@ -792,6 +1200,8 @@ class Database:
         we want.  This is not portable SQL; on another engine it needs a
         window function.
         """
+        where, params = self._message_filter(content=content)
+        params.append(limit)
         return self.query(
             "SELECT m.sim_id, m.peer, m.device, "
             "       m.id AS last_id, m.body AS last_body, "
@@ -802,9 +1212,10 @@ class Database:
             "               THEN 1 ELSE 0 END) AS unread_count, "
             "       s.label AS sim_label, s.iccid AS sim_iccid "
             "FROM messages m LEFT JOIN sims s ON s.id = m.sim_id "
+            f"{where} "
             "GROUP BY m.sim_id, m.peer "
             "ORDER BY last_ts DESC LIMIT ?",
-            (limit,),
+            tuple(params),
         )
 
     def mark_read(self, *, sim_id: int | None, peer: str) -> int:
@@ -835,9 +1246,11 @@ class Database:
         direction: str | None = None,
         peer: str | None = None,
         search: str | None = None,
+        content: str | None = None,
     ) -> list[dict[str, Any]]:
         where, params = self._message_filter(
-            sim_id=sim_id, direction=direction, peer=peer, search=search
+            sim_id=sim_id, direction=direction, peer=peer, search=search,
+            content=content,
         )
         sql = (
             "SELECT m.*, s.label AS sim_label, s.iccid AS sim_iccid "
@@ -856,6 +1269,7 @@ class Database:
         direction: str | None = None,
         peer: str | None = None,
         search: str | None = None,
+        content: str | None = None,
     ) -> tuple[str, list[Any]]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -871,6 +1285,10 @@ class Database:
         if search:
             clauses.append("(m.body LIKE ? OR m.peer LIKE ?)")
             params.extend([f"%{search}%", f"%{search}%"])
+        if content == "text":
+            clauses.append("m.is_binary = 0")
+        elif content == "data":
+            clauses.append("m.is_binary = 1")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         return where, params
 
@@ -882,6 +1300,7 @@ class Database:
         direction: str | None = None,
         peer: str | None = None,
         search: str | None = None,
+        content: str | None = None,
         batch_size: int = 500,
     ) -> Iterable[dict[str, Any]]:
         """Stream a stable read without retaining every message in memory.
@@ -897,11 +1316,13 @@ class Database:
                 direction=direction,
                 peer=peer,
                 search=search,
+                content=content,
             )
             return
 
         where, params = self._message_filter(
-            sim_id=sim_id, direction=direction, peer=peer, search=search
+            sim_id=sim_id, direction=direction, peer=peer, search=search,
+            content=content,
         )
         sql = (
             "SELECT m.*, s.label AS sim_label, s.iccid AS sim_iccid "
@@ -931,9 +1352,11 @@ class Database:
         direction: str | None = None,
         peer: str | None = None,
         search: str | None = None,
+        content: str | None = None,
     ) -> int:
         where, params = self._message_filter(
-            sim_id=sim_id, direction=direction, peer=peer, search=search
+            sim_id=sim_id, direction=direction, peer=peer, search=search,
+            content=content,
         )
         row = self.one(
             f"SELECT COUNT(*) AS n FROM messages m {where}", tuple(params)
@@ -948,7 +1371,7 @@ class Database:
     _ROW_COUNT_TABLES = (
         "messages", "device_status", "notify_logs", "task_logs",
         "agent_logs", "audit_events", "incidents", "ingested",
-        "sims", "devices", "channels", "rules", "tasks",
+        "sms_delivery_segments", "sims", "devices", "channels", "rules", "tasks",
     )
 
     def activity_stats(self) -> dict[str, Any]:
@@ -1057,6 +1480,13 @@ class Database:
             removed["messages"] = self.execute(
                 "DELETE FROM messages WHERE ts < ?", (cutoff,)
             ).rowcount
+            # Matched rows cascade with messages. Unmatched reports have no
+            # parent, so give them the same retention horizon explicitly.
+            self.execute(
+                "DELETE FROM sms_delivery_segments "
+                "WHERE message_id IS NULL AND created_at < ?",
+                (cutoff,),
+            )
         if status_days > 0:
             cutoff = (
                 datetime.now(UTC) - timedelta(days=status_days)
@@ -1186,14 +1616,10 @@ class Database:
         try:
             with self._lock:
                 source.backup(self._db)
-                # Older valid backups predate additive operational tables and
-                # carry their own (lower) user_version.  Reapplying the schema
-                # and running the ordered migrations brings the restored data to
-                # the current version, so the live process stays usable without
-                # a restart.  pre_existing=True: this file now holds real data,
-                # so a migration must snapshot it first.
-                self._db.executescript(SCHEMA)
-                self._migrate(pre_existing=True)
+                # Older valid backups carry their own lower user_version.
+                # Prepare them exactly like a database opened at startup so the
+                # restored bytes are snapshotted before any migration writes.
+                self._prepare_schema(pre_existing=True)
         finally:
             source.close()
 

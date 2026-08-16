@@ -18,6 +18,7 @@ from typing import Any
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
+from . import PROTOCOL_VERSION
 from .config import ServerConfig
 from .store import LocalStore
 
@@ -128,6 +129,7 @@ class ServerLink:
                 "type": "hello",
                 "agent_id": self.agent_id,
                 "version": self.version,
+                "protocol_version": PROTOCOL_VERSION,
                 "last_seq": self.store.last_seq(),
                 "devices": self.describe_devices(),
             })
