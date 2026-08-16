@@ -16,7 +16,6 @@ import secrets
 import shutil
 import tempfile
 import time
-from collections.abc import Iterable
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal
 
@@ -29,6 +28,7 @@ from . import PROTOCOL_VERSION, __version__
 from .alerts import SETTING_ENABLED
 from .auth import SESSION_COOKIE, AuthError, hash_agent_token
 from .config import ConfigError
+from .csv_export import iter_message_csv
 from .db import SETTING_MESSAGE_RETENTION_DAYS, MigrationFailed, utcnow
 from .gateway import (
     SETTING_PREVIOUS_AGENT_TOKEN_EXPIRES_AT,
@@ -568,49 +568,15 @@ def build_router(state: AppState) -> APIRouter:
         content: Literal["text", "data"] | None = None,
     ) -> StreamingResponse:
         """Stream stored messages as CSV without materialising the export."""
-        import csv
-        import io
-
-        def generate() -> Iterable[str]:
-            buffer = io.StringIO()
-            writer = csv.writer(buffer)
-
-            def line(values: list[Any]) -> str:
-                buffer.seek(0)
-                buffer.truncate(0)
-                writer.writerow(values)
-                return buffer.getvalue()
-
-            # BOM makes Excel recognise the UTF-8 Chinese payload.
-            yield "\ufeff"
-            yield line([
-                "id", "ts", "direction", "sim_id", "sim_label", "peer",
-                "body", "status",
-                # The diagnostic trio. In the export because this is the one
-                # place an operator can hand a garbled message to someone who
-                # can read a PDU, without opening DevTools or a SQL prompt.
-                "is_binary", "dcs", "raw_pdu",
-            ])
-            for message in state.db.iter_messages(
-                limit=limit, sim_id=sim_id, peer=peer, search=search,
-                content=content,
-            ):
-                yield line([
-                    message["id"],
-                    message["ts"],
-                    message["direction"],
-                    message["sim_id"] or "",
-                    message.get("sim_label") or "",
-                    message["peer"],
-                    message["body"],
-                    message["status"],
-                    message.get("is_binary") or 0,
-                    "" if message.get("dcs") is None else message["dcs"],
-                    message.get("raw_pdu") or "",
-                ])
-
         return StreamingResponse(
-            generate(),
+            iter_message_csv(
+                state.db,
+                limit=limit,
+                sim_id=sim_id,
+                peer=peer,
+                search=search,
+                content=content,
+            ),
             media_type="text/csv; charset=utf-8",
             headers={
                 "Content-Disposition": 'attachment; filename="messages.csv"',
@@ -758,15 +724,9 @@ def build_router(state: AppState) -> APIRouter:
         days: int = Query(30, ge=1, le=365),
     ) -> list[dict[str, Any]]:
         """Daily per-card message counts for the dashboard trend chart."""
-        since = (datetime.now(UTC) - timedelta(days=days - 1)).date().isoformat()
-        rows = state.db.query(
-            "SELECT date(ts) AS day, sim_id, "
-            "       SUM(CASE WHEN direction = 'in' THEN 1 ELSE 0 END) AS received, "
-            "       SUM(CASE WHEN direction = 'out' THEN 1 ELSE 0 END) AS sent "
-            "FROM messages WHERE date(ts) >= ? "
-            "GROUP BY date(ts), sim_id ORDER BY day",
-            (since,),
-        )
+        since_day = (datetime.now(UTC) - timedelta(days=days - 1)).date()
+        since = f"{since_day.isoformat()}T00:00:00+00:00"
+        rows = state.db.message_trend(since=since)
         sims = {s["id"]: s for s in state.db.query("SELECT * FROM sims")}
         for row in rows:
             sim = sims.get(row["sim_id"])

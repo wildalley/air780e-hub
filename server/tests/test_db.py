@@ -336,6 +336,10 @@ def test_a_fresh_database_is_stamped_rather_than_migrated(tmp_path):
             "expires_at",
             "activity_due_at",
         } <= sim_columns
+        message_indexes = {
+            row["name"] for row in database.query("PRAGMA index_list(messages)")
+        }
+        assert "idx_messages_conversation" in message_indexes
     finally:
         database.close()
 
@@ -382,6 +386,9 @@ def test_an_upgrade_adds_the_diagnostic_columns_and_keeps_the_messages(tmp_path)
     # Rewind to v1 and drop the v2 columns, i.e. exactly a pre-upgrade file.
     connection = sqlite3.connect(path)
     try:
+        # A real v1 file predates the v7 index, so remove it before rebuilding
+        # the old table shape.
+        connection.execute("DROP INDEX idx_messages_conversation")
         for column in ("raw_pdu", "dcs", "is_binary"):
             connection.execute(f"ALTER TABLE messages DROP COLUMN {column}")
         connection.execute("PRAGMA user_version = 1")
@@ -568,6 +575,78 @@ def test_v5_upgrade_adds_sim_billing_fields_and_keeps_sims(tmp_path):
         } & columns
     finally:
         snapshot.close()
+
+
+def test_v6_upgrade_adds_the_conversation_index(tmp_path):
+    path = tmp_path / "hub.db"
+    database = Database(path)
+    message_id = database.insert_message(
+        agent_id="agent-a", device="a", direction="in", peer="10086",
+        body="保留的短信", ts=utcnow(), iccid="8986000000000000001",
+    )
+    database.close()
+
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute("DROP INDEX idx_messages_conversation")
+        connection.execute("PRAGMA user_version = 6")
+        connection.commit()
+    finally:
+        connection.close()
+
+    database = Database(path)
+    try:
+        assert _user_version(path) == SCHEMA_VERSION
+        indexes = {
+            row["name"] for row in database.query("PRAGMA index_list(messages)")
+        }
+        assert "idx_messages_conversation" in indexes
+        assert database.one(
+            "SELECT body FROM messages WHERE id = ?", (message_id,)
+        ) == {"body": "保留的短信"}
+    finally:
+        database.close()
+
+    snapshot = sqlite3.connect(path.with_name(f"{path.name}.v6.bak"))
+    try:
+        snapshot_indexes = {
+            row[1]
+            for row in snapshot.execute("PRAGMA index_list(messages)")
+        }
+        assert "idx_messages_conversation" not in snapshot_indexes
+    finally:
+        snapshot.close()
+
+
+def test_message_read_paths_use_the_new_indexes(tmp_path):
+    database = Database(tmp_path / "hub.db")
+    try:
+        for index in range(4):
+            database.insert_message(
+                agent_id="agent-a", device="a", direction="in", peer="10086",
+                body=f"短信 {index}", ts=f"2026-08-16T00:00:0{index}+00:00",
+                iccid="8986000000000000001",
+            )
+        thread_plan = database.query(
+            "EXPLAIN QUERY PLAN SELECT id FROM messages "
+            "WHERE sim_id = ? AND peer = ? "
+            "ORDER BY ts DESC, id DESC LIMIT 50",
+            (1, "10086"),
+        )
+        thread_details = " ".join(row["detail"] for row in thread_plan)
+        assert "idx_messages_conversation" in thread_details
+        assert "USE TEMP B-TREE" not in thread_details
+
+        trend_plan = database.query(
+            "EXPLAIN QUERY PLAN SELECT date(ts), sim_id, COUNT(*) FROM messages "
+            "WHERE ts >= ? GROUP BY date(ts), sim_id",
+            ("2026-08-15T00:00:00+00:00",),
+        )
+        trend_details = " ".join(row["detail"] for row in trend_plan)
+        assert "idx_messages_ts" in trend_details
+        assert "ts>?" in trend_details
+    finally:
+        database.close()
 
 
 def test_sim_lifecycle_incidents_warn_escalate_and_resolve_independently(tmp_path):

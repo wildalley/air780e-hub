@@ -457,6 +457,24 @@ def test_conversations_group_by_card_and_correspondent(admin):
     assert threads[1]["message_count"] == 2
     assert threads[2]["message_count"] == 1
 
+
+def test_conversation_preview_breaks_equal_timestamp_ties_by_message_id(admin):
+    db = admin.app.state.hub.db
+    stamp = _minutes_ago(1)
+    db.insert_message(
+        agent_id="home-arch", device="a", direction="in", peer="10086",
+        body="先到的短信", ts=stamp, iccid="89860622180012345670",
+    )
+    db.insert_message(
+        agent_id="home-arch", device="a", direction="in", peer="10086",
+        body="后到的短信", ts=stamp, iccid="89860622180012345670",
+    )
+
+    thread = admin.get("/api/conversations").json()[0]
+    assert thread["last_body"] == "后到的短信"
+    assert thread["message_count"] == 2
+
+
 def test_unread_receipts_are_isolated_by_card_and_correspondent(admin):
     db = admin.app.state.hub.db
     now = _minutes_ago(1)
@@ -570,7 +588,11 @@ def test_message_content_filter_separates_text_and_data_sms(admin):
     text_threads = admin.get("/api/conversations?content=text").json()
     data_threads = admin.get("/api/conversations?content=data").json()
     assert text_threads[0]["last_body"] == "plain text"
+    assert text_threads[0]["message_count"] == 1
+    assert text_threads[0]["unread_count"] == 1
     assert data_threads[0]["last_is_binary"] == 1
+    assert data_threads[0]["message_count"] == 1
+    assert data_threads[0]["unread_count"] == 1
 
     text_export = admin.get("/api/messages/export?content=text").text
     data_export = admin.get("/api/messages/export?content=data").text

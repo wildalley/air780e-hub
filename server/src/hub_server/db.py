@@ -37,16 +37,17 @@ log = logging.getLogger(__name__)
 # Version 4 adds per-segment SMS delivery reports.
 # Version 5 reclassifies stored data PDUs that predate the current checks.
 # Version 6 adds structured SIM billing and lifecycle dates used for reminders.
+# Version 7 adds the covering index used by conversation summaries and threads.
 #
 # To add a migration: append one entry to ``MIGRATIONS`` with the next integer
-# and bump this constant, and add the same columns/tables to SCHEMA so a brand
+# and bump this constant, and add the same columns/tables/indexes to SCHEMA so a brand
 # new database gets them directly.  That is not a duplicate: SCHEMA builds the
 # current shape for a new file, MIGRATIONS moves an existing file forward, and
 # ``_migrate`` stamps a new file rather than replaying migrations against it.
 # Never renumber or edit a released entry — a database that already ran it will
 # not run it again, so an edit only affects databases that have not, and the two
 # then disagree about what version N means.
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # Persisted (settings table) key for the SMS retention window, in days.  The
 # operator edits it on the Notify page; when unset the env default applies.
@@ -170,6 +171,8 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_sim ON messages(sim_id, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_peer ON messages(peer, ts DESC);
+CREATE INDEX IF NOT EXISTS idx_messages_conversation
+    ON messages(sim_id, peer, ts DESC, id DESC);
 
 -- One row per outbound segment. Rows with no message_id are status reports
 -- that beat their sms_out event to the Server and will be reconciled later.
@@ -533,6 +536,8 @@ class Database:
          "_migration_data_messages"),
         (6, "record SIM billing details and lifecycle dates",
          "_migration_sim_lifecycle"),
+        (7, "index message conversations and their newest rows",
+         "_migration_message_conversation_index"),
     )
 
     def _add_columns_if_missing(self, table: str, columns: dict[str, str]) -> None:
@@ -635,6 +640,13 @@ class Database:
                 "expires_at": "TEXT",
                 "activity_due_at": "TEXT",
             },
+        )
+
+    def _migration_message_conversation_index(self) -> None:
+        """v6 -> v7: serve a thread and its summary from one ordered index."""
+        self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_conversation "
+            "ON messages(sim_id, peer, ts DESC, id DESC)"
         )
 
     def _snapshot_before_migration(self, from_version: int) -> Path | None:
@@ -1391,28 +1403,55 @@ class Database:
     ) -> list[dict[str, Any]]:
         """Threads: one row per (card, correspondent), newest activity first.
 
-        The bare ``m.body`` / ``m.direction`` / ``m.id`` columns alongside
-        ``MAX(m.ts)`` are SQLite's documented min/max behaviour — they come
-        from the row that produced the maximum, which is exactly the preview
-        we want.  This is not portable SQL; on another engine it needs a
-        window function.
+        The first pass is deliberately covering: it scans only the compact
+        conversation index to find the newest threads and their counts.  Body,
+        status and unread rows are then read only for the limited result set.
+        Reading those columns during the group scan makes SQLite visit the
+        table for every stored message, which is an order of magnitude slower
+        at 100k rows.
         """
-        where, params = self._message_filter(content=content)
-        params.append(limit)
+        params: dict[str, Any] = {"limit": limit}
+        summary_filter = ""
+        recent_filter = ""
+        unread_filter = ""
+        if content in {"text", "data"}:
+            params["is_binary"] = int(content == "data")
+            summary_filter = "WHERE m.is_binary = :is_binary"
+            recent_filter = "AND recent.is_binary = :is_binary"
+            unread_filter = "AND unread.is_binary = :is_binary"
         return self.query(
-            "SELECT m.sim_id, m.peer, m.device, "
-            "       m.id AS last_id, m.body AS last_body, "
-            "       m.is_binary AS last_is_binary, "
-            "       m.direction AS last_direction, m.status AS last_status, "
-            "       MAX(m.ts) AS last_ts, COUNT(*) AS message_count, "
-            "       SUM(CASE WHEN m.direction = 'in' AND m.read_at IS NULL "
-            "               THEN 1 ELSE 0 END) AS unread_count, "
+            "WITH summary AS ("
+            "  SELECT m.sim_id, m.peer, MAX(m.ts) AS last_ts, "
+            "         COUNT(*) AS message_count "
+            "  FROM messages m "
+            f"  {summary_filter} "
+            "  GROUP BY m.sim_id, m.peer "
+            "  ORDER BY last_ts DESC LIMIT :limit"
+            ") "
+            "SELECT summary.sim_id, summary.peer, latest.device, "
+            "       latest.id AS last_id, latest.body AS last_body, "
+            "       latest.is_binary AS last_is_binary, "
+            "       latest.direction AS last_direction, "
+            "       latest.status AS last_status, summary.last_ts, "
+            "       summary.message_count, "
+            "       (SELECT COUNT(*) FROM messages unread "
+            "        WHERE unread.sim_id IS summary.sim_id "
+            "          AND unread.peer = summary.peer "
+            "          AND unread.direction = 'in' "
+            "          AND unread.read_at IS NULL "
+            f"          {unread_filter}) AS unread_count, "
             "       s.label AS sim_label, s.iccid AS sim_iccid "
-            "FROM messages m LEFT JOIN sims s ON s.id = m.sim_id "
-            f"{where} "
-            "GROUP BY m.sim_id, m.peer "
-            "ORDER BY last_ts DESC LIMIT ?",
-            tuple(params),
+            "FROM summary "
+            "JOIN messages latest ON latest.id = ("
+            "  SELECT recent.id FROM messages recent "
+            "  WHERE recent.sim_id IS summary.sim_id "
+            "    AND recent.peer = summary.peer "
+            f"    {recent_filter} "
+            "  ORDER BY recent.ts DESC, recent.id DESC LIMIT 1"
+            ") "
+            "LEFT JOIN sims s ON s.id = summary.sim_id "
+            "ORDER BY summary.last_ts DESC",
+            params,
         )
 
     def mark_read(self, *, sim_id: int | None, peer: str) -> int:
@@ -1559,6 +1598,17 @@ class Database:
             f"SELECT COUNT(*) AS n FROM messages m {where}", tuple(params)
         )
         return int(row["n"]) if row else 0
+
+    def message_trend(self, *, since: str) -> list[dict[str, Any]]:
+        """Daily per-card counts since a normalized UTC timestamp."""
+        return self.query(
+            "SELECT date(ts) AS day, sim_id, "
+            "       SUM(CASE WHEN direction = 'in' THEN 1 ELSE 0 END) AS received, "
+            "       SUM(CASE WHEN direction = 'out' THEN 1 ELSE 0 END) AS sent "
+            "FROM messages WHERE ts >= ? "
+            "GROUP BY date(ts), sim_id ORDER BY day",
+            (since,),
+        )
 
     # -- operations ---------------------------------------------------------
 
