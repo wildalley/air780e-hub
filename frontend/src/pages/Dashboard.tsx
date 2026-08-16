@@ -94,6 +94,14 @@ export function DashboardPage() {
     label: device.sim_label || device.label || device.name,
     index,
     points: history[device.name] ?? [],
+    current: device.last_seen_at
+      ? {
+          ts: device.last_seen_at,
+          online: device.online,
+          registered: device.registered,
+          dbm: device.dbm,
+        }
+      : undefined,
   }))
 
   return (

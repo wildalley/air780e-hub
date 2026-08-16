@@ -35,7 +35,9 @@ import { useToast } from '../toast'
 import { Loading, OnlineChip } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
 import { StorageMeter } from '../components/StorageMeter'
+import { SignalChart, type SignalSeries } from '../components/SignalChart'
 import { radioStatus } from '../deviceStatus'
+import { LIVE_MS } from '../swr'
 
 function deviceLabel(device: Device): string {
   return device.sim_label || device.label || device.name
@@ -45,8 +47,14 @@ export function DevicesPage() {
   const toast = useToast()
   const [busy, setBusy] = useState<string | null>(null)
   const [selected, setSelected] = useState<Device | null>(null)
+  const [historyHours, setHistoryHours] = useState(24)
 
   const { data: devices, mutate: load } = useSWR('/api/devices', () => api.devices.list())
+  const { data: history = {} } = useSWR(
+    ['/api/devices/history', historyHours],
+    () => api.devices.histories(historyHours),
+    { refreshInterval: LIVE_MS, keepPreviousData: true },
+  )
 
   const refresh = async (device: Device) => {
     setBusy(device.name)
@@ -81,6 +89,21 @@ export function DevicesPage() {
   }
 
   if (!devices) return <Loading />
+
+  const signalSeries: SignalSeries[] = devices.map((device, index) => ({
+    name: device.name,
+    label: deviceLabel(device),
+    index,
+    points: history[device.name] ?? [],
+    current: device.last_seen_at
+      ? {
+          ts: device.last_seen_at,
+          online: device.online,
+          registered: device.registered,
+          dbm: device.dbm,
+        }
+      : undefined,
+  }))
 
   return (
     <Stack spacing={3}>
@@ -247,6 +270,12 @@ export function DevicesPage() {
               </Card>
             ))}
           </Stack>
+
+          <SignalChart
+            series={signalSeries}
+            hours={historyHours}
+            onHoursChange={setHistoryHours}
+          />
         </>
       )}
 
