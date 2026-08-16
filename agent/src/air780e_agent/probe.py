@@ -8,6 +8,8 @@ Doubles as the hardware bring-up tool: the checklist in
     python -m air780e_agent.probe /dev/ttyACM3 --send 10086 CXHF
     python -m air780e_agent.probe --scan          # try every /dev/ttyACM*
     air780e-probe --report /tmp/air780e-compat.json
+    air780e-probe --report /tmp/air780e-enum.json --enumeration-only
+    air780e-probe --report /tmp/air780e-hotplug.json --observe-hotplug 120
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ import sys
 from pathlib import Path
 
 from .at import ATClient, ATError, SerialTransport
-from .compat import DEFAULT_PORT_PATTERN, build_compatibility_report
+from .compat import DEFAULT_PORT_PATTERN, build_compatibility_report, observe_hotplug
 from .modem import Air780E
 from .pdu import DecodedSms
 
@@ -140,28 +142,59 @@ async def inspect(port: str, *, listen: bool, send: tuple[str, str] | None) -> i
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="air780e-probe", description=__doc__,
+        prog="air780e-probe",
+        description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("port", nargs="?", help="serial device, e.g. /dev/ttyACM3")
-    parser.add_argument("--scan", action="store_true",
-                        help="try every /dev/ttyACM* and report which speaks AT")
+    parser.add_argument(
+        "--scan", action="store_true", help="try every /dev/ttyACM* and report which speaks AT"
+    )
     parser.add_argument(
         "--report",
         metavar="PATH",
         help="write a redacted, read-only compatibility JSON report ('-' for stdout)",
     )
     parser.add_argument(
+        "--enumeration-only",
+        action="store_true",
+        help="with --report, inspect only sysfs/udev and never open serial ports",
+    )
+    parser.add_argument(
+        "--observe-hotplug",
+        type=float,
+        metavar="SECONDS",
+        help="with --report, record changed sysfs/udev topology for this long",
+    )
+    parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=0.5,
+        metavar="SECONDS",
+        help="hotplug polling interval (default: 0.5)",
+    )
+    parser.add_argument(
         "--pattern",
         default=DEFAULT_PORT_PATTERN,
         help=f"serial glob used by --scan/--report (default: {DEFAULT_PORT_PATTERN})",
     )
-    parser.add_argument("--listen", action="store_true",
-                        help="stay attached and print incoming messages")
-    parser.add_argument("--send", nargs=2, metavar=("NUMBER", "TEXT"),
-                        help="send one message, then continue")
+    parser.add_argument(
+        "--listen", action="store_true", help="stay attached and print incoming messages"
+    )
+    parser.add_argument(
+        "--send", nargs=2, metavar=("NUMBER", "TEXT"), help="send one message, then continue"
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
+
+    if (args.enumeration_only or args.observe_hotplug is not None) and not args.report:
+        parser.error("--enumeration-only/--observe-hotplug requires --report")
+    if (args.enumeration_only or args.observe_hotplug is not None) and args.port:
+        parser.error("a serial port cannot be combined with enumeration-only reporting")
+    if args.observe_hotplug is not None and args.observe_hotplug <= 0:
+        parser.error("--observe-hotplug must be greater than zero")
+    if args.poll_interval <= 0:
+        parser.error("--poll-interval must be greater than zero")
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.WARNING,
@@ -169,10 +202,22 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if args.report:
-        ports = [args.port] if args.port else None
-        report = asyncio.run(
-            build_compatibility_report(pattern=args.pattern, ports=ports)
-        )
+        if args.observe_hotplug is not None:
+            report = asyncio.run(
+                observe_hotplug(
+                    duration=args.observe_hotplug,
+                    poll_interval=args.poll_interval,
+                )
+            )
+        else:
+            ports = [args.port] if args.port else None
+            report = asyncio.run(
+                build_compatibility_report(
+                    pattern=args.pattern,
+                    ports=ports,
+                    enumeration_only=args.enumeration_only,
+                )
+            )
         rendered = json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         if args.report == "-":
             print(rendered, end="")
@@ -183,11 +228,29 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"cannot write {args.report}: {exc}", file=sys.stderr)
                 return 1
             summary = report["summary"]
-            print(
-                f"wrote {args.report}: {summary['at_ports']} AT port(s), "
-                f"{summary['usb_devices']} USB device(s)"
-            )
-        return 0 if report["summary"]["validation_ready"] else 1
+            if report.get("report_type") == "hotplug-observation":
+                print(
+                    f"wrote {args.report}: {summary['topology_transitions']} topology "
+                    f"transition(s), hotplug cycle "
+                    f"{'complete' if summary['hotplug_cycle_complete'] else 'incomplete'}"
+                )
+            elif args.enumeration_only:
+                print(
+                    f"wrote {args.report}: {summary['air780e_usb_devices']} Air780E "
+                    f"USB device(s), {summary['complete_air780e_layouts']} complete layout(s)"
+                )
+            else:
+                print(
+                    f"wrote {args.report}: {summary['at_ports']} AT port(s), "
+                    f"{summary['air780e_usb_devices']} Air780E USB device(s)"
+                )
+        if report.get("report_type") == "hotplug-observation":
+            ready_key = "hotplug_cycle_complete"
+        elif args.enumeration_only:
+            ready_key = "enumeration_ready"
+        else:
+            ready_key = "validation_ready"
+        return 0 if report["summary"][ready_key] else 1
 
     if args.scan or not args.port:
         if not args.scan:
