@@ -216,6 +216,11 @@ sudo systemctl mask ModemManager
 SUBSYSTEM=="usb", ATTR{idVendor}=="19d1", ATTR{idProduct}=="0001", ENV{ID_MM_DEVICE_IGNORE}="1"
 ```
 
+规则文件存在不等于已作用到当前设备。应用规则并重新触发后,用枚举报告检查每个设备的
+`modem_manager_ignore_applied`;它直接读取运行中的 udev 数据库。报告汇总的
+`modem_manager_safety` 会区分 `not-installed`、`ignore-applied`、
+`service-inactive`、`unprotected` 和 `unknown`。
+
 ### 3.3 两个模块的设备名固定 —— agent 按 IMEI/ICCID 自己找
 
 `ttyACM*` 编号跟插入顺序走,重启或重插就变。常规做法是按序列号绑 `by-id`,**但上面 dmesg 里 `SerialNumber=000000000001` 是通用值 —— 两个同型号模块序列号完全相同**(本机实测已确认),`by-id` 会直接撞车。
@@ -252,10 +257,16 @@ Air780E 发射瞬间电流可达约 2A。插主板前置 USB 口或无源 hub �
 
 按顺序走,每步确认再进行下一步:
 
-先用 `air780e-probe --report /tmp/air780e-compat.json` 生成默认脱敏的只读报告;它会
-自动记录发行版、内核、USB/ACM 接口和 `CGMI` / `CGMM` / `CGMR`,并区分
-ModemManager 未安装、已停止或正在运行。生产 Agent 已运行时须先按
-[兼容性矩阵](compatibility.md#生成脱敏报告)进入短维护窗口,避免两个进程抢串口。
+生产 Agent 运行时先用下述枚举模式;它只读 sysfs/udev,不打开串口：
+
+```bash
+air780e-probe --report /tmp/air780e-enumeration.json --enumeration-only
+```
+
+它自动按 USB 设备归组 ACM 接口、校验每个 Air780E 的 `02/04/06`,并记录设备节点、
+启动会话和实际 udev ignore 属性。需要 `CGMI` / `CGMM` / `CGMR` 时,再按
+[兼容性矩阵](compatibility.md#完整-at-报告)进入短维护窗口运行不带
+`--enumeration-only` 的完整报告,避免两个进程抢串口。
 
 ```bash
 # 1. 枚举与固件类型
@@ -284,6 +295,11 @@ mmcli -m 0 --messaging-list
 
 # 6. 插上第二个,确认两个都在,并记录各自 USB 端口路径
 udevadm info -a /dev/ttyACM3 | grep -m3 KERNELS
+
+# 7. 热插拔观察(命令运行后拔插一个模块;不占串口,可与 Agent 并行)
+air780e-probe --report /tmp/air780e-hotplug.json --observe-hotplug 120
 ```
 
-验证结果回填到[硬件与系统兼容性矩阵](compatibility.md),再更新本文档的「待验证」项。
+热插拔报告只证明 USB 拓扑恢复;仍需从 Agent 日志或 Web 设备页确认原 worker 按
+IMEI/ICCID 恢复。验证结果回填到[硬件与系统兼容性矩阵](compatibility.md),再更新
+本文档的「待验证」项。

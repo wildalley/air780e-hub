@@ -322,9 +322,18 @@ Agent 可以按 IMEI 或 ICCID 自动发现模块，无需依赖不稳定的 `tt
 /opt/air780e-agent/.venv/bin/python -m air780e_agent.probe /dev/ttyACM0
 ```
 
-需要归档发行版、内核、USB 接口和真实 `CGMR` 固件版本时,按
-[兼容性矩阵](compatibility.md#生成脱敏报告)在 Agent 停止的短维护窗口生成脱敏报告。
-报告不会读取或删除短信,但仍不能和正在占用串口的 Agent 并发运行。
+Agent 运行期间可先生成不碰串口的枚举报告,确认每个模块都有完整 `02/04/06`、
+设备节点对当前账户可读写,以及 ModemManager ignore 属性是否实际生效：
+
+```bash
+/opt/air780e-agent/.venv/bin/air780e-probe \
+  --report /tmp/air780e-enumeration.json --enumeration-only
+```
+
+冷启动和热插拔/重新编号的只读验证命令、退出码含义见
+[兼容性矩阵](compatibility.md#在线枚举与冷启动证据)。需要归档真实 `CGMR` 固件版本
+时,再按该文档进入短维护窗口生成完整报告。完整报告不会读取或删除短信,但会打开
+串口,不能和正在占用串口的 Agent 并发运行。
 
 如果需要固定符号链接，可安装 udev 示例并在配置中显式设置 `port`。
 

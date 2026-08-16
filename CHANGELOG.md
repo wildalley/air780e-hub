@@ -19,6 +19,7 @@
 - 增加 10 万条短信的可重复性能基准，覆盖列表、搜索、会话、趋势和流式 CSV；会话查询增加复合索引并避免为全部历史记录读取正文，趋势范围过滤可直接使用时间索引。
 - 增加可调循环次数的故障注入基线，覆盖断网丢 ACK、Agent/Server 重启重放、跨批次积压、重复事件、USB 重新枚举和持久化自愈限频。
 - 增加默认脱敏、只读的 Agent 兼容性报告，采集发行版、内核、Python、`cdc_acm`、USB/ACM 接口、设备权限及真实 `CGMI/CGMM/CGMR`，并建立硬件、固件与 Linux 发行版实测矩阵。报告不输出 IMEI、ICCID、SMSC、主机名或运营商，也不读取和删除短信。
+- 兼容性报告 schema v2 按 USB 设备校验每个 Air780E 的 `02/04/06` ACM 布局，并记录已实际应用的 ModemManager udev ignore 属性、启动会话与设备节点就绪状态；新增可与 Agent 并行的 `--enumeration-only` 和定时 `--observe-hotplug`，在不打开串口的前提下归档冷启动、设备消失、重新出现、路径变化及 `ttyACM` 重新编号证据。
 
 ### Fixed
 
