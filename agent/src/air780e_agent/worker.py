@@ -9,8 +9,11 @@ own once the port reappears.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
+import time
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -28,11 +31,20 @@ if TYPE_CHECKING:  # imported for typing only — discovery imports config, not 
 log = logging.getLogger(__name__)
 
 EmitCallback = Callable[[str, dict[str, Any]], None]
+ClockCallback = Callable[[], float]
 
 # Below this change in +CSQ a sample is not worth a row in the graph.
 RSSI_NOISE_FLOOR = 2
 # Re-send an unchanged status at least this often, so "still alive" is visible.
 STATUS_HEARTBEAT = 900.0
+# Registration actions are counted in a rolling window and persisted locally,
+# so restarting a flapping Agent cannot bypass the protection.
+RECOVERY_WINDOW = 24 * 60 * 60
+REGISTRATION_RECOVERY_ACTIONS = (
+    "operator_reselect",
+    "radio_cycle",
+    "module_reset",
+)
 
 
 class TransportFactory(Protocol):
@@ -86,6 +98,10 @@ class DeviceOffline(RuntimeError):
     """Raised when a command arrives for a module that is not currently up."""
 
 
+class DeviceRecoveryReconnect(RuntimeError):
+    """A recovery action intentionally asks the supervisor to reopen the port."""
+
+
 class DeviceWorker:
     def __init__(
         self,
@@ -95,14 +111,26 @@ class DeviceWorker:
         *,
         status_interval: float = 60.0,
         reconnect_max_delay: float = 60.0,
+        health_check_timeout: float = 5.0,
+        health_failure_threshold: int = 3,
+        registration_recovery_delay: float = 300.0,
+        recovery_cooldown: float = 300.0,
+        recovery_max_attempts_24h: int = 6,
         transport_factory: TransportFactory = _default_transport,
         registry: PortRegistry | None = None,
+        clock: ClockCallback = time.time,
     ) -> None:
         self.config = config
         self.store = store
         self.emit = emit
         self.status_interval = status_interval
         self.reconnect_max_delay = reconnect_max_delay
+        self.health_check_timeout = max(0.1, health_check_timeout)
+        self.health_failure_threshold = max(1, health_failure_threshold)
+        self.registration_recovery_delay = max(0.0, registration_recovery_delay)
+        self.recovery_cooldown = max(0.0, recovery_cooldown)
+        self.recovery_max_attempts_24h = max(0, recovery_max_attempts_24h)
+        self._clock = clock
         self._transport_factory = transport_factory
         # Absent for a pinned port; required to find an unpinned module.
         self._registry = registry
@@ -117,6 +145,17 @@ class DeviceWorker:
         self._stopped = False
         self._last_status_sent = 0.0
         self._last_status_payload: dict[str, Any] | None = None
+        self._health_failures = 0
+        self._unregistered_since: float | None = None
+        self._recovery_stage = 0
+        self._recovery_attempt_times: deque[float] = deque()
+        self._recovery_sequence = 0
+        self._recovery_inflight: tuple[str, int] | None = None
+        self._recovery_issue_open = False
+        self._last_recovery_action = ""
+        self._last_recovery_attempt = 0
+        self._recovery_limit_reported = False
+        self._load_recovery_state()
 
     @property
     def name(self) -> str:
@@ -137,6 +176,67 @@ class DeviceWorker:
             "port": self._port or self.config.port,
             **self.state.describe(),
         }
+
+    # -- durable recovery state ------------------------------------------
+
+    @property
+    def _recovery_store_key(self) -> str:
+        return f"device-recovery:{self.name}"
+
+    def _load_recovery_state(self) -> None:
+        raw = self.store.get(self._recovery_store_key)
+        if not raw:
+            return
+        try:
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError("recovery state is not an object")
+            now = self._clock()
+            attempts = [
+                float(value)
+                for value in data.get("attempts", [])
+                if 0 <= now - float(value) < RECOVERY_WINDOW
+            ]
+            stage = int(data.get("stage", 0))
+            self._recovery_attempt_times = deque(sorted(attempts))
+            self._recovery_stage = (
+                stage if 0 <= stage < len(REGISTRATION_RECOVERY_ACTIONS) else 0
+            )
+            self._recovery_sequence = max(0, int(data.get("sequence", 0)))
+            self._recovery_issue_open = bool(data.get("issue_open", False))
+            self._last_recovery_action = str(data.get("last_action", ""))
+            self._last_recovery_attempt = max(0, int(data.get("last_attempt", 0)))
+            self._recovery_limit_reported = bool(data.get("limit_reported", False))
+            inflight = data.get("inflight")
+            if isinstance(inflight, dict):
+                action = str(inflight.get("action", ""))
+                attempt = int(inflight.get("attempt", 0))
+                if action and attempt > 0:
+                    self._recovery_inflight = (action, attempt)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            log.warning("[%s] ignoring invalid persisted recovery state", self.name)
+
+    def _persist_recovery_state(self) -> None:
+        inflight = None
+        if self._recovery_inflight is not None:
+            action, attempt = self._recovery_inflight
+            inflight = {"action": action, "attempt": attempt}
+        self.store.set(
+            self._recovery_store_key,
+            json.dumps(
+                {
+                    "attempts": list(self._recovery_attempt_times),
+                    "stage": self._recovery_stage,
+                    "sequence": self._recovery_sequence,
+                    "inflight": inflight,
+                    "issue_open": self._recovery_issue_open,
+                    "last_action": self._last_recovery_action,
+                    "last_attempt": self._last_recovery_attempt,
+                    "limit_reported": self._recovery_limit_reported,
+                },
+                separators=(",", ":"),
+            ),
+        )
 
     # -- supervision -------------------------------------------------------
 
@@ -206,11 +306,13 @@ class DeviceWorker:
         self.state.registered = info.registered
         self.state.radio_enabled = info.radio_enabled
         self._ready.set()
+        self._health_failures = 0
 
         log.info(
             "[%s] up: %s iccid=%s operator=%s",
             self.name, info.model or "?", info.iccid or "?", info.operator or "?",
         )
+        self._settle_recovery_after_connect()
         if not info.smsc:
             self._log_event("warning", "no SMSC configured; sending will fail")
 
@@ -284,9 +386,268 @@ class DeviceWorker:
 
     # -- status ------------------------------------------------------------
 
+    async def _check_health(self) -> bool:
+        client = self._client
+        if client is None:
+            return False
+        try:
+            await client.execute("AT", timeout=self.health_check_timeout)
+        except ATError as exc:
+            self._health_failures += 1
+            if self._health_failures < self.health_failure_threshold:
+                log.warning(
+                    "[%s] AT health check failed (%d/%d): %s",
+                    self.name,
+                    self._health_failures,
+                    self.health_failure_threshold,
+                    exc,
+                )
+                return False
+            reason = (
+                f"AT health check failed {self._health_failures} consecutive times: {exc}"
+            )
+            self._start_recovery("serial_reconnect", reason)
+            raise DeviceRecoveryReconnect(reason) from exc
+
+        if self._health_failures:
+            log.info(
+                "[%s] AT health check recovered after %d failure(s)",
+                self.name,
+                self._health_failures,
+            )
+        self._health_failures = 0
+        return True
+
+    async def _maybe_recover_registration(self, modem: Air780E) -> None:
+        if self.state.radio_enabled is False:
+            self._cancel_registration_recovery("radio was deliberately disabled")
+            return
+        if self.state.registered:
+            self._registration_restored("network registration restored")
+            return
+        if self.recovery_max_attempts_24h == 0:
+            self._cancel_registration_recovery(
+                "automatic registration recovery is disabled by configuration"
+            )
+            return
+
+        now = self._clock()
+        if self._unregistered_since is None:
+            self._unregistered_since = now
+        if now - self._unregistered_since < self.registration_recovery_delay:
+            return
+
+        self._prune_recovery_attempts(now)
+        if len(self._recovery_attempt_times) >= self.recovery_max_attempts_24h:
+            self._report_recovery_limit()
+            return
+        if (
+            self._recovery_attempt_times
+            and now - self._recovery_attempt_times[-1] < self.recovery_cooldown
+        ):
+            return
+
+        action = REGISTRATION_RECOVERY_ACTIONS[self._recovery_stage]
+        self._recovery_attempt_times.append(now)
+        attempt = self._start_recovery(
+            action,
+            f"module remained unregistered for {now - self._unregistered_since:.0f}s",
+        )
+
+        if action == "operator_reselect":
+            recovered = await modem.reselect_operator()
+        elif action == "radio_cycle":
+            recovered = await modem.cycle_radio()
+        else:
+            reset_error = ""
+            try:
+                await modem.reset()
+            except ATError as exc:
+                # The module may reboot before writing its final OK.  Closing
+                # and reopening the port is still the correct next step.
+                reset_error = f"; reset acknowledgement failed: {exc}"
+            self._recovery_stage = 0
+            self._unregistered_since = now
+            self._persist_recovery_state()
+            raise DeviceRecoveryReconnect(
+                f"module reset requested for registration recovery{reset_error}"
+            )
+
+        if recovered:
+            self.state.registered = True
+            self._recovery_stage = 0
+            self._unregistered_since = None
+            self._recovery_limit_reported = False
+            self._finish_recovery(
+                action,
+                attempt,
+                "succeeded",
+                "mobile network registration recovered",
+            )
+            return
+
+        self._recovery_stage = (self._recovery_stage + 1) % len(
+            REGISTRATION_RECOVERY_ACTIONS
+        )
+        self._finish_recovery(
+            action,
+            attempt,
+            "failed",
+            "module is still unregistered after the recovery action",
+        )
+
+    def _start_recovery(self, action: str, reason: str) -> int:
+        self._recovery_sequence += 1
+        attempt = self._recovery_sequence
+        self._recovery_inflight = (action, attempt)
+        self._recovery_issue_open = True
+        self._last_recovery_action = action
+        self._last_recovery_attempt = attempt
+        self._persist_recovery_state()
+        self._log_event(
+            "warning",
+            f"automatic recovery started: {action}",
+            event="device_recovery",
+            action=action,
+            outcome="started",
+            reason=reason,
+            attempt=attempt,
+        )
+        return attempt
+
+    def _finish_recovery(
+        self,
+        action: str,
+        attempt: int,
+        outcome: str,
+        reason: str,
+    ) -> None:
+        level = "info" if outcome in {"succeeded", "cancelled"} else "warning"
+        self._log_event(
+            level,
+            f"automatic recovery {outcome}: {action}; {reason}",
+            event="device_recovery",
+            action=action,
+            outcome=outcome,
+            reason=reason,
+            attempt=attempt,
+        )
+        self._recovery_inflight = None
+        if outcome in {"succeeded", "cancelled"}:
+            self._recovery_issue_open = False
+        self._persist_recovery_state()
+
+    def _settle_recovery_after_connect(self) -> None:
+        inflight = self._recovery_inflight
+        if inflight is not None:
+            action, attempt = inflight
+            if action == "serial_reconnect":
+                self._finish_recovery(
+                    action, attempt, "succeeded", "AT connection reopened successfully"
+                )
+            elif self.state.radio_enabled is False:
+                self._finish_recovery(
+                    action, attempt, "cancelled", "radio is deliberately disabled"
+                )
+            elif self.state.registered:
+                self._finish_recovery(
+                    action, attempt, "succeeded", "module registered after reconnect"
+                )
+            else:
+                self._finish_recovery(
+                    action, attempt, "failed", "module reopened but remains unregistered"
+                )
+
+        if self.state.registered:
+            self._registration_restored("network registration restored after reconnect")
+        elif self.state.radio_enabled is False:
+            self._cancel_registration_recovery("radio is deliberately disabled")
+        else:
+            # A reset gets a fresh attachment grace period instead of
+            # immediately starting the next escalation stage.
+            self._unregistered_since = self._clock()
+
+    def _registration_restored(self, reason: str) -> None:
+        changed = (
+            self._unregistered_since is not None
+            or self._recovery_stage != 0
+            or self._recovery_limit_reported
+        )
+        self._unregistered_since = None
+        self._recovery_stage = 0
+        self._recovery_limit_reported = False
+        if self._recovery_issue_open:
+            self._finish_recovery(
+                self._last_recovery_action or "registration_watch",
+                self._last_recovery_attempt,
+                "succeeded",
+                reason,
+            )
+        elif changed:
+            self._persist_recovery_state()
+
+    def _cancel_registration_recovery(self, reason: str) -> None:
+        changed = (
+            self._unregistered_since is not None
+            or self._recovery_stage != 0
+            or self._recovery_limit_reported
+        )
+        self._unregistered_since = None
+        self._recovery_stage = 0
+        self._recovery_limit_reported = False
+        if self._recovery_issue_open:
+            self._finish_recovery(
+                self._last_recovery_action or "registration_watch",
+                self._last_recovery_attempt,
+                "cancelled",
+                reason,
+            )
+        elif changed:
+            self._persist_recovery_state()
+
+    def _prune_recovery_attempts(self, now: float) -> None:
+        changed = False
+        while self._recovery_attempt_times:
+            age = now - self._recovery_attempt_times[0]
+            if 0 <= age < RECOVERY_WINDOW:
+                break
+            self._recovery_attempt_times.popleft()
+            changed = True
+        if (
+            self._recovery_limit_reported
+            and len(self._recovery_attempt_times) < self.recovery_max_attempts_24h
+        ):
+            self._recovery_limit_reported = False
+            changed = True
+        if changed:
+            self._persist_recovery_state()
+
+    def _report_recovery_limit(self) -> None:
+        if self._recovery_limit_reported:
+            return
+        self._recovery_limit_reported = True
+        self._recovery_issue_open = True
+        self._last_recovery_action = "registration_recovery"
+        attempt = self._last_recovery_attempt
+        self._log_event(
+            "error",
+            "automatic registration recovery reached its 24-hour limit",
+            event="device_recovery",
+            action="registration_recovery",
+            outcome="exhausted",
+            reason=(
+                f"{len(self._recovery_attempt_times)} actions in the last 24 hours; "
+                "waiting for the rolling window"
+            ),
+            attempt=attempt,
+        )
+        self._persist_recovery_state()
+
     async def _sample_status(self, *, force: bool = False) -> None:
         modem = self._modem
         if modem is None:
+            return
+        if not await self._check_health():
             return
         radio_enabled = await modem.read_radio_enabled()
         if radio_enabled is not None:
@@ -296,6 +657,7 @@ class DeviceWorker:
             if self.state.radio_enabled is False
             else await modem.read_registration()
         )
+        await self._maybe_recover_registration(modem)
         self.state.signal = await modem.read_signal()
         used, capacity = await modem.storage_usage()
         self.state.storage_used = used
@@ -471,6 +833,11 @@ class DeviceWorker:
         self.state.registered = registered
         if not radio_enabled:
             self.state.signal = Signal()
+            self._cancel_registration_recovery("radio was deliberately disabled")
+        elif registered:
+            self._registration_restored("network registration restored")
+        else:
+            self._unregistered_since = self._clock()
         self._emit_status(force=True)
         return self.describe()
 
@@ -487,5 +854,14 @@ class DeviceWorker:
 
     # -- logging -----------------------------------------------------------
 
-    def _log_event(self, level: str, message: str) -> None:
-        self.emit("log", {"device": self.name, "level": level, "message": message})
+    def _log_event(self, level: str, message: str, **fields: Any) -> None:
+        self.emit(
+            "log",
+            {
+                "device": self.name,
+                "level": level,
+                "message": message,
+                "ts": _now(),
+                **fields,
+            },
+        )

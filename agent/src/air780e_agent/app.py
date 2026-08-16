@@ -50,6 +50,11 @@ class AgentApp:
                 self.emit,
                 status_interval=config.status_interval,
                 reconnect_max_delay=config.reconnect_max_delay,
+                health_check_timeout=config.health_check_timeout,
+                health_failure_threshold=config.health_failure_threshold,
+                registration_recovery_delay=config.registration_recovery_delay,
+                recovery_cooldown=config.recovery_cooldown,
+                recovery_max_attempts_24h=config.recovery_max_attempts_24h,
                 transport_factory=transport_factory,
                 registry=self.registry,
             )

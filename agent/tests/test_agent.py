@@ -140,6 +140,37 @@ async def test_an_unplugged_module_goes_offline_promptly(agent):
     assert described["a"]["online"] is False
 
 
+async def test_a_silent_but_present_module_is_reopened(agent):
+    """A wedged firmware leaves the tty present, so port-loss alone is not enough."""
+    await agent.wait_online()
+    worker = agent.app.workers["a"]
+    worker.health_check_timeout = 0.1
+    worker.health_failure_threshold = 2
+    agent.mocks["a"].silent.add("AT")
+
+    async with asyncio.timeout(2.0):
+        while worker.online:
+            await asyncio.sleep(0.01)
+
+    started = [
+        event.payload
+        for event in agent.events("log")
+        if event.payload.get("event") == "device_recovery"
+    ]
+    assert started[-1]["action"] == "serial_reconnect"
+    assert started[-1]["outcome"] == "started"
+    assert agent.app.workers["b"].online is True
+
+    agent.mocks["a"].silent.clear()
+    await agent.wait_online()
+    completed = [
+        event.payload
+        for event in agent.events("log")
+        if event.payload.get("event") == "device_recovery"
+    ]
+    assert completed[-1]["outcome"] == "succeeded"
+
+
 async def test_losing_the_port_frees_it_for_rediscovery(agent):
     """The claim has to be given back, or the module cannot be picked up
     again when it comes back under a different ttyACM number."""

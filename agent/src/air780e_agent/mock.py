@@ -74,6 +74,10 @@ class MockAir780E:
     # Failure injection for tests.
     fail_next_send: bool = False
     unsupported: set[str] = field(default_factory=set)
+    silent: set[str] = field(default_factory=set)
+    cops_recovers_registration: bool = True
+    cfun_recovers_registration: bool = True
+    reset_recovers_registration: bool = True
     # Chop this many hex characters off the PDU that +CMGR returns, while the
     # header keeps advertising the full length.  Real hardware did this once:
     # the body came back short with no error on the wire.  Counts down, so 1
@@ -92,6 +96,8 @@ class MockAir780E:
     _buffer: bytearray = field(default_factory=bytearray)
     sent: list[codec.DecodedSms] = field(default_factory=list)
     pings: list[str] = field(default_factory=list)
+    commands: list[str] = field(default_factory=list)
+    reset_count: int = 0
 
     def __post_init__(self) -> None:
         self.transport.set_reader(self._feed)
@@ -197,6 +203,10 @@ class MockAir780E:
 
     def _dispatch(self, line: str) -> None:
         upper = line.upper()
+        self.commands.append(upper)
+
+        if upper in {name.upper() for name in self.silent}:
+            return
 
         for name in self.unsupported:
             if upper.startswith(name.upper()):
@@ -234,6 +244,10 @@ class MockAir780E:
             if not self.registered:
                 return self._reply(["+COPS: 0"])
             return self._reply([f'+COPS: 0,0,"{self.operator}",7'])
+        if upper == "AT+COPS=0":
+            if self.radio_enabled and self.cops_recovers_registration:
+                self.registered = True
+            return self._reply()
         if upper in ("AT+CEREG?", "AT+CREG?"):
             name = "+CEREG" if "CEREG" in upper else "+CREG"
             attached = self.radio_enabled and self.registered
@@ -242,7 +256,11 @@ class MockAir780E:
             return self._reply([f"+CFUN: {1 if self.radio_enabled else 0}"])
         if upper in ("AT+CFUN=0", "AT+CFUN=1"):
             self.radio_enabled = upper.endswith("1")
-            self.registered = self.radio_enabled
+            self.registered = self.radio_enabled and self.cfun_recovers_registration
+            return self._reply()
+        if upper == "AT+RESET":
+            self.reset_count += 1
+            self.registered = self.radio_enabled and self.reset_recovers_registration
             return self._reply()
         if upper in ("AT+ICCID", "AT+CCID"):
             return self._reply([f"+ICCID: {self.iccid}"])

@@ -201,6 +201,29 @@ Agent 通过 `AT+CNMI=2,1,0,1,0` 接收 `+CDS`，解码 SMS-STATUS-REPORT 后持
 
 短信正文**不出现在日志里**,只记录诊断所需的最少元数据。
 
+设备自愈沿用 `log` 帧，并增加可选结构字段，因此旧 Server 仍可安全保存：
+
+```json
+{
+  "type": "log",
+  "seq": 1427,
+  "level": "warning",
+  "device": "a",
+  "message": "automatic recovery started: operator_reselect",
+  "event": "device_recovery",
+  "action": "operator_reselect",
+  "outcome": "started",
+  "reason": "module remained unregistered for 300s",
+  "attempt": 1
+}
+```
+
+`action` 为 `serial_reconnect`、`operator_reselect`、`radio_cycle`、
+`module_reset`、`registration_recovery` 或 `registration_watch`；`outcome` 为
+`started`、`failed`、`succeeded`、`cancelled` 或 `exhausted`。新 Server 据此打开、
+升级和自动解决运维事件。
+这些字段是协议 v1 的向后兼容扩展，不改变顶层帧类型。
+
 ---
 
 ## 3. 下行(server → agent)

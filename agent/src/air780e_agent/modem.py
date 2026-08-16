@@ -297,12 +297,14 @@ class Air780E:
         should reserve this for a module that has stayed unregistered rather
         than firing it on the first missed sample.
         """
-        radio_enabled = await self.read_radio_enabled()
-        if radio_enabled is False:
-            # A deliberate flight-mode choice must never be undone by an
-            # automatic registration recovery.
-            self.info.radio_enabled = False
-            self.info.registered = False
+        if await self.reselect_operator():
+            return True
+
+        return await self.cycle_radio()
+
+    async def reselect_operator(self) -> bool:
+        """Ask the module to resume automatic operator selection."""
+        if not await self._automatic_recovery_allowed():
             return False
 
         try:
@@ -310,8 +312,14 @@ class Air780E:
         except ATError as exc:
             log.warning("AT+COPS=0 failed during recovery: %s", exc)
 
-        if await self.read_registration():
-            return True
+        registered = await self.read_registration()
+        self.info.registered = registered
+        return registered
+
+    async def cycle_radio(self) -> bool:
+        """Cycle RF while keeping the AT port alive, then check attachment."""
+        if not await self._automatic_recovery_allowed():
+            return False
 
         try:
             await self.client.execute("AT+CFUN=0", timeout=30.0)
@@ -319,13 +327,33 @@ class Air780E:
             await self.client.execute("AT+CFUN=1", timeout=30.0)
         except ATError as exc:
             log.warning("AT+CFUN cycle failed during recovery: %s", exc)
-            return await self.read_registration()
+            registered = await self.read_registration()
+            self.info.registered = registered
+            return registered
 
         # The radio needs a moment to reattach after CFUN=1.
         await asyncio.sleep(3.0)
         registered = await self.read_registration()
         self.info.registered = registered
         return registered
+
+    async def reset(self) -> None:
+        """Restart the module; the worker deliberately reconnects afterwards."""
+        await self.client.execute("AT+RESET", timeout=30.0)
+
+    async def _automatic_recovery_allowed(self) -> bool:
+        radio_enabled = await self.read_radio_enabled()
+        if radio_enabled is None:
+            # Keep the last known deliberate state when a diagnostic query
+            # itself times out; never turn RF back on based on an unknown read.
+            radio_enabled = self.info.radio_enabled
+        if radio_enabled is not False:
+            return True
+        # A deliberate flight-mode choice must never be undone by an
+        # automatic registration recovery.
+        self.info.radio_enabled = False
+        self.info.registered = False
+        return False
 
     async def read_signal(self) -> Signal:
         signal = Signal()

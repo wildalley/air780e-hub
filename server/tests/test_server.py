@@ -817,6 +817,49 @@ def test_agent_log_is_stored_without_message_bodies(admin):
     assert logs[0]["level"] == "warning"
 
 
+def test_device_recovery_logs_open_escalate_and_resolve_an_incident(admin):
+    with _connect(admin) as ws:
+        _greet(ws)
+        ws.send_json({
+            "type": "log", "seq": 1, "device": "a", "level": "warning",
+            "message": "automatic recovery started: operator_reselect",
+            "event": "device_recovery", "action": "operator_reselect",
+            "outcome": "started", "reason": "unregistered for 300s", "attempt": 1,
+        })
+        assert ws.receive_json() == {"type": "ack", "seq": 1}
+
+        incident = _items(admin.get("/api/operations/incidents"))[0]
+        assert incident["kind"] == "device_recovery"
+        assert incident["severity"] == "warning"
+        assert "自动选择运营商" in incident["detail"]
+
+        ws.send_json({
+            "type": "log", "seq": 2, "device": "a", "level": "error",
+            "message": "automatic registration recovery reached its 24-hour limit",
+            "event": "device_recovery", "action": "registration_recovery",
+            "outcome": "exhausted", "reason": "6 actions in 24 hours", "attempt": 6,
+        })
+        assert ws.receive_json() == {"type": "ack", "seq": 2}
+        incident = _items(admin.get("/api/operations/incidents"))[0]
+        assert incident["severity"] == "critical"
+        assert "限频" in incident["title"]
+
+        ws.send_json({
+            "type": "log", "seq": 3, "device": "a", "level": "info",
+            "message": "automatic recovery succeeded: registration_watch",
+            "event": "device_recovery", "action": "registration_watch",
+            "outcome": "succeeded", "reason": "network registration restored",
+            "attempt": 6,
+        })
+        assert ws.receive_json() == {"type": "ack", "seq": 3}
+
+    assert _items(admin.get("/api/operations/incidents")) == []
+    closed = _items(admin.get("/api/operations/incidents?status=all"))[0]
+    assert closed["kind"] == "device_recovery"
+    assert closed["status"] == "resolved"
+    assert len(_items(admin.get("/api/logs"))) == 3
+
+
 def test_delivery_report_updates_a_single_segment_message(admin):
     sent_at = _minutes_ago(1)
     with _connect(admin) as ws:

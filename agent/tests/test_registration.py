@@ -241,3 +241,20 @@ async def test_recovery_never_undoes_deliberate_flight_mode():
     assert await modem.recover_registration() is False
     assert "AT+COPS=0" not in modem.client.calls
     assert "AT+CFUN=1" not in modem.client.calls
+
+
+async def test_recovery_keeps_flight_mode_when_radio_query_times_out():
+    modem = _modem({"AT+CFUN?": ATError("query timed out")})
+    modem.info.radio_enabled = False
+
+    assert await modem.recover_registration() is False
+    assert "AT+COPS=0" not in modem.client.calls
+    assert "AT+CFUN=1" not in modem.client.calls
+
+
+async def test_module_reset_uses_air780e_reset_command():
+    modem = _modem({"AT+RESET": ATResponse("AT+RESET", [], "OK")})
+
+    await modem.reset()
+
+    assert modem.client.calls == ["AT+RESET"]

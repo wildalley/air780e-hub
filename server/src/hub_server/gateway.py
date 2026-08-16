@@ -49,6 +49,15 @@ COMMAND_TIMEOUT = 30.0
 SETTING_PREVIOUS_AGENT_TOKEN_HASH = "previous_agent_token_hash"
 SETTING_PREVIOUS_AGENT_TOKEN_EXPIRES_AT = "previous_agent_token_expires_at"
 
+RECOVERY_ACTION_NAMES = {
+    "serial_reconnect": "串口重连",
+    "operator_reselect": "自动选择运营商",
+    "radio_cycle": "射频重启",
+    "module_reset": "模块重启",
+    "registration_recovery": "网络注册恢复",
+    "registration_watch": "网络注册监测",
+}
+
 MessageHook = Callable[[int, dict[str, Any]], Awaitable[None]]
 TaskResultHook = Callable[[int, dict[str, Any]], Awaitable[None]]
 # (agent_id, device, online) — fired on every module up/down state the gateway
@@ -451,6 +460,43 @@ class Gateway:
                 frame.get("message", ""),
                 frame.get("ts") or utcnow(),
             ),
+        )
+        if frame.get("event") == "device_recovery":
+            self._apply_device_recovery(agent_id, frame)
+
+    def _apply_device_recovery(self, agent_id: str, frame: dict[str, Any]) -> None:
+        device = str(frame.get("device") or "")
+        action = str(frame.get("action") or "")
+        outcome = str(frame.get("outcome") or "")
+        if not device or not action:
+            return
+
+        fingerprint = f"device-recovery:{agent_id}:{device}"
+        if outcome in {"succeeded", "cancelled"}:
+            detail = "模块自动恢复成功" if outcome == "succeeded" else "自动恢复已取消"
+            self.db.resolve_incident(fingerprint, detail=detail)
+            return
+        if outcome not in {"started", "exhausted"}:
+            # A failed action leaves the incident opened by its matching
+            # `started` event active while the Agent waits for the next stage.
+            return
+
+        action_name = RECOVERY_ACTION_NAMES.get(action, action)
+        attempt = _optional_int(frame.get("attempt"))
+        reason = str(frame.get("reason") or "")
+        detail_parts = [action_name]
+        if attempt is not None:
+            detail_parts.append(f"第 {attempt} 次恢复动作")
+        if reason:
+            detail_parts.append(reason)
+        exhausted = outcome == "exhausted"
+        self.db.open_incident(
+            fingerprint,
+            kind="device_recovery",
+            severity="critical" if exhausted else "warning",
+            source=f"{agent_id}/{device}",
+            title="设备自动恢复已达到限频上限" if exhausted else "设备正在自动恢复",
+            detail="；".join(detail_parts),
         )
 
     async def _apply_task_result(self, agent_id: str, frame: dict[str, Any]) -> None:

@@ -17,6 +17,11 @@ FULL = b"""
 id = "home-arch"
 db = "/tmp/agent.db"
 status_interval = 30.0
+health_check_timeout = 2.5
+health_failure_threshold = 4
+registration_recovery_delay = 120.0
+recovery_cooldown = 180.0
+recovery_max_attempts_24h = 5
 
 [server]
 url = "wss://sms.example.com/ws"
@@ -45,6 +50,11 @@ def test_full_config():
     config = AgentConfig.parse(FULL)
     assert config.agent_id == "home-arch"
     assert config.status_interval == 30.0
+    assert config.health_check_timeout == 2.5
+    assert config.health_failure_threshold == 4
+    assert config.registration_recovery_delay == 120.0
+    assert config.recovery_cooldown == 180.0
+    assert config.recovery_max_attempts_24h == 5
     assert config.server.enabled is True
     assert config.server.token == "secret"
     assert [d.name for d in config.devices] == ["a", "b"]

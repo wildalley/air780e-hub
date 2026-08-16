@@ -63,6 +63,15 @@ class AgentConfig:
     status_interval: float = 60.0
     # Backoff ceiling for reopening a port that has gone away.
     reconnect_max_delay: float = 60.0
+    # A tty can remain present while the module firmware stops answering.
+    # Probe it before every status sample and reopen after repeated failures.
+    health_check_timeout: float = 5.0
+    health_failure_threshold: int = 3
+    # Leave transient network detachments alone, then recover in increasingly
+    # disruptive stages (automatic selection, RF cycle, module reset).
+    registration_recovery_delay: float = 300.0
+    recovery_cooldown: float = 300.0
+    recovery_max_attempts_24h: int = 6
     # Hard ceiling on the durable outbound queue.
     max_queued_events: int = 100_000
     # How often the keep-alive scheduler looks for due tasks.  These fire
@@ -100,6 +109,15 @@ class AgentConfig:
             db_path=Path(agent.get("db", cls.db_path)),
             status_interval=float(agent.get("status_interval", 60.0)),
             reconnect_max_delay=float(agent.get("reconnect_max_delay", 60.0)),
+            health_check_timeout=float(agent.get("health_check_timeout", 5.0)),
+            health_failure_threshold=int(agent.get("health_failure_threshold", 3)),
+            registration_recovery_delay=float(
+                agent.get("registration_recovery_delay", 300.0)
+            ),
+            recovery_cooldown=float(agent.get("recovery_cooldown", 300.0)),
+            recovery_max_attempts_24h=int(
+                agent.get("recovery_max_attempts_24h", 6)
+            ),
             max_queued_events=int(agent.get("max_queued_events", 100_000)),
             scheduler_tick=float(agent.get("scheduler_tick", 30.0)),
             scheduler_retry_delay=float(agent.get("scheduler_retry_delay", 60.0)),
@@ -165,6 +183,13 @@ EXAMPLE_CONFIG = """\
 id = "site-a"
 db = "/var/lib/air780e-agent/agent.db"
 status_interval = 60.0
+# Self-healing defaults are conservative.  Set recovery_max_attempts_24h = 0
+# to disable automatic network recovery while retaining serial reconnects.
+health_check_timeout = 5.0
+health_failure_threshold = 3
+registration_recovery_delay = 300.0
+recovery_cooldown = 300.0
+recovery_max_attempts_24h = 6
 
 [server]
 # Leave url empty to run fully standalone (messages still stored locally,
