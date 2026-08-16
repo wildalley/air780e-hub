@@ -158,7 +158,8 @@ class ServerLink:
                 try:
                     # The timeout is a safety net: if a wake is ever missed,
                     # the queue still drains within a few seconds.
-                    await asyncio.wait_for(self._wake.wait(), timeout=5.0)
+                    async with asyncio.timeout(5.0):
+                        await self._wake.wait()
                 except TimeoutError:
                     pass
                 continue

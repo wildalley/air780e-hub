@@ -77,7 +77,8 @@ async def _connect_once(monkeypatch, store: LocalStore, socket: _Socket) -> None
         "connect",
         lambda *_args, **_kwargs: _Connection(socket),
     )
-    await _make_link(store)._connect_once()
+    async with asyncio.timeout(3.0):
+        await _make_link(store)._connect_once()
 
 
 async def test_hello_advertises_the_wire_protocol_version(tmp_path, monkeypatch):
@@ -107,8 +108,7 @@ async def test_acked_backlog_drains_across_batch_boundaries(tmp_path, monkeypatc
     socket = _Socket(event_count=total, acknowledge=True)
 
     try:
-        async with asyncio.timeout(1.0):
-            await _connect_once(monkeypatch, store, socket)
+        await _connect_once(monkeypatch, store, socket)
         assert store.unacked_count() == 0
     finally:
         store.close()
