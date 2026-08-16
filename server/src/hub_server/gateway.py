@@ -44,6 +44,7 @@ def _optional_int(value: Any) -> int | None:
 CLOSE_AUTH_FAILED = 4001
 CLOSE_PROTOCOL_ERROR = 4002
 CLOSE_AGENT_CONFLICT = 4003
+CLOSE_INTERNAL_ERROR = 1011
 
 COMMAND_TIMEOUT = 30.0
 SETTING_PREVIOUS_AGENT_TOKEN_HASH = "previous_agent_token_hash"
@@ -87,6 +88,16 @@ class AgentConnection:
 
     async def send(self, frame: dict[str, Any]) -> None:
         await self.websocket.send_text(json.dumps(frame, ensure_ascii=False))
+
+
+@dataclass
+class AppliedEvent:
+    """External work to start only after the event transaction commits."""
+
+    message_id: int | None = None
+    task_id: int | None = None
+    device_change: tuple[str, bool] | None = None
+    command_result: bool = False
 
 
 class Gateway:
@@ -203,6 +214,15 @@ class Gateway:
             # worth a look but must not take the server down.
             if type(exc).__name__ != "WebSocketDisconnect":
                 log.exception("agent %s connection failed", agent_id or "?")
+                try:
+                    # Stop this ordered stream before any higher cumulative
+                    # ACK can overtake the event that just rolled back.
+                    await websocket.close(
+                        code=CLOSE_INTERNAL_ERROR,
+                        reason="event application failed",
+                    )
+                except Exception:
+                    pass
         finally:
             if agent_id is not None:
                 self._unregister(agent_id)
@@ -277,40 +297,70 @@ class Gateway:
         kind = frame["type"]
         seq = frame.get("seq")
 
-        if kind == "cmd_result":
-            self._resolve_command(frame)
-
         if isinstance(seq, int):
-            fresh = self.db.claim_event(agent_id, seq, kind)
-            if fresh:
-                try:
-                    await self._apply(agent_id, kind, frame)
-                except Exception:
-                    log.exception("failed to apply %s seq=%s", kind, seq)
-            else:
+            # The callback is synchronous on purpose: Database holds one
+            # short transaction and its lock around all persistence writes.
+            # Notifications and alert hooks run only after COMMIT below.
+            fresh, applied = self.db.apply_event(
+                agent_id,
+                seq,
+                kind,
+                lambda: self._apply(agent_id, kind, frame),
+            )
+            if not fresh:
                 log.debug("duplicate %s seq=%d from %s, skipped", kind, seq, agent_id)
+            else:
+                await self._after_apply(agent_id, kind, frame, applied)
             # Ack either way: a duplicate is still safely delivered.
             await websocket.send_text(json.dumps({"type": "ack", "seq": seq}))
 
-    async def _apply(self, agent_id: str, kind: str, frame: dict[str, Any]) -> None:
+    def _apply(
+        self, agent_id: str, kind: str, frame: dict[str, Any]
+    ) -> AppliedEvent:
+        applied = AppliedEvent()
         if kind == "sms_in":
-            await self._apply_sms_in(agent_id, frame)
+            applied.message_id = self._apply_sms_in(agent_id, frame)
         elif kind == "sms_out":
             self._apply_sms_out(agent_id, frame)
         elif kind == "sms_delivery":
             self._apply_sms_delivery(agent_id, frame)
         elif kind == "status":
-            self._apply_status(agent_id, frame)
+            applied.device_change = self._apply_status(agent_id, frame)
         elif kind == "log":
             self._apply_log(agent_id, frame)
         elif kind == "task_result":
-            await self._apply_task_result(agent_id, frame)
+            applied.task_id = self._apply_task_result(agent_id, frame)
         elif kind == "cmd_result":
-            pass  # already resolved before the claim, nothing to persist
+            applied.command_result = True
         else:
             log.debug("ignoring unknown event kind %r", kind)
+        return applied
 
-    async def _apply_sms_in(self, agent_id: str, frame: dict[str, Any]) -> None:
+    async def _after_apply(
+        self,
+        agent_id: str,
+        kind: str,
+        frame: dict[str, Any],
+        applied: AppliedEvent,
+    ) -> None:
+        """Start non-durable side effects after the event is safely stored."""
+        try:
+            if applied.command_result:
+                self._resolve_command(frame)
+            if applied.device_change is not None:
+                device, online = applied.device_change
+                self._note_device(agent_id, device, online)
+            if applied.message_id is not None and self.on_message is not None:
+                await self.on_message(applied.message_id, frame)
+            if applied.task_id is not None and self.on_task_result is not None:
+                await self.on_task_result(applied.task_id, frame)
+        except Exception:
+            # Persistence has committed and replaying it cannot repair an
+            # in-process callback.  Keep the event durable and log the hook
+            # failure instead of replaying and duplicating business data.
+            log.exception("post-apply hook failed for %s", kind)
+
+    def _apply_sms_in(self, agent_id: str, frame: dict[str, Any]) -> int:
         raw_pdu = frame.get("pdu") or None
         message_id = self.db.insert_message(
             agent_id=agent_id,
@@ -332,8 +382,7 @@ class Gateway:
             is_binary=bool(frame.get("binary"))
             or bool(raw_pdu and _pdu_is_data(raw_pdu)),
         )
-        if self.on_message is not None:
-            await self.on_message(message_id, frame)
+        return message_id
 
     def _apply_sms_out(self, agent_id: str, frame: dict[str, Any]) -> None:
         references = [
@@ -407,15 +456,21 @@ class Gateway:
             event_seq=_optional_int(frame.get("seq")),
         )
 
-    def _apply_status(self, agent_id: str, frame: dict[str, Any]) -> None:
+    def _apply_status(
+        self, agent_id: str, frame: dict[str, Any]
+    ) -> tuple[str, bool] | None:
         payload = dict(frame)
         payload["name"] = frame.get("device", "")
         device_id = self.db.upsert_device(agent_id, payload)
         self.db.record_status(device_id, frame)
         # A status frame need not carry online (some only sample signal); act
         # only on the ones that state it, so the alerter sees real edges.
+        device_change = None
         if "online" in frame:
-            self._note_device(agent_id, frame.get("device", ""), bool(frame.get("online")))
+            device_change = (
+                str(frame.get("device") or ""),
+                bool(frame.get("online")),
+            )
         if "registered" in frame or frame.get("online") is False:
             fingerprint = f"network-registration:{agent_id}:{frame.get('device', '')}"
             if frame.get("online") is False:
@@ -448,6 +503,7 @@ class Gateway:
                 )
             else:
                 self.db.resolve_incident(fingerprint, detail="移动网络注册已恢复")
+        return device_change
 
     def _apply_log(self, agent_id: str, frame: dict[str, Any]) -> None:
         self.db.execute(
@@ -499,7 +555,7 @@ class Gateway:
             detail="；".join(detail_parts),
         )
 
-    async def _apply_task_result(self, agent_id: str, frame: dict[str, Any]) -> None:
+    def _apply_task_result(self, agent_id: str, frame: dict[str, Any]) -> int | None:
         self.db.execute(
             "INSERT INTO task_logs (task_id, ts, status, attempts, detail, error) "
             "VALUES (?, ?, ?, ?, ?, ?)",
@@ -514,7 +570,7 @@ class Gateway:
         )
         task_id = frame.get("task_id")
         if task_id is None:
-            return
+            return None
 
         task = self.db.one("SELECT name FROM tasks WHERE id = ?", (task_id,)) or {}
         fingerprint = f"keepalive-task:{task_id}"
@@ -543,8 +599,7 @@ class Gateway:
                 (frame.get("next_run_at"), task_id),
             )
 
-        if self.on_task_result is not None:
-            await self.on_task_result(int(task_id), frame)
+        return int(task_id)
 
     # -- commands ----------------------------------------------------------
 

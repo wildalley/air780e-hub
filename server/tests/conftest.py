@@ -13,6 +13,21 @@ import pytest
 import hub_server.main as main_module
 
 
+def pytest_addoption(parser) -> None:
+    parser.addoption(
+        "--fault-cycles",
+        action="store",
+        type=int,
+        default=1,
+        help="repeat deterministic restart/replay fault scenarios",
+    )
+
+
+@pytest.fixture
+def fault_cycles(pytestconfig) -> int:
+    return max(1, pytestconfig.getoption("--fault-cycles"))
+
+
 @pytest.fixture(autouse=True)
 def no_frontend_bundle(tmp_path_factory, monkeypatch):
     missing = tmp_path_factory.mktemp("no-bundle") / "www"

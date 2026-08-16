@@ -85,8 +85,8 @@ CREATE TABLE IF NOT EXISTS agents (
     last_seq     INTEGER NOT NULL DEFAULT 0
 );
 
--- Every event the agent sends is recorded here before it is applied, so a
--- replay after a lost ack cannot duplicate a message.
+-- Every event the agent sends is recorded in the same transaction that
+-- applies it, so a replay after a lost ack cannot duplicate a message.
 CREATE TABLE IF NOT EXISTS ingested (
     agent_id TEXT NOT NULL,
     seq      INTEGER NOT NULL,
@@ -770,19 +770,52 @@ class Database:
 
     # -- idempotency -------------------------------------------------------
 
-    def claim_event(self, agent_id: str, seq: int, kind: str) -> bool:
-        """Record an event's arrival.
+    def apply_event(
+        self,
+        agent_id: str,
+        seq: int,
+        kind: str,
+        apply: Callable[[], Any],
+    ) -> tuple[bool, Any]:
+        """Claim and apply one Agent event atomically.
 
-        Returns False if this ``(agent_id, seq)`` was already applied — the
-        agent replays after a lost ack, so duplicates are expected, not a bug.
+        ``(agent_id, seq)`` is durable only if every business write made by
+        ``apply`` commits with it.  A transient failure rolls the whole event
+        back, allowing the Agent to replay it after the connection drops.
+        Returns ``(False, None)`` for an already committed replay.
         """
         with self._lock:
-            cursor = self._db.execute(
-                "INSERT OR IGNORE INTO ingested (agent_id, seq, kind, at) "
-                "VALUES (?, ?, ?, ?)",
-                (agent_id, seq, kind, utcnow()),
-            )
-            return cursor.rowcount > 0
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._db.execute(
+                    "INSERT OR IGNORE INTO ingested (agent_id, seq, kind, at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (agent_id, seq, kind, utcnow()),
+                )
+                if cursor.rowcount == 0:
+                    # Older databases did not maintain agents.last_seq.  A
+                    # replay is enough to reconcile it without a migration.
+                    self._db.execute(
+                        "UPDATE agents SET last_seq = MAX(last_seq, ?) WHERE id = ?",
+                        (seq, agent_id),
+                    )
+                    self._db.execute("COMMIT")
+                    return False, None
+
+                result = apply()
+                self._db.execute(
+                    "UPDATE agents SET last_seq = MAX(last_seq, ?) WHERE id = ?",
+                    (seq, agent_id),
+                )
+                self._db.execute("COMMIT")
+                return True, result
+            except BaseException:
+                try:
+                    if self._db.in_transaction:
+                        self._db.execute("ROLLBACK")
+                except sqlite3.Error:
+                    log.exception("rollback after failed event application also failed")
+                raise
 
     # -- agents and devices ------------------------------------------------
 

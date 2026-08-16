@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -11,6 +12,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from hub_server.config import Settings
+from hub_server.db import Database
+from hub_server.gateway import Gateway
 from hub_server.main import create_app
 
 
@@ -176,6 +179,14 @@ def _minutes_ago(minutes: int) -> str:
 def _items(response) -> list[dict]:
     """The rows out of a paged list response."""
     return response.json()["items"]
+
+
+class _AckSocket:
+    def __init__(self) -> None:
+        self.frames: list[dict] = []
+
+    async def send_text(self, raw: str) -> None:
+        self.frames.append(json.loads(raw))
 
 
 def test_agent_needs_a_valid_token(client):
@@ -405,6 +416,126 @@ def test_replayed_event_is_not_duplicated(admin):
 
     items = admin.get("/api/messages").json()["items"]
     assert len(items) == 1
+
+
+async def test_failed_event_application_rolls_back_and_is_replayable(tmp_path):
+    """A partial write must neither claim nor acknowledge the sequence."""
+    settings = Settings(data_dir=tmp_path, agent_token="test-token")
+    db = Database(settings.db_path)
+    db.upsert_agent("test-agent", "0.1.0", 1, connected=True)
+    gateway = Gateway(db, settings)
+    socket = _AckSocket()
+    event = {
+        "type": "sms_in", "seq": 17, "device": "a",
+        "iccid": "89860622180012345670", "peer": "10086",
+        "body": "survives retry", "ts": "2026-08-02T18:00:00+08:00",
+    }
+    original = gateway._apply_sms_in
+    attempts = 0
+
+    def fail_once(agent_id: str, frame: dict) -> int:
+        nonlocal attempts
+        attempts += 1
+        message_id = original(agent_id, frame)
+        if attempts == 1:
+            raise RuntimeError("injected failure after message insert")
+        return message_id
+
+    gateway._apply_sms_in = fail_once  # type: ignore[method-assign]
+    try:
+        with pytest.raises(RuntimeError, match="injected failure"):
+            await gateway._ingest("test-agent", event, socket)
+
+        assert socket.frames == [], "a failed sequence must not be acknowledged"
+        assert db.query("SELECT id FROM messages") == []
+        assert db.query("SELECT seq FROM ingested") == []
+
+        await gateway._ingest("test-agent", event, socket)
+        await gateway._ingest("test-agent", event, socket)
+
+        assert socket.frames == [
+            {"type": "ack", "seq": 17},
+            {"type": "ack", "seq": 17},
+        ]
+        assert len(db.query("SELECT id FROM messages")) == 1
+        assert db.query("SELECT seq, kind FROM ingested") == [
+            {"seq": 17, "kind": "sms_in"}
+        ]
+        assert db.one("SELECT last_seq FROM agents WHERE id = 'test-agent'")[
+            "last_seq"
+        ] == 17
+    finally:
+        db.close()
+
+
+def test_failed_event_application_closes_the_ordered_stream(admin, monkeypatch):
+    """The next frame must not produce a cumulative ACK past a failed one."""
+    from starlette.websockets import WebSocketDisconnect
+
+    gateway = admin.app.state.hub.gateway
+    original = gateway._apply_sms_in
+
+    def fail_after_insert(agent_id: str, frame: dict) -> int:
+        original(agent_id, frame)
+        raise RuntimeError("injected ordered-stream failure")
+
+    monkeypatch.setattr(gateway, "_apply_sms_in", fail_after_insert)
+    with pytest.raises(WebSocketDisconnect) as excinfo:
+        with _connect(admin) as ws:
+            _greet(ws)
+            ws.send_json({
+                "type": "sms_in", "seq": 18, "device": "a",
+                "iccid": "89860622180012345670", "peer": "10086",
+                "body": "must roll back", "ts": "2026-08-02T18:00:00+08:00",
+            })
+            ws.receive_json()
+
+    assert excinfo.value.code == 1011
+    db = admin.app.state.hub.db
+    assert db.query("SELECT id FROM messages WHERE seq = 18") == []
+    assert db.query("SELECT seq FROM ingested WHERE seq = 18") == []
+
+
+def test_lost_ack_replay_survives_repeated_server_restarts(settings, fault_cycles):
+    """Persist once, lose its ACK, then replay across fresh Server processes."""
+    event = {
+        "type": "sms_in", "seq": 23, "device": "a",
+        "iccid": "89860622180012345670", "peer": "10086",
+        "body": "one durable copy", "ts": "2026-08-02T18:00:00+08:00",
+    }
+
+    first_app = create_app(settings)
+    with TestClient(first_app) as first:
+        with _connect(first) as ws:
+            _greet(ws)
+            ws.send_json(event)
+            # Wait for the durable write but deliberately never consume the
+            # ACK from this connection, exactly as a network cut would do.
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if first.app.state.hub.db.one(
+                    "SELECT COUNT(*) AS n FROM ingested WHERE agent_id = ? AND seq = ?",
+                    ("test-agent", event["seq"]),
+                )["n"] == 1:
+                    break
+                time.sleep(0.01)
+            else:
+                pytest.fail("event was not persisted before the injected disconnect")
+
+    for _cycle in range(fault_cycles):
+        restarted_app = create_app(settings)
+        with TestClient(restarted_app) as restarted:
+            with _connect(restarted) as ws:
+                _greet(ws)
+                ws.send_json(event)
+                assert ws.receive_json() == {"type": "ack", "seq": event["seq"]}
+
+            db = restarted.app.state.hub.db
+            assert db.one("SELECT COUNT(*) AS n FROM messages")["n"] == 1
+            assert db.one("SELECT COUNT(*) AS n FROM ingested")["n"] == 1
+            assert db.one("SELECT last_seq FROM agents WHERE id = 'test-agent'")[
+                "last_seq"
+            ] == event["seq"]
 
 
 def test_messages_from_two_cards_are_kept_apart(admin):
