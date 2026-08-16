@@ -2,28 +2,48 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
 import air780e_agent.link as link_module
 from air780e_agent import PROTOCOL_VERSION
 from air780e_agent.config import ServerConfig
-from air780e_agent.link import ServerLink
+from air780e_agent.link import BATCH, ServerLink
 from air780e_agent.store import LocalStore
+
+_END = object()
 
 
 class _Socket:
-    def __init__(self) -> None:
+    def __init__(self, *, event_count: int = 0, acknowledge: bool = False) -> None:
         self.frames: list[dict[str, Any]] = []
+        self._event_count = event_count
+        self._acknowledge = acknowledge
+        self._events_sent = 0
+        self._incoming: asyncio.Queue[str | object] = asyncio.Queue()
+        if event_count == 0:
+            self._incoming.put_nowait(_END)
 
     async def send(self, raw: str) -> None:
-        self.frames.append(json.loads(raw))
+        frame = json.loads(raw)
+        self.frames.append(frame)
+        if not isinstance(frame.get("seq"), int):
+            return
+        self._events_sent += 1
+        if self._acknowledge:
+            self._incoming.put_nowait(json.dumps({"type": "ack", "seq": frame["seq"]}))
+        if self._events_sent == self._event_count:
+            self._incoming.put_nowait(_END)
 
     def __aiter__(self):
         return self
 
     async def __anext__(self):
-        raise StopAsyncIteration
+        frame = await self._incoming.get()
+        if frame is _END:
+            raise StopAsyncIteration
+        return frame
 
 
 class _Connection:
@@ -37,19 +57,11 @@ class _Connection:
         return None
 
 
-async def test_hello_advertises_the_wire_protocol_version(tmp_path, monkeypatch):
-    socket = _Socket()
-    monkeypatch.setattr(
-        link_module,
-        "connect",
-        lambda *_args, **_kwargs: _Connection(socket),
-    )
-    store = LocalStore(tmp_path / "agent.db")
-
+def _make_link(store: LocalStore) -> ServerLink:
     async def on_command(_frame: dict[str, Any]) -> None:
         return None
 
-    link = ServerLink(
+    return ServerLink(
         ServerConfig(url="wss://hub.test/ws", token="secret"),
         agent_id="site-a",
         version="0.1.0",
@@ -57,8 +69,22 @@ async def test_hello_advertises_the_wire_protocol_version(tmp_path, monkeypatch)
         on_command=on_command,
         describe_devices=lambda: [{"name": "a"}],
     )
+
+
+async def _connect_once(monkeypatch, store: LocalStore, socket: _Socket) -> None:
+    monkeypatch.setattr(
+        link_module,
+        "connect",
+        lambda *_args, **_kwargs: _Connection(socket),
+    )
+    await _make_link(store)._connect_once()
+
+
+async def test_hello_advertises_the_wire_protocol_version(tmp_path, monkeypatch):
+    socket = _Socket()
+    store = LocalStore(tmp_path / "agent.db")
     try:
-        await link._connect_once()
+        await _connect_once(monkeypatch, store, socket)
     finally:
         store.close()
 
@@ -70,3 +96,57 @@ async def test_hello_advertises_the_wire_protocol_version(tmp_path, monkeypatch)
         "last_seq": 0,
         "devices": [{"name": "a"}],
     }]
+
+
+async def test_acked_backlog_drains_across_batch_boundaries(tmp_path, monkeypatch):
+    """A large outage queue must not pause five seconds after every batch."""
+    store = LocalStore(tmp_path / "agent.db")
+    total = BATCH + 1
+    for index in range(total):
+        store.append_event("status", {"device": "a", "rssi": index})
+    socket = _Socket(event_count=total, acknowledge=True)
+
+    try:
+        async with asyncio.timeout(1.0):
+            await _connect_once(monkeypatch, store, socket)
+        assert store.unacked_count() == 0
+    finally:
+        store.close()
+
+    events = [frame for frame in socket.frames if "seq" in frame]
+    assert len(events) == total
+    assert [frame["seq"] for frame in events] == list(range(1, total + 1))
+
+
+async def test_lost_ack_replays_after_agent_restart(
+    tmp_path, monkeypatch, fault_cycles
+):
+    """Disconnect before ACK, reopen SQLite, then replay the exact sequence."""
+    path = tmp_path / "agent.db"
+    store = LocalStore(path)
+    previous_seq = 0
+    try:
+        for cycle in range(fault_cycles):
+            event = store.append_event(
+                "sms_in",
+                {"device": "a", "peer": "10086", "body": f"cycle-{cycle}"},
+            )
+            assert event.seq > previous_seq
+
+            dropped = _Socket(event_count=1, acknowledge=False)
+            await _connect_once(monkeypatch, store, dropped)
+            assert store.unacked_count() == 1
+            assert [frame.get("seq") for frame in dropped.frames[1:]] == [event.seq]
+
+            # This is the Agent process boundary: only the SQLite file carries
+            # the event and sequence into the next connection.
+            store.close()
+            store = LocalStore(path)
+
+            replayed = _Socket(event_count=1, acknowledge=True)
+            await _connect_once(monkeypatch, store, replayed)
+            assert [frame.get("seq") for frame in replayed.frames[1:]] == [event.seq]
+            assert store.unacked_count() == 0
+            previous_seq = event.seq
+    finally:
+        store.close()

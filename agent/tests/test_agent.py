@@ -260,6 +260,92 @@ imei = "867567048825491"
             await mock.stop()
 
 
+async def test_worker_reclaims_the_same_module_after_usb_reenumeration(
+    tmp_path, monkeypatch, fault_cycles
+):
+    """A running worker follows its IMEI when ttyACM numbering changes."""
+    imei = "867567048825490"
+    iccid = "89860622180012345670"
+    config = AgentConfig.parse(f"""
+[agent]
+id = "reenumeration-agent"
+status_interval = 0.05
+reconnect_max_delay = 0.05
+
+[[devices]]
+name = "a"
+imei = "{imei}"
+iccid = "{iccid}"
+""".encode())
+    config.db_path = tmp_path / "agent.db"
+
+    visible_ports = ["/dev/ttyACM0"]
+    mocks: dict[str, MockAir780E] = {}
+    transports: dict[str, PipeTransport] = {}
+
+    async def add_module(port: str) -> None:
+        agent_side, modem_side = PipeTransport.create_pair()
+        mock = MockAir780E(transport=modem_side, imei=imei, iccid=iccid)
+        await mock.start()
+        transports[port] = agent_side
+        mocks[port] = mock
+
+    await add_module(visible_ports[0])
+
+    async def prober(port: str, *, timeout: float):
+        mock = mocks.get(port)
+        if mock is None or port not in visible_ports:
+            return None
+        return ProbeResult(port=port, model=mock.model, imei=mock.imei, iccid=mock.iccid)
+
+    monkeypatch.setattr(
+        "air780e_agent.discovery.globmodule.glob",
+        lambda _pattern: list(visible_ports),
+    )
+    # Keep deterministic fault cycles fast while preserving the production
+    # backoff implementation itself.
+    monkeypatch.setattr("air780e_agent.worker.random.uniform", lambda *_args: 0.01)
+
+    registry = PortRegistry(prober=prober)
+    app = AgentApp(
+        config,
+        transport_factory=lambda device: transports[device.port],
+        registry=registry,
+    )
+    runner = asyncio.create_task(app.run())
+    current_port = visible_ports[0]
+    try:
+        async with asyncio.timeout(3.0):
+            while not app.workers["a"].online:
+                await asyncio.sleep(0.01)
+
+        for cycle in range(fault_cycles):
+            next_port = f"/dev/ttyACM{cycle + 3}"
+            await add_module(next_port)
+            visible_ports[:] = [next_port]
+            transports[current_port].disconnect()
+
+            async with asyncio.timeout(3.0):
+                while True:
+                    described = app.workers["a"].describe()
+                    if app.workers["a"].online and described["port"] == next_port:
+                        break
+                    await asyncio.sleep(0.01)
+
+            assert described["imei"] == imei
+            assert described["iccid"] == iccid
+            assert registry.claimed_by(current_port) is None
+            assert registry.claimed_by(next_port) == "a"
+            await mocks[current_port].stop()
+            current_port = next_port
+    finally:
+        await app.stop()
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        for mock in mocks.values():
+            await mock.stop()
+
+
 async def test_startup_emits_status_for_each_device(agent):
     await agent.wait_online()
     events = await agent.wait_for_events("status", 2)

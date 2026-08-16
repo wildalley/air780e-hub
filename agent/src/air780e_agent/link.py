@@ -145,13 +145,16 @@ class ServerLink:
 
     async def _sender(self, ws) -> None:
         while not self._stopped:
+            # Clear before looking at the queue.  An append or ACK that races
+            # the query then leaves the event set and cannot strand work until
+            # the five-second safety timeout.
+            self._wake.clear()
             events = [
                 event
                 for event in self.store.unacked_events(limit=BATCH)
                 if event.seq > self._sent_through
             ]
             if not events:
-                self._wake.clear()
                 try:
                     # The timeout is a safety net: if a wake is ever missed,
                     # the queue still drains within a few seconds.
@@ -198,6 +201,10 @@ class ServerLink:
         removed = self.store.ack_through(seq)
         if removed:
             log.debug("acked through %d (%d event(s) cleared)", seq, removed)
+            # unacked_events() reads the oldest BATCH rows.  Once their ACK
+            # removes them, wake the sender so the next batch is visible now
+            # rather than after the safety timeout.
+            self.wake()
 
     def _handle_resend(self, frame: dict[str, Any]) -> None:
         seq = frame.get("seq")

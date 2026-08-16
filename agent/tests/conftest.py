@@ -13,6 +13,21 @@ from air780e_agent.modem import Air780E
 from air780e_agent.pdu import DecodedSms, StatusReport
 
 
+def pytest_addoption(parser) -> None:
+    parser.addoption(
+        "--fault-cycles",
+        action="store",
+        type=int,
+        default=1,
+        help="repeat deterministic reconnect/re-enumeration fault scenarios",
+    )
+
+
+@pytest.fixture
+def fault_cycles(pytestconfig) -> int:
+    return max(1, pytestconfig.getoption("--fault-cycles"))
+
+
 @dataclass
 class Rig:
     client: ATClient
