@@ -176,6 +176,7 @@ npm run build
 
 - [部署指南](docs/deploy.md)
 - [发布清单](docs/release.md)
+- [短信性能基线](docs/performance.md)
 - [变更日志](CHANGELOG.md)
 - [通知渠道与规则](docs/notify.md)
 - [Agent / Server 协议](docs/protocol.md)

@@ -29,6 +29,15 @@
 - Python 与 JavaScript/TypeScript 的 CodeQL 代码扫描；
 - 构建镜像的 HIGH / CRITICAL 漏洞扫描。
 
+涉及消息查询、SQLite 或 CSV 导出的版本，在固定性能主机额外执行：
+
+```bash
+cd server
+uv run --frozen python benchmarks/messages.py --enforce --json
+```
+
+保存输出用于和上一版本比较。绝对延迟不放进共享 CI runner；数据集、阈值和参考结果见[短信性能基线](performance.md)。
+
 再在一台干净的部署主机执行：
 
 ```bash
