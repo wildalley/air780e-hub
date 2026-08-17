@@ -101,7 +101,12 @@ export interface Device {
   online: number
   registered: number
   radio_enabled: number | null
+  eps_registered?: number | null
+  cs_registered?: number | null
+  ims_registered?: number | null
   model: string
+  hardware_model?: string
+  firmware?: string
   imei: string
   operator: string
   rssi: number | null

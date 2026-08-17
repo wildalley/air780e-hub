@@ -64,8 +64,15 @@ Agent 自主重放,正常连接不依赖 Server 根据该值计算范围。
       "imei": "000000000000001",
       "iccid": "89000000000000000001",
       "model": "AirM2M_780E_V1171_LTE_AT",
+      "hardware_model": "Air780EPV",
+      "firmware": "AirM2M_780EPV_V1011_LTE_AT",
       "operator": "EXAMPLE",
-      "smsc": "+10000000000"
+      "smsc": "+10000000000",
+      "registered": true,
+      "radio_enabled": true,
+      "eps_registered": true,
+      "cs_registered": false,
+      "ims_registered": false
     }
   ]
 }
@@ -73,6 +80,11 @@ Agent 自主重放,正常连接不依赖 Server 根据该值计算范围。
 
 `version` 是发布版本，`protocol_version` 是 JSON 帧契约版本；两者用途不同，均须
 上报。旧 Agent 未携带协议字段时按 `0` 处理，因此会明确显示为协议不兼容。
+
+`eps_registered`、`cs_registered` 和 `ims_registered` 都允许 `null`:表示固件没有
+暴露该注册域或查询失败,与明确的 `false` 不同。IMS 字段只用于诊断;Server 不因其为
+`false` 或 `null` 阻止发送。上述新增设备字段是协议 v1 的可选扩展,旧 Agent 缺失时
+Server 和前端按未知状态处理。
 
 ### `sms_in` —— 收到短信
 
@@ -156,6 +168,9 @@ Agent 通过 `AT+CNMI=2,1,0,1,0` 接收 `+CDS`，解码 SMS-STATUS-REPORT 后持
   "online": true,
   "registered": true,
   "radio_enabled": true,
+  "eps_registered": true,
+  "cs_registered": false,
+  "ims_registered": false,
   "operator": "CHINA MOBILE",
   "rssi": 24,
   "dbm": -65,
@@ -167,7 +182,8 @@ Agent 通过 `AT+CNMI=2,1,0,1,0` 接收 `+CDS`，解码 SMS-STATUS-REPORT 后持
 }
 ```
 
-采样周期默认 60 秒。**变化不大时不上报**(rssi 变动 < 2 且其余字段不变则跳过),避免信号曲线被噪声灌满。
+采样周期默认 60 秒。EPS、CS 或 IMS 注册域变化会立即使本次采样值得上报。
+**变化不大时不上报**(rssi 变动 < 2 且其余字段不变则跳过),避免信号曲线被噪声灌满。
 
 ### `task_result` —— 保号任务执行结果
 

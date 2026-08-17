@@ -27,12 +27,27 @@ async def test_initialize_reads_identity(modem, rig):
     assert modem.info.smsc == rig.mock.smsc
     assert modem.info.operator == rig.mock.operator
     assert modem.info.registered is True
+    assert modem.info.eps_registered is True
+    assert modem.info.cs_registered is True
+    assert modem.info.ims_registered is False
 
 
 async def test_initialize_selects_pdu_mode(modem, rig):
     assert rig.mock._cmgf == 0, "text mode mangles non-ASCII content"
+    assert rig.mock._cmee == 1, "numeric +CMS/+CME codes are required for diagnosis"
     assert rig.mock._echo is False
     assert rig.mock._cnmi.upper() == "AT+CNMI=2,1,0,1,0"
+    assert "AT+CIREG=1" in rig.mock.commands
+
+
+async def test_initialize_tolerates_firmware_without_ims_status(rig):
+    rig.mock.unsupported.add("AT+CIREG")
+    rig.modem = Air780E(rig.client)
+
+    info = await rig.modem.initialize()
+
+    assert info.registered is True
+    assert info.ims_registered is None
 
 
 async def test_read_signal(modem, rig):

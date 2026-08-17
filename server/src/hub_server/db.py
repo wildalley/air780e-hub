@@ -38,6 +38,7 @@ log = logging.getLogger(__name__)
 # Version 5 reclassifies stored data PDUs that predate the current checks.
 # Version 6 adds structured SIM billing and lifecycle dates used for reminders.
 # Version 7 adds the covering index used by conversation summaries and threads.
+# Version 8 records modem firmware and per-domain network/IMS registration.
 #
 # To add a migration: append one entry to ``MIGRATIONS`` with the next integer
 # and bump this constant, and add the same columns/tables/indexes to SCHEMA so a brand
@@ -47,7 +48,7 @@ log = logging.getLogger(__name__)
 # Never renumber or edit a released entry — a database that already ran it will
 # not run it again, so an edit only affects databases that have not, and the two
 # then disagree about what version N means.
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # Persisted (settings table) key for the SMS retention window, in days.  The
 # operator edits it on the Notify page; when unset the env default applies.
@@ -125,7 +126,12 @@ CREATE TABLE IF NOT EXISTS devices (
     online       INTEGER NOT NULL DEFAULT 0,
     registered   INTEGER NOT NULL DEFAULT 0,
     radio_enabled INTEGER,
+    eps_registered INTEGER,
+    cs_registered INTEGER,
+    ims_registered INTEGER,
     model        TEXT NOT NULL DEFAULT '',
+    hardware_model TEXT NOT NULL DEFAULT '',
+    firmware     TEXT NOT NULL DEFAULT '',
     imei         TEXT NOT NULL DEFAULT '',
     operator     TEXT NOT NULL DEFAULT '',
     rssi         INTEGER,
@@ -538,6 +544,8 @@ class Database:
          "_migration_sim_lifecycle"),
         (7, "index message conversations and their newest rows",
          "_migration_message_conversation_index"),
+        (8, "record modem firmware and registration domains",
+         "_migration_modem_diagnostics"),
     )
 
     def _add_columns_if_missing(self, table: str, columns: dict[str, str]) -> None:
@@ -647,6 +655,19 @@ class Database:
         self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_conversation "
             "ON messages(sim_id, peer, ts DESC, id DESC)"
+        )
+
+    def _migration_modem_diagnostics(self) -> None:
+        """v7 -> v8: retain the evidence needed to diagnose SMS routing."""
+        self._add_columns_if_missing(
+            "devices",
+            {
+                "eps_registered": "INTEGER",
+                "cs_registered": "INTEGER",
+                "ims_registered": "INTEGER",
+                "hardware_model": "TEXT NOT NULL DEFAULT ''",
+                "firmware": "TEXT NOT NULL DEFAULT ''",
+            },
         )
 
     def _snapshot_before_migration(self, from_version: int) -> Path | None:
@@ -1054,6 +1075,9 @@ class Database:
         "online",
         "registered",
         "radio_enabled",
+        "eps_registered",
+        "cs_registered",
+        "ims_registered",
         "rssi",
         "dbm",
         "bars",
@@ -1063,7 +1087,15 @@ class Database:
     # Identity fields.  A blank here always means "this frame didn't carry it",
     # never "the module lost its IMEI" — status frames are a subset of hello,
     # so overwriting on blank would erase the card's name every 60 seconds.
-    _DEVICE_IDENTITY_FIELDS = ("label", "port", "model", "imei", "operator")
+    _DEVICE_IDENTITY_FIELDS = (
+        "label",
+        "port",
+        "model",
+        "hardware_model",
+        "firmware",
+        "imei",
+        "operator",
+    )
 
     def upsert_device(self, agent_id: str, payload: dict[str, Any]) -> int:
         name = payload.get("name", "")
@@ -1074,7 +1106,12 @@ class Database:
         for field in self._DEVICE_STATE_FIELDS:
             if field in payload:
                 value = payload[field]
-                if field == "radio_enabled":
+                if field in (
+                    "radio_enabled",
+                    "eps_registered",
+                    "cs_registered",
+                    "ims_registered",
+                ):
                     columns[field] = None if value is None else int(bool(value))
                 elif field in ("online", "registered"):
                     columns[field] = int(bool(value))

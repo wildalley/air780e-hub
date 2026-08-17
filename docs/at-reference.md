@@ -116,6 +116,34 @@ modprobe -n -v cdc_acm
 
 启动时还需做一次全量 `AT+CMGL` 补读,捞回主机离线期间积压的短信。
 
+#### LTE、IMS 与短信发送边界
+
+Air780E 系列支持短信,但这不等于每个型号和固件都支持 VoLTE,也不等于 LTE 注册后
+必然通过 IMS 发送短信。短信还可能由 NAS/SGs 承载,所以 **IMS 未注册只能作为诊断
+证据,不能作为拒绝 `AT+CMGS` 的条件**。
+
+2026-08-17 对 `AirM2M_780EPV_V1011_LTE_AT` 的只读查询和唯一一次发送测试显示:
+
+- EPS/LTE 已注册且数据已附着,CS 未注册;
+- `AT+CIREG?` 返回 `+CIREG: 2,0`,即固件能报告 IMS 状态但当时未注册;
+- `CGSMS`、`IMS`、`IMSREG`、`VOLTE` 等探测命令不受该固件支持;
+- `AT+CMGS` 仍被执行,但该次出站失败;同一 SIM 放入手机后可以发送。
+
+Agent 因此只以 best-effort 方式启用和查询 `CIREG`:固件拒绝时状态为“未知”,接受时
+在设备页区分 EPS/LTE、CS 与 IMS,并把注册域和完整固件版本附到发送错误。它不会发送
+未经该固件文档确认的 `AT+IMS`、`AT+VOLTE` 或 `ECCFG` 配置,也不会把 IMS 未注册
+误判成必然不能发短信。
+
+[SimAdmin](https://github.com/3899/SimAdmin) 的发送路径同样没有自行实现 IMS:它调用
+ModemManager Messaging 的 `Create` / `Send`,IMS 状态接口当前直接说明 ModemManager
+未暴露该状态。[uart_sms_forwarder](https://github.com/dushixiang/uart_sms_forwarder)
+则要求烧录 LuatOS,由 `sms.sendLong()` 交给底层固件;其 README 明确提示部分合宙固件
+存在收发短信问题。该项目的 [issue #37](https://github.com/dushixiang/uart_sms_forwarder/issues/37)
+有 Air780EPV 用户报告 `LuatOS-SoC_V2020_Air780EP` 在不需要 VoLTE 时恢复收发,
+[issue #40](https://github.com/dushixiang/uart_sms_forwarder/issues/40) 也有普通 Air780E
+刷 V1122 后恢复的个案。这些是固件兼容性线索,不是证明不同型号固件可以互刷的官方
+结论;而且切到 LuatOS 后不能继续使用本项目当前的 AT Agent。
+
 ### 2.2 信号与网络状态
 
 | 指令 | 拿到什么 |
@@ -126,6 +154,7 @@ modprobe -n -v cdc_acm
 | `AT+EEMGINFO` | 工程模式详细网络参数 |
 | `AT+COPS?` | 当前运营商 |
 | `AT+CREG?` / `AT+CGREG?` / `AT+CEREG?` | 2G / GPRS / LTE 注册状态 |
+| `AT+CIREG?` | IMS 注册状态;部分固件不支持,且未注册不等于 SMS 必然不可用 |
 | `AT+CPIN?` | SIM 卡状态 / PIN |
 | `AT+ICCID`(或 `AT+CCID`) | 卡 ICCID |
 | `AT+CGSN` | IMEI |
@@ -182,7 +211,7 @@ Air780E 的 AT 固件内置了完整的网络客户端,这意味着**必要时�
 | `AT+RNDISCALL` | RNDIS 拨号(可当网卡) |
 | `AT+CNETLIGHT` | 网络指示灯 |
 | `AT+IPR` | 波特率 |
-| `AT+CMEE` | **错误码详细程度 —— 初始化时务必设为 `2`**,否则出错只回 `ERROR` 无从排查 |
+| `AT+CMEE` | 错误码详细程度;Agent 使用 `1` 保留数字 `+CMS` / `+CME` 码,`2` 会转成固件相关文本 |
 | `AT+FS*` | 模块文件系统 |
 | `AT+CTTS` / `AT+CAUDPLAY` | TTS / 音频播放 |
 
@@ -278,7 +307,7 @@ for p in /dev/ttyACM*; do echo "--- $p"; echo 'ATI' | socat - "$p" ; done
 #    期望看到 AirM2M_780E_..._AT。若全无响应 → 是 LuatOS 固件,需刷 AT 固件
 
 # 3. 基础信息
-echo 'AT+CMEE=2' | socat - /dev/ttyACMx    # 打开详细错误码
+echo 'AT+CMEE=1' | socat - /dev/ttyACMx    # 保留可检索的数字 CMS/CME 错误码
 echo 'AT+CPIN?'  | socat - /dev/ttyACMx    # 卡是否就绪
 echo 'AT+CSQ'    | socat - /dev/ttyACMx    # 信号
 echo 'AT+COPS?'  | socat - /dev/ttyACMx    # 运营商

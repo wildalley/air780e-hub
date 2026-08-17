@@ -5,3 +5,20 @@ export function radioStatus(device: Pick<Device, 'radio_enabled' | 'registered'>
   if (!device.radio_enabled) return '飞行模式'
   return device.registered ? '射频开启 · 已注册' : '射频开启 · 正在注册'
 }
+
+export function networkRegistrationStatus(
+  device: Pick<Device, 'registered' | 'eps_registered' | 'cs_registered'>,
+): string {
+  if (!device.registered) return '移动网络未注册'
+  const domains: string[] = []
+  if (device.eps_registered) domains.push('LTE')
+  if (device.cs_registered) domains.push('CS')
+  return domains.length > 0 ? `${domains.join(' + ')} 已注册` : '移动网络已注册'
+}
+
+export function imsRegistrationStatus(
+  device: Pick<Device, 'ims_registered'>,
+): string {
+  if (device.ims_registered == null) return 'IMS 状态未知'
+  return device.ims_registered ? 'IMS 已注册' : 'IMS 未注册'
+}

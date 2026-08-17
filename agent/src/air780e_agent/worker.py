@@ -68,7 +68,12 @@ class DeviceState:
     iccid: str = ""
     imei: str = ""
     model: str = ""
+    hardware_model: str = ""
+    firmware: str = ""
     smsc: str = ""
+    eps_registered: bool | None = None
+    cs_registered: bool | None = None
+    ims_registered: bool | None = None
     signal: Signal = field(default_factory=Signal)
     storage_used: int = 0
     storage_capacity: int = 0
@@ -83,7 +88,12 @@ class DeviceState:
             "iccid": self.iccid,
             "imei": self.imei,
             "model": self.model,
+            "hardware_model": self.hardware_model,
+            "firmware": self.firmware,
             "smsc": self.smsc,
+            "eps_registered": self.eps_registered,
+            "cs_registered": self.cs_registered,
+            "ims_registered": self.ims_registered,
             "rssi": self.signal.rssi,
             "dbm": self.signal.dbm,
             "bars": self.signal.bars,
@@ -299,11 +309,16 @@ class DeviceWorker:
         self.state.online = True
         self.state.last_error = ""
         self.state.model = info.model
+        self.state.hardware_model = info.hardware_model
+        self.state.firmware = info.firmware
         self.state.imei = info.imei
         self.state.iccid = info.iccid
         self.state.smsc = info.smsc
         self.state.operator = info.operator
         self.state.registered = info.registered
+        self.state.eps_registered = info.eps_registered
+        self.state.cs_registered = info.cs_registered
+        self.state.ims_registered = info.ims_registered
         self.state.radio_enabled = info.radio_enabled
         self._ready.set()
         self._health_failures = 0
@@ -657,6 +672,14 @@ class DeviceWorker:
             if self.state.radio_enabled is False
             else await modem.read_registration()
         )
+        if self.state.radio_enabled is False:
+            self.state.eps_registered = False
+            self.state.cs_registered = False
+        else:
+            self.state.eps_registered = modem.info.eps_registered
+            self.state.cs_registered = modem.info.cs_registered
+        self.state.ims_registered = await modem.read_ims_registration()
+        modem.info.ims_registered = self.state.ims_registered
         await self._maybe_recover_registration(modem)
         self.state.signal = await modem.read_signal()
         used, capacity = await modem.storage_usage()
@@ -699,7 +722,15 @@ class DeviceWorker:
             return True
 
         for key in (
-            "online", "registered", "radio_enabled", "operator", "storage_used", "port"
+            "online",
+            "registered",
+            "radio_enabled",
+            "eps_registered",
+            "cs_registered",
+            "ims_registered",
+            "operator",
+            "storage_used",
+            "port",
         ):
             if previous.get(key) != payload.get(key):
                 return True
@@ -799,6 +830,7 @@ class DeviceWorker:
         try:
             refs = await modem.send_sms(number, body)
         except ATError as exc:
+            error = f"{exc}; modem status: {self._sms_diagnostic_context()}"
             self.store.record_message(
                 device=self.name, direction="out", peer=number, body=body,
                 ts=ts, iccid=self.state.iccid or None, status="failed",
@@ -806,9 +838,9 @@ class DeviceWorker:
             self.emit("sms_out", {
                 "device": self.name, "iccid": self.state.iccid, "peer": number,
                 "body": body, "ts": ts, "status": "failed", "refs": [],
-                "cmd_id": cmd_id, "error": str(exc),
+                "cmd_id": cmd_id, "error": error,
             })
-            raise
+            raise ATError(error) from exc
 
         self.store.record_message(
             device=self.name, direction="out", peer=number, body=body,
@@ -823,6 +855,29 @@ class DeviceWorker:
         log.info("[%s] sent to %s (%d segment(s))", self.name, number, len(refs))
         return refs
 
+    def _sms_diagnostic_context(self) -> str:
+        domains = []
+        if self.state.eps_registered:
+            domains.append("EPS/LTE")
+        if self.state.cs_registered:
+            domains.append("CS")
+        if domains:
+            network = "+".join(domains) + " registered"
+        elif self.state.registered:
+            network = "registered (domain unavailable)"
+        else:
+            network = "not registered"
+
+        if self.state.ims_registered is True:
+            ims = "IMS registered"
+        elif self.state.ims_registered is False:
+            ims = "IMS not registered"
+        else:
+            ims = "IMS status unavailable"
+
+        firmware = self.state.firmware or "unknown firmware"
+        return f"{network}, {ims}, firmware={firmware}"
+
     async def ping(self, host: str = "www.baidu.com") -> bool:
         return await self._require_radio().ping(host)
 
@@ -831,6 +886,9 @@ class DeviceWorker:
         radio_enabled, registered = await modem.set_radio_enabled(enabled)
         self.state.radio_enabled = radio_enabled
         self.state.registered = registered
+        self.state.eps_registered = modem.info.eps_registered
+        self.state.cs_registered = modem.info.cs_registered
+        self.state.ims_registered = modem.info.ims_registered
         if not radio_enabled:
             self.state.signal = Signal()
             self._cancel_registration_recovery("radio was deliberately disabled")

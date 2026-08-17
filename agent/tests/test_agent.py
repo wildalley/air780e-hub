@@ -465,9 +465,12 @@ async def test_send_sms_failure_is_reported(agent):
     result = agent.events("cmd_result")[-1].payload
     assert result["ok"] is False
     assert "CMS ERROR" in result["error"]
+    assert "IMS not registered" in result["error"]
+    assert agent.mocks["a"].firmware in result["error"]
 
     out = agent.events("sms_out")[-1].payload
     assert out["status"] == "failed"
+    assert out["error"] == result["error"]
 
 
 async def test_send_to_unknown_device_is_rejected(agent):

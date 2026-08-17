@@ -71,6 +71,7 @@ class MockAir780E:
     rsrp: int = 55  # +CESQ encoding
     rsrq: int = 20
     registered: bool = True
+    ims_registered: bool = False
     radio_enabled: bool = True
     pin_ready: bool = True
 
@@ -255,10 +256,16 @@ class MockAir780E:
             if self.radio_enabled and self.cops_recovers_registration:
                 self.registered = True
             return self._reply()
+        if upper in ("AT+CREG=1", "AT+CEREG=1", "AT+CIREG=1"):
+            return self._reply()
         if upper in ("AT+CEREG?", "AT+CREG?"):
             name = "+CEREG" if "CEREG" in upper else "+CREG"
             attached = self.radio_enabled and self.registered
             return self._reply([f"{name}: 0,{1 if attached else 2}"])
+        if upper == "AT+CIREG?":
+            attached = self.radio_enabled and self.ims_registered
+            # AirM2M_780EPV_V1011 reports notification mode 2 here.
+            return self._reply([f"+CIREG: 2,{1 if attached else 0}"])
         if upper == "AT+CFUN?":
             return self._reply([f"+CFUN: {1 if self.radio_enabled else 0}"])
         if upper in ("AT+CFUN=0", "AT+CFUN=1"):

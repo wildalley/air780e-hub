@@ -142,8 +142,10 @@ HELLO = {
     "devices": [
         {"name": "a", "label": "移动卡", "port": "/dev/air780e-a", "online": True,
          "iccid": "89860622180012345670", "imei": "111", "model": "AirM2M_780E",
+         "hardware_model": "Air780EPV", "firmware": "AirM2M_780EPV_V1011_LTE_AT",
          "operator": "CHINA MOBILE", "smsc": "+8613800210500", "registered": True,
-         "radio_enabled": True},
+         "radio_enabled": True, "eps_registered": True, "cs_registered": False,
+         "ims_registered": False},
         {"name": "b", "label": "联通卡", "port": "/dev/air780e-b", "online": True,
          "iccid": "89860622180012345671", "imei": "222", "model": "AirM2M_780E",
          "operator": "CHINA UNICOM", "smsc": "+8613010200500", "registered": True,
@@ -230,6 +232,12 @@ def test_hello_registers_devices_and_sims(admin):
 
     devices = admin.get("/api/devices").json()
     assert {d["name"] for d in devices} == {"a", "b"}
+    device_a = next(device for device in devices if device["name"] == "a")
+    assert device_a["hardware_model"] == "Air780EPV"
+    assert device_a["firmware"] == "AirM2M_780EPV_V1011_LTE_AT"
+    assert device_a["eps_registered"] == 1
+    assert device_a["cs_registered"] == 0
+    assert device_a["ims_registered"] == 0
 
     sims = admin.get("/api/sims").json()
     assert len(sims) == 2, "two cards must be tracked separately"
@@ -1592,6 +1600,8 @@ def test_status_events_do_not_erase_device_identity(admin):
     assert device["label"] == "移动卡"
     assert device["port"] == "/dev/air780e-a"
     assert device["imei"] == "111"
+    assert device["hardware_model"] == "Air780EPV"
+    assert device["firmware"] == "AirM2M_780EPV_V1011_LTE_AT"
     assert device["iccid"] == "89860622180012345670"
     # …while the state the frame *did* carry is applied.
     assert device["rssi"] == 22

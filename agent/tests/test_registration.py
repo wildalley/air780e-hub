@@ -138,6 +138,29 @@ async def test_read_registration_survives_a_failed_query():
     assert await modem.read_registration() is True
 
 
+async def test_registration_domains_remain_visible_after_the_combined_read():
+    modem = _modem(
+        {
+            "AT+CEREG?": _reg_response("AT+CEREG?", "+CEREG", 5),
+            "AT+CREG?": _reg_response("AT+CREG?", "+CREG", 0),
+        }
+    )
+
+    assert await modem.read_registration() is True
+    assert modem.info.eps_registered is True
+    assert modem.info.cs_registered is False
+
+
+async def test_ims_registration_is_diagnostic_and_tri_state():
+    registered = _modem(
+        {"AT+CIREG?": _reg_response("AT+CIREG?", "+CIREG", 1)}
+    )
+    unavailable = _modem({"AT+CIREG?": ATError("not supported")})
+
+    assert await registered.read_ims_registration() is True
+    assert await unavailable.read_ims_registration() is None
+
+
 # --------------------------------------------------------------------------
 # _on_registration: unsolicited reports are stat-first
 # --------------------------------------------------------------------------
@@ -170,6 +193,27 @@ def test_urc_roaming_stat_registers():
     modem = _modem({})
     modem._on_registration(ATUrc(name="+CEREG", params='5,"1A2B","00C3F1D2",7'))
     assert modem.info.registered is True
+
+
+def test_ims_urc_does_not_change_mobile_network_registration():
+    modem = _modem({})
+    modem.info.registered = True
+    modem.info.eps_registered = True
+
+    modem._on_registration(ATUrc(name="+CIREG", params="0"))
+
+    assert modem.info.registered is True
+    assert modem.info.ims_registered is False
+
+
+def test_one_unregistered_network_urc_does_not_hide_the_other_domain():
+    modem = _modem({})
+    modem.info.eps_registered = True
+
+    modem._on_registration(ATUrc(name="+CREG", params="0"))
+
+    assert modem.info.registered is True
+    assert modem.info.cs_registered is False
 
 
 # --------------------------------------------------------------------------

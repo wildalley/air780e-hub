@@ -55,13 +55,21 @@ class FakeModem:
         self.info = SimpleNamespace(
             registered=registered,
             radio_enabled=radio_enabled,
+            eps_registered=registered,
+            cs_registered=False,
+            ims_registered=False,
         )
 
     async def read_radio_enabled(self) -> bool:
         return self.radio_enabled
 
     async def read_registration(self) -> bool:
+        self.info.registered = self.registered
+        self.info.eps_registered = self.registered
         return self.registered
+
+    async def read_ims_registration(self) -> bool:
+        return self.info.ims_registered
 
     async def read_signal(self) -> Signal:
         return Signal(rssi=20)
@@ -75,11 +83,15 @@ class FakeModem:
     async def reselect_operator(self) -> bool:
         self.actions.append("operator_reselect")
         self.registered = self.operator_recovers
+        self.info.registered = self.registered
+        self.info.eps_registered = self.registered
         return self.registered
 
     async def cycle_radio(self) -> bool:
         self.actions.append("radio_cycle")
         self.registered = self.radio_cycle_recovers
+        self.info.registered = self.registered
+        self.info.eps_registered = self.registered
         return self.registered
 
     async def reset(self) -> None:

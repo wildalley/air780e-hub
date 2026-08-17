@@ -48,6 +48,7 @@ CNMI_STORE_AND_NOTIFY = "AT+CNMI=2,1,0,1,0"
 # We use 1 for the widest module support — `_on_registration` copes with both.
 CREG_ENABLE = "AT+CREG=1"   # circuit-switched / 2G
 CEREG_ENABLE = "AT+CEREG=1"  # EPS / LTE
+CIREG_ENABLE = "AT+CIREG=1"  # IMS, optional and diagnostic only
 
 SEND_TIMEOUT = 60.0
 
@@ -95,6 +96,9 @@ class ModemInfo:
     smsc: str = ""
     operator: str = ""
     registered: bool = False
+    eps_registered: bool | None = None
+    cs_registered: bool | None = None
+    ims_registered: bool | None = None
     radio_enabled: bool | None = None
 
 
@@ -158,13 +162,16 @@ class Air780E:
         client.register_urc("+CDS", self._on_cds, payload_lines=1)
         client.register_urc("+CREG", self._on_registration)
         client.register_urc("+CEREG", self._on_registration)
+        client.register_urc("+CIREG", self._on_registration)
 
     # -- setup -------------------------------------------------------------
 
     async def initialize(self) -> ModemInfo:
         """Put the modem into the state the rest of the agent assumes."""
         await self.client.execute("ATE0")  # echo off: halves the parsing work
-        await self.client.execute("AT+CMEE=2")  # verbose errors, not bare ERROR
+        # Numeric errors preserve +CMS/+CME codes for diagnosis.  CMEE=2 turns
+        # them into firmware-specific text and loses the machine-readable code.
+        await self.client.execute("AT+CMEE=1")
         await self.client.execute("AT+CMGF=0")  # PDU mode, always
         await self.client.execute("AT+CSCS=\"GSM\"")
 
@@ -181,7 +188,7 @@ class Air780E:
         # implements both domains, and a missing one must not abort setup —
         # the periodic refresh in `read_registration` covers whatever URCs
         # never arrive.
-        for command in (CREG_ENABLE, CEREG_ENABLE):
+        for command in (CREG_ENABLE, CEREG_ENABLE, CIREG_ENABLE):
             try:
                 await self.client.execute(command)
             except ATError as exc:
@@ -236,9 +243,13 @@ class Air780E:
             info.operator = match.group(1)
 
         info.radio_enabled = await self.read_radio_enabled()
-        info.registered = (
-            False if info.radio_enabled is False else await self.read_registration()
-        )
+        if info.radio_enabled is False:
+            info.eps_registered = False
+            info.cs_registered = False
+        else:
+            info.eps_registered, info.cs_registered = await self.read_registration_domains()
+        info.registered = bool(info.eps_registered or info.cs_registered)
+        info.ims_registered = await self.read_ims_registration()
 
         return info
 
@@ -269,8 +280,38 @@ class Air780E:
         """
         await self.client.execute(f"AT+CFUN={1 if enabled else 0}", timeout=30.0)
         self.info.radio_enabled = enabled
-        self.info.registered = await self.read_registration() if enabled else False
+        if enabled:
+            self.info.registered = await self.read_registration()
+            self.info.ims_registered = await self.read_ims_registration()
+        else:
+            self.info.registered = False
+            self.info.eps_registered = False
+            self.info.cs_registered = False
+            if self.info.ims_registered is not None:
+                self.info.ims_registered = False
         return enabled, self.info.registered
+
+    async def _read_registration_domain(
+        self, command: str, prefix: str
+    ) -> bool | None:
+        """Read one 3GPP registration domain, preserving unsupported/unknown."""
+        try:
+            response = await self.client.execute(command)
+        except ATError as exc:
+            log.debug("%s failed: %s", command, exc)
+            return None
+        value = response.first(f"+{prefix}:") or ""
+        # Query form is "<n>,<stat>[,...]"; the stat is the second field.
+        match = re.match(r"\s*\d+\s*,\s*(\d+)", value)
+        if match is None:
+            return None
+        return match.group(1) in REGISTERED_STATES
+
+    async def read_registration_domains(self) -> tuple[bool | None, bool | None]:
+        """Return ``(EPS/LTE, CS)`` registration without collapsing the evidence."""
+        eps = await self._read_registration_domain("AT+CEREG?", "CEREG")
+        cs = await self._read_registration_domain("AT+CREG?", "CREG")
+        return eps, cs
 
     async def read_registration(self) -> bool:
         """True if the module is registered on *either* the CS or EPS domain.
@@ -281,18 +322,21 @@ class Air780E:
         SIM like giffgaff lands here.  ``1`` is home, ``5`` is roaming; both
         mean "attached".
         """
-        for command, prefix in (("AT+CEREG?", "CEREG"), ("AT+CREG?", "CREG")):
-            try:
-                response = await self.client.execute(command)
-            except ATError as exc:
-                log.debug("%s failed: %s", command, exc)
-                continue
-            value = response.first(f"+{prefix}:") or ""
-            # Query form is "<n>,<stat>[,...]"; the stat is the second field.
-            match = re.match(r"\s*\d+\s*,\s*(\d+)", value)
-            if match and match.group(1) in REGISTERED_STATES:
-                return True
-        return False
+        eps, cs = await self.read_registration_domains()
+        self.info.eps_registered = eps
+        self.info.cs_registered = cs
+        self.info.registered = bool(eps or cs)
+        return self.info.registered
+
+    async def read_ims_registration(self) -> bool | None:
+        """Return IMS registration, or ``None`` when firmware does not expose it.
+
+        ``AT+CIREG?`` is diagnostic only.  An unregistered IMS domain must not
+        block ``AT+CMGS``: some networks carry SMS over NAS/SGs without IMS.
+        Air780E firmware varies, so rejection of the query is represented as
+        unknown instead of being mistaken for an unregistered service.
+        """
+        return await self._read_registration_domain("AT+CIREG?", "CIREG")
 
     async def recover_registration(self) -> bool:
         """Nudge a module that is stuck unregistered back onto the network.
@@ -359,6 +403,10 @@ class Air780E:
         # automatic registration recovery.
         self.info.radio_enabled = False
         self.info.registered = False
+        self.info.eps_registered = False
+        self.info.cs_registered = False
+        if self.info.ims_registered is not None:
+            self.info.ims_registered = False
         return False
 
     async def read_signal(self) -> Signal:
@@ -580,14 +628,24 @@ class Air780E:
             await result
 
     def _on_registration(self, urc: ATUrc) -> None:
-        # An unsolicited +CREG/+CEREG is stat-first: "+CREG: 1" or, in mode 2,
+        # An unsolicited +CREG/+CEREG/+CIREG is stat-first: "+CREG: 1" or, in mode 2,
         # "+CREG: 1,\"00C3\",\"1234ABCD\",7".  (The query form "<n>,<stat>" is
         # consumed by the pending AT+CxREG? command, never routed here.)  The
         # earlier "<n>,<stat>" pattern silently marked a registered module as
         # unregistered whenever a mode-2 URC carried location fields.
         match = re.match(r"\s*(\d+)", urc.params)
         state = match.group(1) if match else urc.params.strip()
-        self.info.registered = state in ("1", "5")
+        registered = state in REGISTERED_STATES
+        if urc.name.upper() == "+CIREG":
+            self.info.ims_registered = registered
+            return
+        if urc.name.upper() == "+CEREG":
+            self.info.eps_registered = registered
+        else:
+            self.info.cs_registered = registered
+        self.info.registered = bool(
+            self.info.eps_registered or self.info.cs_registered
+        )
 
     async def _index_loop(self) -> None:
         """Serialize +CMTI follow-ups so two URCs cannot interleave reads."""

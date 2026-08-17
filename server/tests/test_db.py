@@ -78,6 +78,33 @@ def test_unknown_radio_state_remains_null(tmp_path):
         database.close()
 
 
+def test_registration_domains_preserve_false_and_unknown(tmp_path):
+    database = Database(tmp_path / "hub.db")
+    try:
+        database.upsert_device(
+            "agent-a",
+            {
+                "name": "modem-a",
+                "registered": True,
+                "eps_registered": True,
+                "cs_registered": False,
+                "ims_registered": None,
+            },
+        )
+        row = database.one(
+            "SELECT registered, eps_registered, cs_registered, ims_registered "
+            "FROM devices"
+        )
+        assert row == {
+            "registered": 1,
+            "eps_registered": 1,
+            "cs_registered": 0,
+            "ims_registered": None,
+        }
+    finally:
+        database.close()
+
+
 # -- schema versioning ----------------------------------------------------
 
 
@@ -614,6 +641,63 @@ def test_v6_upgrade_adds_the_conversation_index(tmp_path):
             for row in snapshot.execute("PRAGMA index_list(messages)")
         }
         assert "idx_messages_conversation" not in snapshot_indexes
+    finally:
+        snapshot.close()
+
+
+def test_v7_upgrade_adds_modem_diagnostics_and_keeps_devices(tmp_path):
+    path = tmp_path / "hub.db"
+    database = Database(path)
+    database.upsert_device(
+        "agent-a",
+        {
+            "name": "a",
+            "model": "AirM2M_780EPV",
+            "hardware_model": "Air780EPV",
+            "firmware": "V1011",
+            "registered": True,
+        },
+    )
+    database.close()
+
+    connection = sqlite3.connect(path)
+    try:
+        for column in (
+            "eps_registered",
+            "cs_registered",
+            "ims_registered",
+            "hardware_model",
+            "firmware",
+        ):
+            connection.execute(f"ALTER TABLE devices DROP COLUMN {column}")
+        connection.execute("PRAGMA user_version = 7")
+        connection.commit()
+    finally:
+        connection.close()
+
+    database = Database(path)
+    try:
+        assert _user_version(path) == SCHEMA_VERSION
+        columns = {row["name"] for row in database.query("PRAGMA table_info(devices)")}
+        assert {
+            "eps_registered",
+            "cs_registered",
+            "ims_registered",
+            "hardware_model",
+            "firmware",
+        } <= columns
+        assert database.one("SELECT name, model FROM devices") == {
+            "name": "a",
+            "model": "AirM2M_780EPV",
+        }
+    finally:
+        database.close()
+
+    snapshot = sqlite3.connect(path.with_name(f"{path.name}.v7.bak"))
+    try:
+        columns = {row[1] for row in snapshot.execute("PRAGMA table_info(devices)")}
+        assert "ims_registered" not in columns
+        assert "firmware" not in columns
     finally:
         snapshot.close()
 

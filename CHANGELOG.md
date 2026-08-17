@@ -20,6 +20,7 @@
 - 增加可调循环次数的故障注入基线，覆盖断网丢 ACK、Agent/Server 重启重放、跨批次积压、重复事件、USB 重新枚举和持久化自愈限频。
 - 增加默认脱敏、只读的 Agent 兼容性报告，采集发行版、内核、Python、`cdc_acm`、USB/ACM 接口、设备权限及真实 `CGMI/CGMM/CGMR`，并建立硬件、固件与 Linux 发行版实测矩阵。报告不输出 IMEI、ICCID、SMSC、主机名或运营商，也不读取和删除短信。
 - 兼容性报告 schema v2 按 USB 设备校验每个 Air780E 的 `02/04/06` ACM 布局，并记录已实际应用的 ModemManager udev ignore 属性、启动会话与设备节点就绪状态；新增可与 Agent 并行的 `--enumeration-only` 和定时 `--observe-hotplug`，在不打开串口的前提下归档冷启动、设备消失、重新出现、路径变化及 `ttyACM` 重新编号证据。
+- Agent 新增 EPS/LTE、CS 与可选 IMS 注册域诊断，上报硬件型号和完整固件版本；设备页区分显示各注册域，发送失败会附带这些上下文。IMS 查询不受支持时保留为未知，也不会因 IMS 未注册阻止 `AT+CMGS`。
 
 ### Fixed
 
@@ -28,10 +29,11 @@
 - Server 不再先记录幂等标记、业务写入失败后仍确认事件；幂等标记与业务数据现同事务提交，失败整体回滚且不发送 ACK。Agent 收到 ACK 后会立即推进下一积压批次，不再每 200 条等待 5 秒。
 - Agent 在 Python 3.11 下不再因积压 ACK 唤醒与 WebSocket 断开同时发生而吞掉 sender 取消；链接会正常结束并进入重连，不会永久卡住。
 - `probe` 不再把 `ATI` 型号串重复显示成固件版本；普通检查和兼容性报告现分别读取 `AT+CGMI`、`AT+CGMM` 与 `AT+CGMR`。
+- Agent 初始化改用 `AT+CMEE=1`，保留可检索的数字 `+CMS` / `+CME` 错误码，避免详细文本因固件不同而丢失机器可读错误码。
 
 ### Upgrade Notes
 
-- Server 数据库 schema 从 v2 顺序迁移到 v7，启动前自动写入 `hub.db.v<旧版本>.bak` 快照；迁移会重新标记库内已有的数据短信，为 SIM 增加计费、余额、低余额阈值、套餐到期和保号截止字段，并为短信会话建立查询索引。该版本新增 Agent/Server 协议 v1，部署时必须从同一提交升级并重启 Server 与 Agent；只同步 Agent 源码而不重新执行 `pip install` 仍会运行旧副本。
+- Server 数据库 schema 从 v2 顺序迁移到 v8，启动前自动写入 `hub.db.v<旧版本>.bak` 快照；迁移会重新标记库内已有的数据短信，为 SIM 增加计费、余额、低余额阈值、套餐到期和保号截止字段，为短信会话建立查询索引，并保存模块固件与 EPS/CS/IMS 注册域。该版本新增 Agent/Server 协议 v1，部署时必须从同一提交升级并重启 Server 与 Agent；只同步 Agent 源码而不重新执行 `pip install` 仍会运行旧副本。
 
 ## [0.1.0] — 2026-08-08
 

@@ -36,7 +36,7 @@ import { Loading, OnlineChip } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
 import { StorageMeter } from '../components/StorageMeter'
 import { SignalChart, type SignalSeries } from '../components/SignalChart'
-import { radioStatus } from '../deviceStatus'
+import { imsRegistrationStatus, networkRegistrationStatus, radioStatus } from '../deviceStatus'
 import { LIVE_MS } from '../swr'
 
 function deviceLabel(device: Device): string {
@@ -154,7 +154,10 @@ export function DevicesPage() {
                         <Stack spacing={0.5} sx={{ alignItems: 'flex-start' }}>
                           <OnlineChip online={Boolean(device.online)} />
                           <Typography variant="caption" sx={{ color: 'text.secondary' }}>
-                            {device.registered ? '已注册' : '未注册'}
+                            {networkRegistrationStatus(device)}
+                          </Typography>
+                          <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                            {imsRegistrationStatus(device)}
                           </Typography>
                         </Stack>
                       </TableCell>
@@ -238,7 +241,8 @@ export function DevicesPage() {
                         gap: 1.5,
                       }}
                     >
-                      <SummaryValue label="注册" value={device.registered ? '已注册' : '未注册'} />
+                      <SummaryValue label="移动网络" value={networkRegistrationStatus(device)} />
+                      <SummaryValue label="IMS" value={imsRegistrationStatus(device)} />
                       <SummaryValue
                         label="信号"
                         value={device.dbm != null ? `${device.dbm} dBm (${device.bars}/5)` : '—'}
@@ -354,7 +358,11 @@ function DeviceDrawer({ device, onClose }: { device: Device | null; onClose: () 
         ['模块名称', device.name],
         ['Agent', device.agent_id],
         ['设备端口', device.port || '—'],
-        ['型号', device.model || '—'],
+        ['AT 型号', device.model || '—'],
+        ['硬件型号', device.hardware_model || '—'],
+        ['固件版本', device.firmware || '—'],
+        ['移动网络', networkRegistrationStatus(device)],
+        ['IMS 注册', imsRegistrationStatus(device)],
         ['IMEI', device.imei || '—'],
         ['ICCID', device.iccid || '无卡'],
         ['电话号码', device.phone_number || '—'],
