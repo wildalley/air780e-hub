@@ -49,8 +49,12 @@ WORKDIR /app
 
 COPY --from=python-build /app/.venv /app/.venv
 
-# Runs unprivileged; /data is the only writable path it needs.
-RUN useradd --system --uid 10001 --home /app hub \
+# Apply Debian security updates that may land between base-image publishes,
+# then run unprivileged; /data is the only writable path the service needs.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get upgrade --yes \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --home /app hub \
     && mkdir -p /data \
     && chown hub:hub /data
 USER hub
