@@ -499,11 +499,11 @@ def build_router(state: AppState) -> APIRouter:
         return await _call(
             agent_id,
             {"type": "network_diagnostics", "device": name},
-            # The agent reads four optional diagnostics serially, each with a
+            # The agent reads five optional diagnostics serially, each with a
             # 30-second AT timeout. Leave room for all of them before the
             # gateway gives up and drops the pending command: a firmware that
             # hangs on one command must not cost the sections after it.
-            timeout=135.0,
+            timeout=165.0,
         )
 
     @router.get("/sims", dependencies=guard)

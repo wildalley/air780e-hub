@@ -222,8 +222,8 @@ CMEE=2(本次实测):AT+CMGR=99 → +CMS ERROR: invalid memory index  ← 期望
 |---|---|
 | `AT+CSQ` | RSSI(0-31)+ 误码率 |
 | `AT+CESQ` | 扩展信号质量,LTE 下含 **RSRP / RSRQ** |
-| `AT+CCED` | 小区环境描述(服务小区 + 邻区) |
-| `AT+EEMGINFO` | 工程模式详细网络参数 |
+| `AT+CCED=<mode>,<dump>` | 小区环境描述;`=0,1` 服务小区,`=0,2` 邻区。**没有裸执行形式** |
+| ~~`AT+EEMGINFO`~~ | 工程模式详细网络参数;**V1011 不支持**,五种拼法都返回 `ERROR` |
 | `AT+COPS?` | 当前运营商 |
 | `AT+CREG?` / `AT+CGREG?` / `AT+CEREG?` | 2G / GPRS / LTE 注册状态 |
 | `AT+CIREG?` | IMS 注册状态;部分固件不支持,且未注册不等于 SMS 必然不可用 |
@@ -235,6 +235,23 @@ CMEE=2(本次实测):AT+CMGR=99 → +CMS ERROR: invalid memory index  ← 期望
 | `AT+CCLK?` | 模块时钟 |
 | `AT+CTZU` / `AT+CTZR` | 时区自动更新 |
 
+> **`AT+CCED` 必须带参数**(2026-08-18 实测,V1011)。裸执行形式返回
+> `+CME ERROR: 3`(operation not allowed),读起来像权限问题,实际只是缺参数 ——
+> 与 `AT^CACAP` 的 `+CME ERROR: 4`(operation not supported)不是一回事。
+>
+> ```
+> AT+CCED=?    → +CCED: (0,1,2),(1,2,8)
+> AT+CCED=0,1  → +CCED:LTE current cell: <13 个字段>
+> AT+CCED=0,2  → +CCED:LTE neighbor cell: <每个邻区一行>   (=0,8 返回同样内容)
+> AT+CCED=0,3  → +CME ERROR: 50        AT+CCED      → +CME ERROR: 3
+> ```
+>
+> mode 0 是单次读取,mode 2 停止周期上报;Agent 只发 mode 0,不开周期上报。
+>
+> ⚠️ **服务小区行的第 3 个字段是 IMSI**(实测与 `AT+CIMI` 逐字节一致)。它和设备页
+> 已经显示的 ICCID 同级敏感,不要把真实返回粘进公开仓库的文档或测试数据 ——
+> mock 里的这一段已经掩码成全 0。
+>
 > 手册中**未出现 `AT+CIMI`**,但**实测支持**(2026-08-03,V1011 固件):返回裸 IMSI 字符串,无 `+CIMI:` 前缀。`AT+CGSN` 同样返回裸 IMEI。是手册没列全,不是不支持。
 >
 > 反过来,部分 SIM 的 **`AT+CNUM` 会返回 `ERROR`** —— 号码通常没有写入 SIM,界面上的号码需要人工填写。
@@ -250,7 +267,7 @@ SimAdmin 仪表盘上的信号、运营商、小区信息基本都能覆盖。�
 | 扫描运营商 | `AT+COPS=?` | 返回可见网络的状态、长短名称、MCC/MNC 和接入制式;模块扫描最长可持续数分钟 |
 | 手动选择 | `AT+COPS=1,2,"<MCCMNC>"` | 只接受 5 或 6 位数字,避免把任意 AT 文本拼进指令 |
 | 恢复自动 | `AT+COPS=0` | 重新交给模块自动选择网络 |
-| 网络诊断 | `AT+CCED`、`AT+EEMGINFO`、`AT*BANDIND?`、`AT^SYSINFO` | 原样返回各固件的工程参数;其中一条不支持时不丢弃其余结果 |
+| 网络诊断 | `AT+CCED=0,1`、`AT+CCED=0,2`、`AT+EEMGINFO`、`AT*BANDIND?`、`AT^SYSINFO` | 原样返回各固件的工程参数;其中一条不支持时不丢弃其余结果 |
 
 手动选择生效后,Agent 暂停“自动选择运营商”注册自愈,否则后台会在未注册时发送
 `AT+COPS=0` 并撤销管理员选择;恢复自动选网后自愈策略照常运行。运营商选择只决定
@@ -259,8 +276,8 @@ SimAdmin 仪表盘上的信号、运营商、小区信息基本都能覆盖。�
 
 当前公开文档没有为本项目所用的 AT 固件确认稳定的锁频、锁小区接口,因此 Web 不会
 下发从其它芯片或厂商移植来的私有命令。`AT+COPS=?` 使用 180 秒 Agent 超时和 210 秒
-Server 等待时间,不经过普通 Web AT 调试台的 30 秒路径;网络诊断串行读四条指令,
-每条 30 秒 AT 超时,Server 等待 135 秒。
+Server 等待时间,不经过普通 Web AT 调试台的 30 秒路径;网络诊断串行读五条指令,
+每条 30 秒 AT 超时,Server 等待 165 秒。
 
 ##### 锁频/锁小区:V1011 实测确认没有可用接口(2026-08-18)
 
@@ -276,8 +293,9 @@ AT^CACAP        → +CME ERROR: 4             AT+CPOL?       → ERROR
 
 `*BANDIND` 唯一可写形式是 `(0,1)` 的开关,表达不了目标频段;`^SYSCONFIG` 的制式字段
 只允许 `(2)`,连接入制式都改不了;`^CACAP` 与 `AT+CPOL`(优先运营商列表)直接不支持。
-合宙公开指令索引中也没有锁频、锁小区的**设置**命令 —— `*BANDIND`、`AT+CCED` 和
-`AT+EEMGINFO` 都只是查询。这与上文“需要 QMI,EC618 不支持”一致。
+合宙公开指令索引中也没有锁频、锁小区的**设置**命令 —— `*BANDIND` 与 `AT+CCED` 都只
+读不写(`AT+CCED` 的 mode 2 只是停止周期上报,不改变无线状态),`AT+EEMGINFO` 在
+V1011 上根本不存在。这与上文“需要 QMI,EC618 不支持”一致。
 
 `AT*BANDIND?` 与 `AT^SYSINFO` 已并入网络诊断,按原始行展示。**字段含义手册未给出**,
 以下只是按同类模块惯例的推断,不作为结论:`39` 可能是当前工作频段(Band 39 为 TD-LTE,

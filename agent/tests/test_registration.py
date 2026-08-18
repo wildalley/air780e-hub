@@ -244,7 +244,8 @@ async def test_select_operator_none_restores_automatic_selection():
 async def test_network_diagnostics_preserve_partial_firmware_support():
     modem = _modem(
         {
-            "AT+CCED": ATResponse("AT+CCED", ["+CCED: raw"]),
+            "AT+CCED=0,1": ATResponse("AT+CCED=0,1", ["+CCED: raw"]),
+            "AT+CCED=0,2": ATResponse("AT+CCED=0,2", ["+CCED: neighbour"]),
             "AT+EEMGINFO": ATError("not supported"),
             "AT*BANDIND?": ATResponse("AT*BANDIND?", ["*BANDIND: 0, 39, 7"]),
             "AT^SYSINFO": ATError("not supported"),
@@ -252,10 +253,33 @@ async def test_network_diagnostics_preserve_partial_firmware_support():
     )
     assert await modem.read_network_diagnostics() == {
         "cced": {"lines": ["+CCED: raw"], "error": None},
+        "cced_neighbors": {"lines": ["+CCED: neighbour"], "error": None},
         "eemginfo": {"lines": [], "error": "not supported"},
         "bandind": {"lines": ["*BANDIND: 0, 39, 7"], "error": None},
         "sysinfo": {"lines": [], "error": "not supported"},
     }
+
+
+async def test_network_diagnostics_send_cced_with_parameters_only():
+    """``AT+CCED`` has no bare execute form and mode 2 must never be sent.
+
+    V1011 answers the parameterless spelling with ``+CME ERROR: 3``, which
+    reads like a permission problem but only means the arguments are missing —
+    the reason this read reported nothing for months.  Mode 2 stops periodic
+    reporting rather than reading anything, so it stays off the wire.
+    """
+    modem = _modem(
+        {
+            "AT+CCED=0,1": ATResponse("AT+CCED=0,1", ["+CCED: serving"]),
+            "AT+CCED=0,2": ATResponse("AT+CCED=0,2", ["+CCED: neighbour"]),
+            "AT+EEMGINFO": ATError("not supported"),
+            "AT*BANDIND?": ATResponse("AT*BANDIND?", []),
+            "AT^SYSINFO": ATResponse("AT^SYSINFO", []),
+        }
+    )
+    await modem.read_network_diagnostics()
+    cced = [call for call in modem.client.calls if "CCED" in call]
+    assert cced == ["AT+CCED=0,1", "AT+CCED=0,2"]
 
 
 async def test_network_diagnostics_read_band_and_system_info_query_forms():
@@ -267,7 +291,8 @@ async def test_network_diagnostics_read_band_and_system_info_query_forms():
     """
     modem = _modem(
         {
-            "AT+CCED": ATResponse("AT+CCED", []),
+            "AT+CCED=0,1": ATResponse("AT+CCED=0,1", []),
+            "AT+CCED=0,2": ATResponse("AT+CCED=0,2", []),
             "AT+EEMGINFO": ATResponse("AT+EEMGINFO", []),
             "AT*BANDIND?": ATResponse("AT*BANDIND?", ["*BANDIND: 0, 39, 7"]),
             "AT^SYSINFO": ATResponse("AT^SYSINFO", ["^SYSINFO: 2,2,1,17,1,7"]),

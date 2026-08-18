@@ -54,18 +54,24 @@ describe('imsRegistrationStatus', () => {
 describe('formatDiagnostics', () => {
   const ok = (line: string) => ({ lines: [line], error: null })
 
-  it('labels every section with the command that produced it', () => {
+  it('labels every section with the command that produced it, parameters included', () => {
+    // The label has to carry the parameters: AT+CCED has no bare execute form,
+    // so a plain "AT+CCED" label would send anyone retyping it by hand into
+    // +CME ERROR: 3 and read as a permission problem.
     expect(
       formatDiagnostics({
-        cced: ok('+CCED: 0,460'),
+        cced: ok('+CCED:LTE current cell: 460,00'),
+        cced_neighbors: ok('+CCED:LTE neighbor cell: 460,00'),
         eemginfo: ok('+EEMGINFO: LTE'),
         bandind: ok('*BANDIND: 0, 39, 7'),
         sysinfo: ok('^SYSINFO: 2,2,1,17,1,7'),
       }),
     ).toBe(
       [
-        '[AT+CCED]',
-        '+CCED: 0,460',
+        '[AT+CCED=0,1]',
+        '+CCED:LTE current cell: 460,00',
+        '[AT+CCED=0,2]',
+        '+CCED:LTE neighbor cell: 460,00',
         '[AT+EEMGINFO]',
         '+EEMGINFO: LTE',
         '[AT*BANDIND?]',
@@ -86,7 +92,7 @@ describe('formatDiagnostics', () => {
       }),
     ).toBe(
       [
-        '[AT+CCED]',
+        '[AT+CCED=0,1]',
         '+CCED: 0,460',
         '[AT+EEMGINFO]',
         '+CME ERROR 4 (operation not supported)',
@@ -96,7 +102,7 @@ describe('formatDiagnostics', () => {
 
   it('never renders a section as blank', () => {
     expect(formatDiagnostics({ cced: { lines: [], error: null }, eemginfo: ok('x') })).toBe(
-      ['[AT+CCED]', '无返回', '[AT+EEMGINFO]', 'x'].join('\n'),
+      ['[AT+CCED=0,1]', '无返回', '[AT+EEMGINFO]', 'x'].join('\n'),
     )
   })
 })

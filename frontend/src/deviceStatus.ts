@@ -23,8 +23,12 @@ export function imsRegistrationStatus(
   return device.ims_registered ? 'IMS 已注册' : 'IMS 未注册'
 }
 
+// Labelled with the exact command sent, parameters included: AT+CCED has no
+// bare execute form, so a plain "AT+CCED" label would misdescribe the read and
+// send anyone reproducing it by hand straight into +CME ERROR: 3.
 const DIAGNOSTIC_COMMANDS: [keyof NetworkDiagnostics, string][] = [
-  ['cced', 'AT+CCED'],
+  ['cced', 'AT+CCED=0,1'],
+  ['cced_neighbors', 'AT+CCED=0,2'],
   ['eemginfo', 'AT+EEMGINFO'],
   ['bandind', 'AT*BANDIND?'],
   ['sysinfo', 'AT^SYSINFO'],

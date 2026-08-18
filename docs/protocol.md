@@ -380,18 +380,26 @@ Agent 执行官方文档中的 `AT+COPS=?`,在 `cmd_result.data.operators` 返�
 {"type":"network_diagnostics","cmd_id":"c-9a08","device":"a"}
 ```
 
-Agent 依次查询 `AT+CCED` 和 `AT+EEMGINFO`,不解析固件相关字段,而是分别返回原始行
-和可选错误。两条查询各有 30 秒 AT 超时,Server 为整组保留 75 秒等待时间。单条命令
-不支持不会使整个诊断失败:
+Agent 依次查询 `AT+CCED=0,1`、`AT+CCED=0,2`、`AT+EEMGINFO`、`AT*BANDIND?` 和
+`AT^SYSINFO`,不解析固件相关字段,而是分别返回原始行和可选错误。五条查询各有 30 秒
+AT 超时,Server 为整组保留 165 秒等待时间。单条命令不支持不会使整个诊断失败:
 
 ```json
 {
   "diagnostics": {
-    "cced": {"lines":["+CCED: ..."],"error":null},
-    "eemginfo": {"lines":[],"error":"AT+EEMGINFO: +CME ERROR: 4"}
+    "cced": {"lines":["+CCED:LTE current cell: ..."],"error":null},
+    "cced_neighbors": {"lines":["+CCED:LTE neighbor cell: ..."],"error":null},
+    "eemginfo": {"lines":[],"error":"AT+EEMGINFO: ERROR"},
+    "bandind": {"lines":["*BANDIND: 0, 39, 7"],"error":null},
+    "sysinfo": {"lines":["^SYSINFO: 2,2,1,17,1,7"],"error":null}
   }
 }
 ```
+
+`cced` 的服务小区行第 3 个字段是 IMSI,与 ICCID 同级敏感 —— 见
+[at-reference.md](at-reference.md) §2.2。`AT+CCED` 没有裸执行形式,必须带
+`<mode>,<dump>` 参数;V1011 不支持 `AT+EEMGINFO`,保留该小节是为了在实现它的固件上
+仍然可用。
 
 ### `raw_at` —— Web AT 调试台
 

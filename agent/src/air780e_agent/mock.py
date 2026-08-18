@@ -67,14 +67,29 @@ class MockAir780E:
             (2, "CHINA UNICOM", "UNICOM", "46001", 7),
         ]
     )
+    # Shapes measured on AirM2M_780EPV_V1011 (2026-08-18).  The third field of
+    # the serving-cell line is the IMSI; it is masked here so no fixture
+    # carries a real subscriber identity.
     cced_lines: list[str] = field(
-        default_factory=lambda: ["+CCED: 0,460,00C3,1234ABCD,7,24,55,20"]
+        default_factory=lambda: [
+            "+CCED:LTE current cell: 460,00,000000000000000,1,3,5,1300,164654196,63,14,37289,31,442"
+        ]
     )
+    cced_neighbour_lines: list[str] = field(
+        default_factory=lambda: [
+            "+CCED:LTE neighbor cell: 460,00,38400,185861504,57,8,37289,65535,369",
+            "+CCED:LTE neighbor cell: 460,00,36275,185861438,45,10,37289,65535,371",
+        ]
+    )
+    # V1011 does not implement AT+EEMGINFO in any spelling; even the test form
+    # answers bare ERROR.  Kept so a firmware that does implement it still
+    # reports, and so the unsupported path stays covered.
+    eemginfo_supported: bool = False
     eemginfo_lines: list[str] = field(
         default_factory=lambda: ["+EEMGINFO: LTE,46000,7,55,20"]
     )
-    # Measured on AirM2M_780EPV_V1011 (2026-08-18).  Both are query-only reads;
-    # the field layouts are undocumented, hence kept as raw lines.
+    # Both query-only reads; the field layouts are undocumented, hence kept as
+    # raw lines.
     bandind_lines: list[str] = field(default_factory=lambda: ["*BANDIND: 0, 39, 7"])
     sysinfo_lines: list[str] = field(
         default_factory=lambda: ["^SYSINFO: 2,2,1,17,1,7"]
@@ -308,9 +323,17 @@ class MockAir780E:
             if self.radio_enabled and self.cops_recovers_registration:
                 self.registered = True
             return self._reply()
-        if upper == "AT+CCED":
+        if upper == "AT+CCED=0,1":
             return self._reply(self.cced_lines)
+        if upper in ("AT+CCED=0,2", "AT+CCED=0,8"):
+            # V1011 answers both neighbour dump values identically.
+            return self._reply(self.cced_neighbour_lines)
+        if upper == "AT+CCED":
+            # Bare execute form needs parameters; V1011 rejects it with CME 3.
+            return self._error(cme=3)
         if upper == "AT+EEMGINFO":
+            if not self.eemginfo_supported:
+                return self._error()
             return self._reply(self.eemginfo_lines)
         if upper == "AT*BANDIND?":
             return self._reply(self.bandind_lines)

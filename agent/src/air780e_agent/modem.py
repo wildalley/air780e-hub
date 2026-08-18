@@ -433,14 +433,29 @@ class Air780E:
         the agent does not know yet, and so an unsupported command degrades to
         one missing section instead of failing the whole read.
 
+        ``AT+CCED`` takes ``<mode>,<dump>`` and has no bare execute form: V1011
+        answers the parameterless spelling with ``+CME ERROR: 3`` (operation not
+        allowed), which reads like a permission problem but only means the
+        arguments are missing.  ``AT+CCED=?`` reports ``(0,1,2),(1,2,8)``; mode
+        0 is the one-shot read, dump 1 the serving cell and dump 2 the
+        neighbours.  Mode 2 stops periodic reporting, so it is never sent here.
+
         ``AT*BANDIND?`` and ``AT^SYSINFO`` are queries only.  Their *set* forms
         are not band or cell locking: V1011 accepts just ``*BANDIND=(0,1)`` and
         ``^SYSCONFIG`` mode ``(2)``, neither of which can express "lock to band
         N".  See docs/at-reference.md §2.2.
+
+        Note that the serving-cell line carries the IMSI, so these lines are as
+        sensitive as the ICCID the device page already shows.
         """
         diagnostics: dict[str, dict[str, list[str] | str | None]] = {}
         for key, command in (
-            ("cced", "AT+CCED"),
+            ("cced", "AT+CCED=0,1"),
+            ("cced_neighbors", "AT+CCED=0,2"),
+            # Documented by Luat but absent from V1011: +EEMGINFO, ^EEMGINFO,
+            # *EEMGINFO and +EMGINFO all answer a bare ERROR, with no test form
+            # either.  Kept for firmware that does implement it — an
+            # unsupported command costs one empty section, not the whole read.
             ("eemginfo", "AT+EEMGINFO"),
             ("bandind", "AT*BANDIND?"),
             ("sysinfo", "AT^SYSINFO"),

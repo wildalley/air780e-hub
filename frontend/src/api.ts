@@ -147,6 +147,7 @@ export interface NetworkDiagnostics {
   cced: NetworkDiagnostic
   eemginfo: NetworkDiagnostic
   // Added later than the two above; an agent one version behind omits them.
+  cced_neighbors?: NetworkDiagnostic
   bandind?: NetworkDiagnostic
   sysinfo?: NetworkDiagnostic
 }
