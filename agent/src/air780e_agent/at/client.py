@@ -27,6 +27,7 @@ from .errors import (
     CmeError,
     CmsError,
     TransportClosed,
+    code_for_error_text,
 )
 from .transport import Transport
 
@@ -295,8 +296,19 @@ class ATClient:
         elif match := _CMS_RE.match(line):
             error = CmsError(int(match.group(1)), command=pending.command)
         elif match := _CME_TEXT_RE.match(line):
-            # +CMEE=1 gives numeric codes, =2 gives text; accept both.
-            error = ATCommandError(match.group(0), command=pending.command)
+            # +CMEE=1 gives numeric codes, =2 gives text; accept both.  Some
+            # firmware (Air780E V1011) answers with text even under CMEE=1, so
+            # recover the code from the wording when it is one we know —
+            # callers switch on `.code`, and losing it flattens every distinct
+            # cause into one opaque failure.
+            family, text = match.group(1), match.group(2)
+            code = code_for_error_text(family, text)
+            if code is None:
+                error = ATCommandError(match.group(0), command=pending.command)
+            elif family.upper() == "CMS":
+                error = CmsError(code, command=pending.command)
+            else:
+                error = CmeError(code, command=pending.command)
         elif upper in _FINAL_PLAIN_ERRORS:
             error = ATCommandError(line, command=pending.command)
         else:

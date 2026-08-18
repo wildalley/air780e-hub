@@ -8,6 +8,7 @@ from .errors import (
     CmeError,
     CmsError,
     TransportClosed,
+    code_for_error_text,
 )
 from .transport import (
     FdTransport,
@@ -33,5 +34,6 @@ __all__ = [
     "SerialTransport",
     "Transport",
     "TransportClosed",
+    "code_for_error_text",
     "create_pty_pair",
 ]

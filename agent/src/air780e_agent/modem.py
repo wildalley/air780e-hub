@@ -481,24 +481,38 @@ class Air780E:
         return enabled, self.info.registered
 
     async def _read_registration_domain(
-        self, command: str, prefix: str
+        self, command: str, *prefixes: str
     ) -> bool | None:
-        """Read one 3GPP registration domain, preserving unsupported/unknown."""
+        """Read one 3GPP registration domain, preserving unsupported/unknown.
+
+        Several prefixes may be given because firmware does not always answer
+        under the prefix it was asked about: Air780E V1011 answers ``AT+CEREG?``
+        with ``+CGREG: 0,5``.  Accepting the alias is what keeps the EPS domain
+        from reading as "unknown" forever on that firmware.
+        """
         try:
             response = await self.client.execute(command)
         except ATError as exc:
             log.debug("%s failed: %s", command, exc)
             return None
-        value = response.first(f"+{prefix}:") or ""
-        # Query form is "<n>,<stat>[,...]"; the stat is the second field.
-        match = re.match(r"\s*\d+\s*,\s*(\d+)", value)
-        if match is None:
-            return None
-        return match.group(1) in REGISTERED_STATES
+        for prefix in prefixes:
+            value = response.first(f"+{prefix}:")
+            if value is None:
+                continue
+            # Query form is "<n>,<stat>[,...]"; the stat is the second field.
+            match = re.match(r"\s*\d+\s*,\s*(\d+)", value)
+            if match is not None:
+                return match.group(1) in REGISTERED_STATES
+        return None
 
     async def read_registration_domains(self) -> tuple[bool | None, bool | None]:
         """Return ``(EPS/LTE, CS)`` registration without collapsing the evidence."""
-        eps = await self._read_registration_domain("AT+CEREG?", "CEREG")
+        # ``+CGREG`` is deliberately not a registered URC prefix: `_handle_line`
+        # matches the in-flight command's expected prefix *before* the URC
+        # router, so routing it as a URC would take this very reply out of the
+        # response and put the domain back to unknown.  A pushed EPS change is
+        # instead picked up by the next status poll.
+        eps = await self._read_registration_domain("AT+CEREG?", "CEREG", "CGREG")
         cs = await self._read_registration_domain("AT+CREG?", "CREG")
         return eps, cs
 

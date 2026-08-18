@@ -395,3 +395,46 @@ async def test_module_reset_uses_air780e_reset_command():
     await modem.reset()
 
     assert modem.client.calls == ["AT+RESET"]
+
+
+# --------------------------------------------------------------------------
+# Firmware that answers AT+CEREG? under the +CGREG prefix (Air780E V1011)
+# --------------------------------------------------------------------------
+
+
+async def test_cereg_answered_as_cgreg_is_still_read():
+    """V1011 answers AT+CEREG? with "+CGREG: 0,5" — measured on hardware.
+
+    Matching only "+CEREG:" left eps_registered at None forever, so the device
+    page could never show the LTE domain even while the module was attached.
+    """
+    modem = _modem({"AT+CEREG?": _reg_response("AT+CEREG?", "+CGREG", 5)})
+
+    assert await modem.read_registration() is True
+    assert modem.info.eps_registered is True
+
+
+async def test_cgreg_alias_does_not_leak_into_the_cs_domain():
+    """+CREG must not accept the +CGREG alias: they are different domains."""
+    modem = _modem(
+        {
+            "AT+CEREG?": _reg_response("AT+CEREG?", "+CGREG", 0),
+            "AT+CREG?": _reg_response("AT+CREG?", "+CGREG", 5),
+        }
+    )
+
+    assert await modem.read_registration() is False
+    assert modem.info.eps_registered is False
+    assert modem.info.cs_registered is None
+
+
+async def test_canonical_prefix_wins_when_both_appear():
+    modem = _modem(
+        {
+            "AT+CEREG?": ATResponse(
+                "AT+CEREG?", ["+CGREG: 0,0", "+CEREG: 0,5"], "OK"
+            ),
+        }
+    )
+
+    assert await modem.read_registration() is True

@@ -210,3 +210,53 @@ async def test_mock_rejects_length_mismatch(rig):
             payload=part.pdu_hex + "\x1a",
             expect_prompt=True,
         )
+
+
+# --------------------------------------------------------------------------
+# Text-mode +CME/+CMS errors (Air780E V1011 ignores CMEE=1)
+# --------------------------------------------------------------------------
+
+
+async def test_text_cms_error_recovers_numeric_code(rig):
+    """Firmware that answers CMEE=1 with text must still yield `.code`.
+
+    Measured on AirM2M_780EPV_V1011: `+CMS ERROR: invalid memory index`
+    arrives even after `AT+CMEE=1`.  Without the reverse lookup this became a
+    bare ATCommandError and every distinct cause looked identical.
+    """
+    rig.mock.force_text_errors = True
+    with pytest.raises(CmsError) as excinfo:
+        await rig.client.execute("AT+CMGR=999")
+    assert excinfo.value.code == 321
+
+
+async def test_text_cme_error_recovers_numeric_code(rig):
+    rig.mock.force_text_errors = True
+    with pytest.raises(CmeError) as excinfo:
+        await rig.client.execute("AT+NOSUCHTHING")
+    assert excinfo.value.code == 4
+
+
+async def test_unknown_error_wording_stays_untyped(rig):
+    """Wording the table does not know must not be mapped to a guess."""
+    from air780e_agent.at import code_for_error_text
+
+    assert code_for_error_text("CMS", "some vendor specific failure") is None
+    assert code_for_error_text("CMS", "unknown error") == 500
+    # Punctuation, case and internal whitespace must not defeat the lookup.
+    assert code_for_error_text("CMS", "Unknown  Error.") == 500
+    assert code_for_error_text("CME", "operation not supported") == 4
+    # The two families are separate tables: 4 is CME-only wording.
+    assert code_for_error_text("CMS", "operation not supported") is None
+
+
+async def test_text_error_with_unknown_wording_raises_plain(rig, monkeypatch):
+    """An unrecognized text error stays an ATCommandError, verbatim."""
+    import air780e_agent.mock as mock_module
+
+    monkeypatch.setitem(mock_module.CMS_ERRORS, 321, "vendor gibberish")
+    rig.mock.force_text_errors = True
+    with pytest.raises(ATCommandError) as excinfo:
+        await rig.client.execute("AT+CMGR=999")
+    assert "vendor gibberish" in str(excinfo.value)
+    assert not isinstance(excinfo.value, CmsError)

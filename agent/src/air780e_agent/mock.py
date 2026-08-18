@@ -21,6 +21,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
+from .at.errors import CME_ERRORS, CMS_ERRORS
 from .at.transport import Transport
 from .pdu import codec
 
@@ -92,6 +93,11 @@ class MockAir780E:
     fail_next_send: bool = False
     unsupported: set[str] = field(default_factory=set)
     silent: set[str] = field(default_factory=set)
+    # Air780E V1011 quirks, both measured on real hardware (2026-08-18):
+    # errors come back as text even under +CMEE=1, and AT+CEREG? answers under
+    # the +CGREG prefix.
+    force_text_errors: bool = False
+    cereg_answers_as_cgreg: bool = False
     cops_recovers_registration: bool = True
     cfun_recovers_registration: bool = True
     reset_recovers_registration: bool = True
@@ -179,11 +185,18 @@ class MockAir780E:
 
     def _error(self, cms: int | None = None, cme: int | None = None) -> None:
         if cms is not None:
-            self._reply(final=f"+CMS ERROR: {cms}")
+            self._reply(final=f"+CMS ERROR: {self._error_value('CMS', cms)}")
         elif cme is not None and self._cmee:
-            self._reply(final=f"+CME ERROR: {cme}")
+            self._reply(final=f"+CME ERROR: {self._error_value('CME', cme)}")
         else:
             self._reply(final="ERROR")
+
+    def _error_value(self, family: str, code: int) -> str:
+        """The code, or its name when emulating firmware that ignores CMEE=1."""
+        if not self.force_text_errors:
+            return str(code)
+        table = CMS_ERRORS if family == "CMS" else CME_ERRORS
+        return table.get(code, str(code))
 
     def _feed(self, data: bytes) -> None:
         self._buffer.extend(data)
@@ -296,7 +309,11 @@ class MockAir780E:
         if upper in ("AT+CREG=1", "AT+CEREG=1", "AT+CIREG=1"):
             return self._reply()
         if upper in ("AT+CEREG?", "AT+CREG?"):
-            name = "+CEREG" if "CEREG" in upper else "+CREG"
+            if "CEREG" in upper:
+                # V1011 answers the EPS query under the GPRS prefix.
+                name = "+CGREG" if self.cereg_answers_as_cgreg else "+CEREG"
+            else:
+                name = "+CREG"
             attached = self.radio_enabled and self.registered
             return self._reply([f"{name}: 0,{1 if attached else 2}"])
         if upper == "AT+CIREG?":

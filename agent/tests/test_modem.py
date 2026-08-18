@@ -300,3 +300,22 @@ async def test_incoming_message_during_send(modem, rig):
     assert refs == [0]
     assert rig.mock.sent[0].text == "outgoing"
     assert rig.received[0].text == "arrived mid-send"
+
+
+async def test_cgreg_alias_survives_the_urc_router(rig):
+    """The +CGREG answer must reach the response, not the URC handlers.
+
+    `_handle_line` tries the in-flight command's expected prefix *before* the
+    URC router, so an alias the router claimed would be dispatched as a
+    registration change and never land in `response.lines`.  This exercises the
+    real ATClient rather than a fake, which is the only way that ordering shows.
+    """
+    rig.mock.cereg_answers_as_cgreg = True
+    modem = Air780E(rig.client)
+    rig.modem = modem
+
+    response = await rig.client.execute("AT+CEREG?")
+    assert response.first("+CGREG:") == "0,1"
+
+    assert await modem.read_registration() is True
+    assert modem.info.eps_registered is True

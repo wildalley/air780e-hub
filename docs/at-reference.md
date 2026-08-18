@@ -144,6 +144,45 @@ ModemManager Messaging 的 `Create` / `Send`,IMS 状态接口当前直接说明 
 刷 V1122 后恢复的个案。这些是固件兼容性线索,不是证明不同型号固件可以互刷的官方
 结论;而且切到 LuatOS 后不能继续使用本项目当前的 AT Agent。
 
+#### V1011 的两个固件怪癖(2026-08-18 实测)
+
+同一张 giffgaff SIM 漫游在 46000 上复测,记录两处与手册不一致的行为。两者都已在
+Agent 中处理,`mock.py` 也提供 `force_text_errors` 与 `cereg_answers_as_cgreg`
+两个开关复现。
+
+**一、`AT+CEREG?` 用 `+CGREG:` 前缀作答。** 连查三次均为同一结果,已排除是插入的 URC:
+
+```
+AT+CEREG?  → +CGREG: 0,5
+AT+CEREG=? → +CGREG: (0,1,2,3,4,5)
+AT+CREG?   → +CREG: 0,1      ← 对照,前缀正常
+```
+
+严格按 `+CEREG:` 取值会一直落空,EPS 域因此永远是“未知”,设备页只显示 CS 已注册。
+`_read_registration_domain` 现接受多个前缀,把 `+CGREG` 作为 `AT+CEREG?` 的别名。
+注意 **`+CGREG` 不能注册成 URC 前缀**:`_handle_line` 会先匹配在途命令的期望前缀,
+再走 URC 路由,注册后反而会把这条响应从结果里劫走。EPS 域的推送变化由下一次状态轮询覆盖。
+
+**二、`AT+CMEE=1` 之后错误码仍是文本。** 手册说 `1` 给数字、`2` 给文本,实测两种设置
+下都拿不到数字码:
+
+```
+CMEE=1(生产日志):AT+CMGS=47 → +CMS ERROR: unknown error         ← 期望 500
+CMEE=2(本次实测):AT+CMGR=99 → +CMS ERROR: invalid memory index  ← 期望 321
+```
+
+`CMEE=1` 那条来自 2026-08-17 的 Agent 日志(Agent 初始化时确实执行了 `AT+CMEE=1`);
+本次裸串口复测中 `CMEE=1` 下同一命令 2 秒内无输出,但那次测试脚本每条命令前会清输入
+缓冲,迟到的响应可能被冲掉,所以只以生产日志为据。
+
+数字码丢失的代价是 `no network service`(331)、`requested facility not subscribed`
+(50)和 `unknown error`(500)在日志里长得一样,而且 `read_stored` / `delete_stored`
+靠 `.code in (321, 322)` 判断“槽位已空”,拿不到码就会误报。客户端现在按 `CMS_ERRORS`
+/ `CME_ERRORS` 的规范名称反查出码;表里没有的措辞保持原样上报,不猜。
+
+**`AT+CEER` 不受支持**,返回 `ERROR`。它恰好是唯一能直接问出“`AT+CMGS` 为什么被拒”的
+命令,所以该固件上拿不到网络侧 cause code。
+
 ### 2.2 信号与网络状态
 
 | 指令 | 拿到什么 |
@@ -231,7 +270,7 @@ Air780E 的 AT 固件内置了完整的网络客户端,这意味着**必要时�
 | `AT+RNDISCALL` | RNDIS 拨号(可当网卡) |
 | `AT+CNETLIGHT` | 网络指示灯 |
 | `AT+IPR` | 波特率 |
-| `AT+CMEE` | 错误码详细程度;Agent 使用 `1` 保留数字 `+CMS` / `+CME` 码,`2` 会转成固件相关文本 |
+| `AT+CMEE` | 错误码详细程度;Agent 使用 `1` 以求数字 `+CMS` / `+CME` 码。**V1011 无视该设置,始终回文本**,客户端因此按规范名称反查出码,见 [§2.1](#v1011-的两个固件怪癖2026-08-18-实测) |
 | `AT+FS*` | 模块文件系统 |
 | `AT+CTTS` / `AT+CAUDPLAY` | TTS / 音频播放 |
 
@@ -327,7 +366,7 @@ for p in /dev/ttyACM*; do echo "--- $p"; echo 'ATI' | socat - "$p" ; done
 #    期望看到 AirM2M_780E_..._AT。若全无响应 → 是 LuatOS 固件,需刷 AT 固件
 
 # 3. 基础信息
-echo 'AT+CMEE=1' | socat - /dev/ttyACMx    # 保留可检索的数字 CMS/CME 错误码
+echo 'AT+CMEE=1' | socat - /dev/ttyACMx    # 争取数字 CMS/CME 错误码(V1011 仍回文本)
 echo 'AT+CPIN?'  | socat - /dev/ttyACMx    # 卡是否就绪
 echo 'AT+CSQ'    | socat - /dev/ttyACMx    # 信号
 echo 'AT+COPS?'  | socat - /dev/ttyACMx    # 运营商

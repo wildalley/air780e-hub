@@ -58,6 +58,28 @@ CMS_ERRORS = {
 }
 
 
+def _normalize(text: str) -> str:
+    return " ".join(text.split()).rstrip(".").casefold()
+
+
+# Reverse lookups, so a text-mode answer still yields a code.  ``AT+CMEE=1``
+# is supposed to make the modem answer numerically, but Air780E firmware
+# V1011 replies with text regardless; without this the code is lost and
+# "no network service" (331) reads the same as "unknown error" (500).
+_CME_CODES = {_normalize(name): code for code, name in CME_ERRORS.items()}
+_CMS_CODES = {_normalize(name): code for code, name in CMS_ERRORS.items()}
+
+
+def code_for_error_text(family: str, text: str) -> int | None:
+    """The ``+CME``/``+CMS`` code whose canonical name is ``text``.
+
+    Returns ``None`` for wording this table does not know, so an unrecognized
+    string is reported verbatim rather than mapped to a plausible-looking code.
+    """
+    table = _CMS_CODES if family.upper() == "CMS" else _CME_CODES
+    return table.get(_normalize(text))
+
+
 class ATError(Exception):
     """Base class for AT command failures."""
 

@@ -32,6 +32,8 @@
 - Agent 在 Python 3.11 下不再因积压 ACK 唤醒与 WebSocket 断开同时发生而吞掉 sender 取消；链接会正常结束并进入重连，不会永久卡住。
 - `probe` 不再把 `ATI` 型号串重复显示成固件版本；普通检查和兼容性报告现分别读取 `AT+CGMI`、`AT+CGMM` 与 `AT+CGMR`。
 - Agent 初始化改用 `AT+CMEE=1`，保留可检索的数字 `+CMS` / `+CME` 错误码，避免详细文本因固件不同而丢失机器可读错误码。
+- 固件无视 `AT+CMEE=1` 而回文本错误时（Air780E `V1011` 实测如此），客户端按规范名称反查出数字码，`no network service`、`requested facility not subscribed` 和 `unknown error` 在日志与发送失败提示中不再无法区分；`read_stored` / `delete_stored` 也能重新识别“槽位为空”而不误报。表中没有的措辞保持原样上报，不猜测代码。
+- 设备页 EPS/LTE 注册域不再永远显示“未知”：Air780E `V1011` 用 `+CGREG:` 前缀回答 `AT+CEREG?`，注册域查询现接受该别名前缀。
 
 ### Upgrade Notes
 
