@@ -635,7 +635,11 @@ async def test_operator_scan_selection_and_network_diagnostics_commands(agent):
     })
     diagnostics = agent.events("cmd_result")[-1].payload
     assert diagnostics["ok"] is True
-    assert diagnostics["data"]["diagnostics"]["cced"]["lines"]
+    sections = diagnostics["data"]["diagnostics"]
+    # All four reach the wire, including the two query-only V1011 reads.
+    assert sections["cced"]["lines"]
+    assert sections["bandind"]["lines"] == ["*BANDIND: 0, 39, 7"]
+    assert sections["sysinfo"]["lines"] == ["^SYSINFO: 2,2,1,17,1,7"]
 
 
 async def test_select_operator_command_validates_numeric(agent):

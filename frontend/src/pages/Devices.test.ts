@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  formatDiagnostics,
   imsRegistrationStatus,
   networkRegistrationStatus,
   radioStatus,
@@ -47,5 +48,55 @@ describe('imsRegistrationStatus', () => {
     expect(imsRegistrationStatus({ ims_registered: null })).toBe('IMS 状态未知')
     expect(imsRegistrationStatus({ ims_registered: 0 })).toBe('IMS 未注册')
     expect(imsRegistrationStatus({ ims_registered: 1 })).toBe('IMS 已注册')
+  })
+})
+
+describe('formatDiagnostics', () => {
+  const ok = (line: string) => ({ lines: [line], error: null })
+
+  it('labels every section with the command that produced it', () => {
+    expect(
+      formatDiagnostics({
+        cced: ok('+CCED: 0,460'),
+        eemginfo: ok('+EEMGINFO: LTE'),
+        bandind: ok('*BANDIND: 0, 39, 7'),
+        sysinfo: ok('^SYSINFO: 2,2,1,17,1,7'),
+      }),
+    ).toBe(
+      [
+        '[AT+CCED]',
+        '+CCED: 0,460',
+        '[AT+EEMGINFO]',
+        '+EEMGINFO: LTE',
+        '[AT*BANDIND?]',
+        '*BANDIND: 0, 39, 7',
+        '[AT^SYSINFO]',
+        '^SYSINFO: 2,2,1,17,1,7',
+      ].join('\n'),
+    )
+  })
+
+  it('keeps a refusing firmware distinguishable from an agent that never asked', () => {
+    // The refusal is worth showing — it is evidence about this firmware. A
+    // section the agent does not report yet is not, so it is left out entirely.
+    expect(
+      formatDiagnostics({
+        cced: ok('+CCED: 0,460'),
+        eemginfo: { lines: [], error: '+CME ERROR 4 (operation not supported)' },
+      }),
+    ).toBe(
+      [
+        '[AT+CCED]',
+        '+CCED: 0,460',
+        '[AT+EEMGINFO]',
+        '+CME ERROR 4 (operation not supported)',
+      ].join('\n'),
+    )
+  })
+
+  it('never renders a section as blank', () => {
+    expect(formatDiagnostics({ cced: { lines: [], error: null }, eemginfo: ok('x') })).toBe(
+      ['[AT+CCED]', '无返回', '[AT+EEMGINFO]', 'x'].join('\n'),
+    )
   })
 })

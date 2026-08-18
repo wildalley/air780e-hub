@@ -48,7 +48,12 @@ import { Loading, OnlineChip } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
 import { StorageMeter } from '../components/StorageMeter'
 import { SignalChart, type SignalSeries } from '../components/SignalChart'
-import { imsRegistrationStatus, networkRegistrationStatus, radioStatus } from '../deviceStatus'
+import {
+  formatDiagnostics,
+  imsRegistrationStatus,
+  networkRegistrationStatus,
+  radioStatus,
+} from '../deviceStatus'
 import { LIVE_MS } from '../swr'
 
 function deviceLabel(device: Device): string {
@@ -604,13 +609,4 @@ function operatorLabel(operator: OperatorNetwork): string {
   const name = operator.long_name || operator.short_name || operator.numeric
   const technology = operator.access_technology === 7 ? 'LTE' : operator.access_technology === 0 ? 'GSM' : ''
   return `${name} (${operator.numeric}${technology ? ` · ${technology}` : ''})${operator.status === 2 ? ' · 当前' : ''}`
-}
-
-function formatDiagnostics(diagnostics: NetworkDiagnostics): string {
-  const section = (name: string, value: { lines: string[]; error: string | null }) =>
-    [
-      `[${name}]`,
-      ...(value.lines.length ? value.lines : [value.error || '无返回']),
-    ]
-  return [...section('AT+CCED', diagnostics.cced), ...section('AT+EEMGINFO', diagnostics.eemginfo)].join('\n')
 }

@@ -73,6 +73,12 @@ class MockAir780E:
     eemginfo_lines: list[str] = field(
         default_factory=lambda: ["+EEMGINFO: LTE,46000,7,55,20"]
     )
+    # Measured on AirM2M_780EPV_V1011 (2026-08-18).  Both are query-only reads;
+    # the field layouts are undocumented, hence kept as raw lines.
+    bandind_lines: list[str] = field(default_factory=lambda: ["*BANDIND: 0, 39, 7"])
+    sysinfo_lines: list[str] = field(
+        default_factory=lambda: ["^SYSINFO: 2,2,1,17,1,7"]
+    )
 
     # Storage is deliberately tiny by default — that is what a SIM gives you.
     # 10 is what an AirM2M_780EPV_V1011 actually reported, for both "SM" and
@@ -306,6 +312,10 @@ class MockAir780E:
             return self._reply(self.cced_lines)
         if upper == "AT+EEMGINFO":
             return self._reply(self.eemginfo_lines)
+        if upper == "AT*BANDIND?":
+            return self._reply(self.bandind_lines)
+        if upper == "AT^SYSINFO":
+            return self._reply(self.sysinfo_lines)
         if upper in ("AT+CREG=1", "AT+CEREG=1", "AT+CIREG=1"):
             return self._reply()
         if upper in ("AT+CEREG?", "AT+CREG?"):

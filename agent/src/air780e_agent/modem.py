@@ -428,12 +428,23 @@ class Air780E:
     async def read_network_diagnostics(self) -> dict[str, dict[str, list[str] | str | None]]:
         """Read optional engineering diagnostics without imposing a schema.
 
-        ``CCED`` and ``EEMGINFO`` differ across Air780E firmware releases.
-        Preserve their raw lines so a newer firmware remains useful even when
-        it adds fields the agent does not know yet.
+        These commands differ across Air780E firmware releases.  Preserve their
+        raw lines so a newer firmware remains useful even when it adds fields
+        the agent does not know yet, and so an unsupported command degrades to
+        one missing section instead of failing the whole read.
+
+        ``AT*BANDIND?`` and ``AT^SYSINFO`` are queries only.  Their *set* forms
+        are not band or cell locking: V1011 accepts just ``*BANDIND=(0,1)`` and
+        ``^SYSCONFIG`` mode ``(2)``, neither of which can express "lock to band
+        N".  See docs/at-reference.md §2.2.
         """
         diagnostics: dict[str, dict[str, list[str] | str | None]] = {}
-        for key, command in (("cced", "AT+CCED"), ("eemginfo", "AT+EEMGINFO")):
+        for key, command in (
+            ("cced", "AT+CCED"),
+            ("eemginfo", "AT+EEMGINFO"),
+            ("bandind", "AT*BANDIND?"),
+            ("sysinfo", "AT^SYSINFO"),
+        ):
             try:
                 response = await self.client.execute(command, timeout=30.0)
             except ATError as exc:

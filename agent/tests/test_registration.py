@@ -246,12 +246,39 @@ async def test_network_diagnostics_preserve_partial_firmware_support():
         {
             "AT+CCED": ATResponse("AT+CCED", ["+CCED: raw"]),
             "AT+EEMGINFO": ATError("not supported"),
+            "AT*BANDIND?": ATResponse("AT*BANDIND?", ["*BANDIND: 0, 39, 7"]),
+            "AT^SYSINFO": ATError("not supported"),
         }
     )
     assert await modem.read_network_diagnostics() == {
         "cced": {"lines": ["+CCED: raw"], "error": None},
         "eemginfo": {"lines": [], "error": "not supported"},
+        "bandind": {"lines": ["*BANDIND: 0, 39, 7"], "error": None},
+        "sysinfo": {"lines": [], "error": "not supported"},
     }
+
+
+async def test_network_diagnostics_read_band_and_system_info_query_forms():
+    """Only the query forms are sent — the set forms cannot lock a band.
+
+    V1011 accepts ``*BANDIND=(0,1)`` and ``^SYSCONFIG`` mode ``(2)`` only, so
+    neither expresses "lock to band N"; sending a set form here would change
+    radio state for no gain.  Guard against a well-meant future edit.
+    """
+    modem = _modem(
+        {
+            "AT+CCED": ATResponse("AT+CCED", []),
+            "AT+EEMGINFO": ATResponse("AT+EEMGINFO", []),
+            "AT*BANDIND?": ATResponse("AT*BANDIND?", ["*BANDIND: 0, 39, 7"]),
+            "AT^SYSINFO": ATResponse("AT^SYSINFO", ["^SYSINFO: 2,2,1,17,1,7"]),
+        }
+    )
+    await modem.read_network_diagnostics()
+    assert "AT*BANDIND?" in modem.client.calls
+    assert "AT^SYSINFO" in modem.client.calls
+    assert not any(
+        "BANDIND=" in call or "SYSCONFIG=" in call for call in modem.client.calls
+    )
 
 
 # --------------------------------------------------------------------------

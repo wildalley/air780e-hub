@@ -1341,7 +1341,10 @@ def test_operator_controls_and_diagnostics_use_typed_long_timeout_commands(admin
         "scan_operators", "select_operator", "select_operator", "network_diagnostics"
     ]
     assert seen[0][2] == {"timeout": 210.0}
-    assert seen[-1][2] == {"timeout": 75.0}
+    # The agent reads four optional diagnostics serially at 30s each, so this
+    # wait has to stay above 120s or the gateway drops a command the modem is
+    # still answering.
+    assert seen[-1][2] == {"timeout": 135.0}
     assert seen[2][1]["numeric"] is None
 
 

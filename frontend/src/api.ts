@@ -146,6 +146,9 @@ export interface NetworkDiagnostic {
 export interface NetworkDiagnostics {
   cced: NetworkDiagnostic
   eemginfo: NetworkDiagnostic
+  // Added later than the two above; an agent one version behind omits them.
+  bandind?: NetworkDiagnostic
+  sysinfo?: NetworkDiagnostic
 }
 
 export type SimBillingType = 'unknown' | 'payg' | 'prepaid' | 'postpaid'
