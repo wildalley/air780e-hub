@@ -7,9 +7,11 @@ import {
   Card,
   CardContent,
   CardHeader,
+  CircularProgress,
   Divider,
   Drawer,
   IconButton,
+  MenuItem,
   Stack,
   Switch,
   Table,
@@ -19,6 +21,7 @@ import {
   TableHead,
   TableRow,
   Tooltip,
+  TextField,
   Typography,
 } from '@mui/material'
 import FlightModeIcon from '@mui/icons-material/AirplanemodeActiveOutlined'
@@ -28,8 +31,17 @@ import RadioIcon from '@mui/icons-material/CellTowerOutlined'
 import InfoIcon from '@mui/icons-material/InfoOutlined'
 import TerminalIcon from '@mui/icons-material/TerminalOutlined'
 import CloseIcon from '@mui/icons-material/Close'
+import SearchIcon from '@mui/icons-material/SearchOutlined'
+import AutoModeIcon from '@mui/icons-material/AutorenewOutlined'
+import DiagnosticsIcon from '@mui/icons-material/TroubleshootOutlined'
 import useSWR from 'swr'
-import { api, ApiError, type Device } from '../api'
+import {
+  api,
+  ApiError,
+  type Device,
+  type NetworkDiagnostics,
+  type OperatorNetwork,
+} from '../api'
 import { formatTs, relativeTs } from '../format'
 import { useToast } from '../toast'
 import { Loading, OnlineChip } from '../components/common'
@@ -88,6 +100,14 @@ export function DevicesPage() {
     }
   }
 
+  const reloadSelected = async () => {
+    const updated = await load()
+    setSelected((current) => {
+      if (!current || !updated) return current
+      return updated.find((device) => device.name === current.name) ?? current
+    })
+  }
+
   if (!devices) return <Loading />
 
   const signalSeries: SignalSeries[] = devices.map((device, index) => ({
@@ -109,7 +129,7 @@ export function DevicesPage() {
     <Stack spacing={3}>
       <PageHeader
         title="设备"
-        subtitle="模块状态、信号与射频控制"
+        subtitle="模块状态、信号、运营商与射频控制"
         actions={
           <Button component={RouterLink} to="/console" startIcon={<TerminalIcon />}>
             AT 调试
@@ -283,7 +303,14 @@ export function DevicesPage() {
         </>
       )}
 
-      <DeviceDrawer device={selected} onClose={() => setSelected(null)} />
+      <DeviceDrawer
+        key={selected?.name ?? 'closed'}
+        device={selected}
+        onClose={() => setSelected(null)}
+        onUpdated={reloadSelected}
+        onError={(message) => toast.show(message, 'error')}
+        onSuccess={(message) => toast.show(message, 'success')}
+      />
       {toast.element}
     </Stack>
   )
@@ -352,7 +379,79 @@ function SummaryValue({ label, value }: { label: string; value: string }) {
   )
 }
 
-function DeviceDrawer({ device, onClose }: { device: Device | null; onClose: () => void }) {
+function DeviceDrawer({
+  device,
+  onClose,
+  onUpdated,
+  onError,
+  onSuccess,
+}: {
+  device: Device | null
+  onClose: () => void
+  onUpdated: () => Promise<unknown>
+  onError: (message: string) => void
+  onSuccess: (message: string) => void
+}) {
+  const [operators, setOperators] = useState<OperatorNetwork[]>([])
+  const [operator, setOperator] = useState('')
+  const [scanBusy, setScanBusy] = useState(false)
+  const [selectBusy, setSelectBusy] = useState(false)
+  const [diagnosticBusy, setDiagnosticBusy] = useState(false)
+  const [diagnostics, setDiagnostics] = useState<NetworkDiagnostics | null>(null)
+
+  const deviceName = device?.name
+
+  const scan = async () => {
+    if (!deviceName) return
+    setScanBusy(true)
+    try {
+      const result = await api.devices.scanOperators(deviceName)
+      setOperators(result.operators)
+      setOperator(
+        (current) =>
+          current ||
+          result.operators.find((item) => item.status === 2)?.numeric ||
+          result.operators[0]?.numeric ||
+          '',
+      )
+      onSuccess(result.operators.length ? `找到 ${result.operators.length} 个运营商` : '未找到可用运营商')
+    } catch (err) {
+      onError(err instanceof ApiError ? err.message : '运营商扫描失败')
+    } finally {
+      setScanBusy(false)
+    }
+  }
+
+  const select = async (numeric: string | null) => {
+    if (!deviceName) return
+    if (!window.confirm(numeric ? '切换运营商会暂时断开网络，继续？' : '恢复自动选网会重新注册网络，继续？')) {
+      return
+    }
+    setSelectBusy(true)
+    try {
+      await api.devices.selectOperator(deviceName, numeric)
+      await onUpdated()
+      onSuccess(numeric ? '运营商选择命令已完成' : '已恢复自动选网')
+    } catch (err) {
+      onError(err instanceof ApiError ? err.message : '运营商选择失败')
+    } finally {
+      setSelectBusy(false)
+    }
+  }
+
+  const readDiagnostics = async () => {
+    if (!deviceName) return
+    setDiagnosticBusy(true)
+    try {
+      const result = await api.devices.networkDiagnostics(deviceName)
+      setDiagnostics(result.diagnostics)
+    } catch (err) {
+      onError(err instanceof ApiError ? err.message : '网络诊断失败')
+    } finally {
+      setDiagnosticBusy(false)
+    }
+  }
+
   const fields = device
     ? [
         ['模块名称', device.name],
@@ -414,8 +513,104 @@ function DeviceDrawer({ device, onClose }: { device: Device | null; onClose: () 
               </Box>
             ))}
           </Box>
+          <Divider sx={{ my: 2.5 }} />
+          <Stack spacing={1.5}>
+            <Typography variant="h3">运营商选择</Typography>
+            <Stack direction="row" spacing={1} sx={{ alignItems: 'center' }}>
+              <Button
+                variant="outlined"
+                size="small"
+                onClick={() => void scan()}
+                disabled={!device.online || device.radio_enabled === 0 || scanBusy || selectBusy}
+                startIcon={scanBusy ? <CircularProgress size={16} /> : <SearchIcon />}
+              >
+                {scanBusy ? '扫描中' : '扫描运营商'}
+              </Button>
+              <Button
+                variant="text"
+                size="small"
+                onClick={() => void select(null)}
+                disabled={!device.online || device.radio_enabled === 0 || scanBusy || selectBusy}
+                startIcon={<AutoModeIcon />}
+              >
+                恢复自动
+              </Button>
+            </Stack>
+            <TextField
+              select
+              size="small"
+              label="扫描结果"
+              value={operator}
+              onChange={(event) => setOperator(event.target.value)}
+              disabled={!operators.length || scanBusy || selectBusy}
+            >
+              {operators.map((item) => (
+                <MenuItem key={item.numeric} value={item.numeric}>
+                  {operatorLabel(item)}
+                </MenuItem>
+              ))}
+            </TextField>
+            <Button
+              variant="contained"
+              size="small"
+              onClick={() => void select(operator || null)}
+              disabled={!operator || !device.online || device.radio_enabled === 0 || scanBusy || selectBusy}
+              startIcon={selectBusy ? <CircularProgress size={16} color="inherit" /> : <RadioIcon />}
+            >
+              {selectBusy ? '切换中' : '选择运营商'}
+            </Button>
+          </Stack>
+          <Divider sx={{ my: 2.5 }} />
+          <Stack spacing={1.5}>
+            <Stack direction="row" sx={{ alignItems: 'center', justifyContent: 'space-between' }}>
+              <Typography variant="h3">网络诊断</Typography>
+              <Button
+                variant="outlined"
+                size="small"
+                onClick={() => void readDiagnostics()}
+                disabled={!device.online || diagnosticBusy}
+                startIcon={diagnosticBusy ? <CircularProgress size={16} /> : <DiagnosticsIcon />}
+              >
+                读取
+              </Button>
+            </Stack>
+            {diagnostics && (
+              <Box
+                component="pre"
+                sx={{
+                  m: 0,
+                  p: 1.5,
+                  maxHeight: 260,
+                  overflow: 'auto',
+                  whiteSpace: 'pre-wrap',
+                  overflowWrap: 'anywhere',
+                  bgcolor: 'action.hover',
+                  borderRadius: 1,
+                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                  fontSize: '0.75rem',
+                }}
+              >
+                {formatDiagnostics(diagnostics)}
+              </Box>
+            )}
+          </Stack>
         </Box>
       )}
     </Drawer>
   )
+}
+
+function operatorLabel(operator: OperatorNetwork): string {
+  const name = operator.long_name || operator.short_name || operator.numeric
+  const technology = operator.access_technology === 7 ? 'LTE' : operator.access_technology === 0 ? 'GSM' : ''
+  return `${name} (${operator.numeric}${technology ? ` · ${technology}` : ''})${operator.status === 2 ? ' · 当前' : ''}`
+}
+
+function formatDiagnostics(diagnostics: NetworkDiagnostics): string {
+  const section = (name: string, value: { lines: string[]; error: string | null }) =>
+    [
+      `[${name}]`,
+      ...(value.lines.length ? value.lines : [value.error || '无返回']),
+    ]
+  return [...section('AT+CCED', diagnostics.cced), ...section('AT+EEMGINFO', diagnostics.eemginfo)].join('\n')
 }

@@ -1309,6 +1309,49 @@ def test_set_radio_requires_an_admin_session(client):
     assert client.post("/api/devices/a/radio", json={"enabled": False}).status_code == 401
 
 
+def test_operator_controls_and_diagnostics_use_typed_long_timeout_commands(admin, monkeypatch):
+    gateway = admin.app.state.hub.gateway
+    seen = []
+
+    monkeypatch.setattr(gateway, "agent_for_device", lambda name: "test-agent")
+
+    async def fake_call(agent_id, frame, **kwargs):
+        seen.append((agent_id, frame, kwargs))
+        if frame["type"] == "scan_operators":
+            return {"operators": [{"numeric": "46000"}]}
+        if frame["type"] == "select_operator":
+            return {"operator": {"numeric": frame["numeric"]}}
+        return {"diagnostics": {"cced": {"lines": [], "error": None}}}
+
+    monkeypatch.setattr(gateway, "call", fake_call)
+
+    scan = admin.post("/api/devices/a/operators/scan")
+    assert scan.status_code == 200
+    assert scan.json()["operators"][0]["numeric"] == "46000"
+
+    selected = admin.post("/api/devices/a/operator", json={"numeric": "46000"})
+    assert selected.status_code == 200
+
+    automatic = admin.post("/api/devices/a/operator", json={"numeric": None})
+    assert automatic.status_code == 200
+
+    diagnostics = admin.post("/api/devices/a/network-diagnostics")
+    assert diagnostics.status_code == 200
+    assert [frame[1]["type"] for frame in seen] == [
+        "scan_operators", "select_operator", "select_operator", "network_diagnostics"
+    ]
+    assert seen[0][2] == {"timeout": 210.0}
+    assert seen[-1][2] == {"timeout": 75.0}
+    assert seen[2][1]["numeric"] is None
+
+
+def test_operator_selection_rejects_invalid_numeric_and_unknown_devices(admin):
+    assert admin.post("/api/devices/a/operator", json={"numeric": "123"}).status_code == 422
+    assert admin.post("/api/devices/a/operator", json={"numeric": "１２３４５"}).status_code == 422
+    assert admin.post("/api/devices/nope/operators/scan").status_code == 404
+    assert admin.post("/api/devices/nope/network-diagnostics").status_code == 404
+
+
 # --------------------------------------------------------------------------
 # CRUD used by the web UI
 # --------------------------------------------------------------------------

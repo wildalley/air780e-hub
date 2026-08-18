@@ -143,6 +143,9 @@ class AgentApp:
             "run_task": self._cmd_run_task,
             "query": self._cmd_query,
             "set_radio": self._cmd_set_radio,
+            "scan_operators": self._cmd_scan_operators,
+            "select_operator": self._cmd_select_operator,
+            "network_diagnostics": self._cmd_network_diagnostics,
             "raw_at": self._cmd_raw_at,
         }
         handler = handlers.get(kind or "")
@@ -235,3 +238,21 @@ class AgentApp:
         if not isinstance(enabled, bool):
             raise ValueError("set_radio needs a boolean enabled value")
         return await worker.set_radio_enabled(enabled)
+
+    async def _cmd_scan_operators(self, frame: dict[str, Any]) -> dict[str, Any]:
+        return await self._worker(frame).scan_operators()
+
+    async def _cmd_select_operator(self, frame: dict[str, Any]) -> dict[str, Any]:
+        numeric = frame.get("numeric")
+        if numeric is not None:
+            if (
+                not isinstance(numeric, str)
+                or not numeric.isascii()
+                or not numeric.isdigit()
+                or len(numeric) not in (5, 6)
+            ):
+                raise ValueError("select_operator needs a 5 or 6 digit numeric operator")
+        return await self._worker(frame).select_operator(numeric)
+
+    async def _cmd_network_diagnostics(self, frame: dict[str, Any]) -> dict[str, Any]:
+        return await self._worker(frame).network_diagnostics()

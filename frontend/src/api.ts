@@ -122,6 +122,32 @@ export interface Device {
   phone_number?: string
 }
 
+export interface OperatorNetwork {
+  status: number | null
+  long_name: string
+  short_name: string
+  numeric: string
+  access_technology: number | null
+}
+
+export interface CurrentOperator {
+  mode: number | null
+  format: number | null
+  operator: string
+  numeric: string
+  access_technology: number | null
+}
+
+export interface NetworkDiagnostic {
+  lines: string[]
+  error: string | null
+}
+
+export interface NetworkDiagnostics {
+  cced: NetworkDiagnostic
+  eemginfo: NetworkDiagnostic
+}
+
 export type SimBillingType = 'unknown' | 'payg' | 'prepaid' | 'postpaid'
 
 export interface Sim {
@@ -461,6 +487,19 @@ export const api = {
       post<{ radio_enabled: boolean; registered: boolean }>(
         `/api/devices/${encodeURIComponent(name)}/radio`,
         { enabled },
+      ),
+    scanOperators: (name: string) =>
+      post<{ operators: OperatorNetwork[] }>(
+        `/api/devices/${encodeURIComponent(name)}/operators/scan`,
+      ),
+    selectOperator: (name: string, numeric: string | null) =>
+      post<{ operator: CurrentOperator; device: Device }>(
+        `/api/devices/${encodeURIComponent(name)}/operator`,
+        { numeric },
+      ),
+    networkDiagnostics: (name: string) =>
+      post<{ diagnostics: NetworkDiagnostics }>(
+        `/api/devices/${encodeURIComponent(name)}/network-diagnostics`,
       ),
   },
   sims: {

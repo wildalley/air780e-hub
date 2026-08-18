@@ -59,6 +59,19 @@ class MockAir780E:
     iccid: str = "89860622180012345678"
     smsc: str = "+8613800210500"
     operator: str = "CHINA MOBILE"
+    operator_numeric: str = "46000"
+    scanned_operators: list[tuple[int, str, str, str, int]] = field(
+        default_factory=lambda: [
+            (1, "CHINA MOBILE", "CMCC", "46000", 7),
+            (2, "CHINA UNICOM", "UNICOM", "46001", 7),
+        ]
+    )
+    cced_lines: list[str] = field(
+        default_factory=lambda: ["+CCED: 0,460,00C3,1234ABCD,7,24,55,20"]
+    )
+    eemginfo_lines: list[str] = field(
+        default_factory=lambda: ["+EEMGINFO: LTE,46000,7,55,20"]
+    )
 
     # Storage is deliberately tiny by default — that is what a SIM gives you.
     # 10 is what an AirM2M_780EPV_V1011 actually reported, for both "SM" and
@@ -252,10 +265,34 @@ class MockAir780E:
             if not self.registered:
                 return self._reply(["+COPS: 0"])
             return self._reply([f'+COPS: 0,0,"{self.operator}",7'])
+        if upper == "AT+COPS=?":
+            entries = ",".join(
+                f'({status},"{long_name}","{short_name}","{numeric}",{act})'
+                for status, long_name, short_name, numeric, act in self.scanned_operators
+            )
+            return self._reply([f"+COPS: {entries}"])
         if upper == "AT+COPS=0":
             if self.radio_enabled and self.cops_recovers_registration:
                 self.registered = True
             return self._reply()
+        match = re.fullmatch(r'AT\+COPS=1,2,"(\d{5,6})"', upper)
+        if match:
+            numeric = match.group(1)
+            selected = next(
+                (entry for entry in self.scanned_operators if entry[3] == numeric),
+                None,
+            )
+            if selected is None:
+                return self._error(cme=30)
+            self.operator_numeric = numeric
+            self.operator = selected[1]
+            if self.radio_enabled and self.cops_recovers_registration:
+                self.registered = True
+            return self._reply()
+        if upper == "AT+CCED":
+            return self._reply(self.cced_lines)
+        if upper == "AT+EEMGINFO":
+            return self._reply(self.eemginfo_lines)
         if upper in ("AT+CREG=1", "AT+CEREG=1", "AT+CIREG=1"):
             return self._reply()
         if upper in ("AT+CEREG?", "AT+CREG?"):

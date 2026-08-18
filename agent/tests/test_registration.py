@@ -8,8 +8,10 @@ a mode-2 URC that carries location fields the old parser tripped over.
 
 from __future__ import annotations
 
+import pytest
+
 from air780e_agent.at import ATError, ATResponse, ATUrc
-from air780e_agent.modem import Air780E
+from air780e_agent.modem import Air780E, parse_current_operator, parse_operator_scan
 
 
 class FakeClient:
@@ -47,6 +49,39 @@ def _reg_response(command: str, prefix: str, stat: int) -> ATResponse:
 
 def _modem(responses: dict[str, object]) -> Air780E:
     return Air780E(FakeClient(responses))
+
+
+def test_current_operator_parser_handles_quoted_name_and_act():
+    assert parse_current_operator('+COPS: 0,0,"CHINA MOBILE",7') == {
+        "mode": 0,
+        "format": 0,
+        "operator": "CHINA MOBILE",
+        "numeric": "",
+        "access_technology": 7,
+    }
+
+
+def test_operator_scan_parser_handles_standard_groups_and_ignores_ranges():
+    value = (
+        '+COPS: (1,"CHINA MOBILE","CMCC","46000",7),'
+        '(2,"Example, roaming","EX","23420",0),(0-4),(0-2)'
+    )
+    assert parse_operator_scan(value) == [
+        {
+            "status": 1,
+            "long_name": "CHINA MOBILE",
+            "short_name": "CMCC",
+            "numeric": "46000",
+            "access_technology": 7,
+        },
+        {
+            "status": 2,
+            "long_name": "Example, roaming",
+            "short_name": "EX",
+            "numeric": "23420",
+            "access_technology": 0,
+        },
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -159,6 +194,64 @@ async def test_ims_registration_is_diagnostic_and_tri_state():
 
     assert await registered.read_ims_registration() is True
     assert await unavailable.read_ims_registration() is None
+
+
+async def test_operator_scan_and_selection_use_typed_commands():
+    modem = _modem(
+        {
+            "AT+COPS=?": ATResponse(
+                "AT+COPS=?",
+                ['+COPS: (1,"CHINA MOBILE","CMCC","46000",7),(2,"Other","O","23420",0)'],
+            ),
+            'AT+COPS=1,2,"23420"': ATResponse(
+                'AT+COPS=1,2,"23420"', []
+            ),
+            "AT+COPS?": ATResponse(
+                "AT+COPS?", ['+COPS: 1,2,"23420",7']
+            ),
+        }
+    )
+
+    operators = await modem.scan_operators()
+    assert [item["numeric"] for item in operators] == ["46000", "23420"]
+    selected = await modem.select_operator("23420")
+    assert selected["numeric"] == "23420"
+    assert modem.operator_selection_mode == 1
+    assert 'AT+COPS=1,2,"23420"' in modem.client.calls
+
+
+async def test_select_operator_rejects_arbitrary_at_text():
+    modem = _modem({})
+    with pytest.raises(ValueError):
+        await modem.select_operator("AT+CFUN=0")
+    with pytest.raises(ValueError):
+        await modem.select_operator("１２３４５")
+
+
+async def test_select_operator_none_restores_automatic_selection():
+    modem = _modem(
+        {
+            "AT+COPS=0": ATResponse("AT+COPS=0", []),
+            "AT+COPS?": ATResponse("AT+COPS?", ["+COPS: 0"]),
+        }
+    )
+    current = await modem.select_operator(None)
+    assert current["mode"] == 0
+    assert modem.operator_selection_mode == 0
+    assert modem.client.calls[0] == "AT+COPS=0"
+
+
+async def test_network_diagnostics_preserve_partial_firmware_support():
+    modem = _modem(
+        {
+            "AT+CCED": ATResponse("AT+CCED", ["+CCED: raw"]),
+            "AT+EEMGINFO": ATError("not supported"),
+        }
+    )
+    assert await modem.read_network_diagnostics() == {
+        "cced": {"lines": ["+CCED: raw"], "error": None},
+        "eemginfo": {"lines": [], "error": "not supported"},
+    }
 
 
 # --------------------------------------------------------------------------

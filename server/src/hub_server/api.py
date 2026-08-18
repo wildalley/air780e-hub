@@ -181,6 +181,16 @@ class RadioBody(BaseModel):
     enabled: bool
 
 
+class OperatorSelectionBody(BaseModel):
+    """A 3GPP numeric MCC/MNC, or null to restore automatic selection."""
+
+    numeric: str | None = Field(
+        default=None,
+        max_length=6,
+        pattern=r"^[0-9]{5,6}$",
+    )
+
+
 class SimPatch(BaseModel):
     label: str | None = None
     phone_number: str | None = None
@@ -454,6 +464,45 @@ def build_router(state: AppState) -> APIRouter:
         return await _call(
             agent_id,
             {"type": "set_radio", "device": name, "enabled": body.enabled},
+        )
+
+    @router.post("/devices/{name}/operators/scan", dependencies=guard)
+    async def scan_device_operators(name: str) -> dict[str, Any]:
+        agent_id = state.gateway.agent_for_device(name)
+        if agent_id is None:
+            raise HTTPException(status_code=404, detail="no such device")
+        # AT+COPS=? is allowed to take several minutes while the modem scans.
+        return await _call(
+            agent_id,
+            {"type": "scan_operators", "device": name},
+            timeout=210.0,
+        )
+
+    @router.post("/devices/{name}/operator", dependencies=guard)
+    async def select_device_operator(
+        name: str, body: OperatorSelectionBody
+    ) -> dict[str, Any]:
+        agent_id = state.gateway.agent_for_device(name)
+        if agent_id is None:
+            raise HTTPException(status_code=404, detail="no such device")
+        return await _call(
+            agent_id,
+            {"type": "select_operator", "device": name, "numeric": body.numeric},
+            timeout=210.0,
+        )
+
+    @router.post("/devices/{name}/network-diagnostics", dependencies=guard)
+    async def device_network_diagnostics(name: str) -> dict[str, Any]:
+        agent_id = state.gateway.agent_for_device(name)
+        if agent_id is None:
+            raise HTTPException(status_code=404, detail="no such device")
+        return await _call(
+            agent_id,
+            {"type": "network_diagnostics", "device": name},
+            # The agent reads two optional diagnostics serially, each with a
+            # 30-second AT timeout. Leave room for both before the gateway
+            # gives up and drops the pending command.
+            timeout=75.0,
         )
 
     @router.get("/sims", dependencies=guard)
@@ -1097,9 +1146,11 @@ def build_router(state: AppState) -> APIRouter:
         except OSError:
             pass
 
-    async def _call(agent_id: str, frame: dict[str, Any]) -> dict[str, Any]:
+    async def _call(
+        agent_id: str, frame: dict[str, Any], *, timeout: float = 30.0
+    ) -> dict[str, Any]:
         try:
-            return await state.gateway.call(agent_id, frame)
+            return await state.gateway.call(agent_id, frame, timeout=timeout)
         except AgentUnavailable as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         except CommandFailed as exc:

@@ -437,6 +437,9 @@ class DeviceWorker:
         if self.state.radio_enabled is False:
             self._cancel_registration_recovery("radio was deliberately disabled")
             return
+        if modem.operator_selection_mode == 1:
+            self._cancel_registration_recovery("manual operator selection is active")
+            return
         if self.state.registered:
             self._registration_restored("network registration restored")
             return
@@ -898,6 +901,34 @@ class DeviceWorker:
             self._unregistered_since = self._clock()
         self._emit_status(force=True)
         return self.describe()
+
+    async def scan_operators(self) -> dict[str, Any]:
+        """Scan visible operators; the modem command may take several minutes."""
+        modem = self._require_radio()
+        return {"operators": await modem.scan_operators()}
+
+    async def select_operator(self, numeric: str | None) -> dict[str, Any]:
+        """Manually select an operator, or return to automatic selection."""
+        modem = self._require_radio()
+        current = await modem.select_operator(numeric)
+        self.state.operator = str(current.get("operator") or "")
+        self.state.registered = await modem.read_registration()
+        self.state.eps_registered = modem.info.eps_registered
+        self.state.cs_registered = modem.info.cs_registered
+        self.state.ims_registered = await modem.read_ims_registration()
+        modem.info.ims_registered = self.state.ims_registered
+        if self.state.registered:
+            self._registration_restored("network registration restored")
+        elif modem.operator_selection_mode == 1:
+            self._cancel_registration_recovery("manual operator selection is active")
+        else:
+            self._unregistered_since = self._clock()
+        self._emit_status(force=True)
+        return {"operator": current, "device": self.describe()}
+
+    async def network_diagnostics(self) -> dict[str, Any]:
+        """Return raw, read-only cell engineering diagnostics."""
+        return {"diagnostics": await self._require_modem().read_network_diagnostics()}
 
     async def raw_at(self, command: str) -> list[str]:
         client = self._client

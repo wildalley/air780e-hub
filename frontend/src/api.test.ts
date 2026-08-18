@@ -148,3 +148,23 @@ describe('message content filters', () => {
     expect(spy.mock.calls[0][0]).toBe('/api/conversations?content=text')
   })
 })
+
+describe('device network controls', () => {
+  it('uses dedicated typed endpoints instead of the raw AT console', async () => {
+    const spy = mockFetch({
+      json: async () => ({ operators: [] }),
+    })
+    await api.devices.scanOperators('slot/a')
+    expect(spy.mock.calls[0][0]).toBe('/api/devices/slot%2Fa/operators/scan')
+    expect(spy.mock.calls[0][1]?.method).toBe('POST')
+
+    spy.mockClear()
+    await api.devices.selectOperator('slot/a', null)
+    expect(spy.mock.calls[0][0]).toBe('/api/devices/slot%2Fa/operator')
+    expect(JSON.parse(String(spy.mock.calls[0][1]?.body))).toEqual({ numeric: null })
+
+    spy.mockClear()
+    await api.devices.networkDiagnostics('slot/a')
+    expect(spy.mock.calls[0][0]).toBe('/api/devices/slot%2Fa/network-diagnostics')
+  })
+})

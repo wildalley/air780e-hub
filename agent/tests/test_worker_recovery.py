@@ -45,12 +45,14 @@ class FakeModem:
         operator_recovers: bool = False,
         radio_cycle_recovers: bool = False,
         reset_recovers: bool = False,
+        operator_selection_mode: int | None = 0,
     ) -> None:
         self.registered = registered
         self.radio_enabled = radio_enabled
         self.operator_recovers = operator_recovers
         self.radio_cycle_recovers = radio_cycle_recovers
         self.reset_recovers = reset_recovers
+        self.operator_selection_mode = operator_selection_mode
         self.actions: list[str] = []
         self.info = SimpleNamespace(
             registered=registered,
@@ -236,6 +238,23 @@ async def test_registration_recovery_limit_is_rolling_and_reported_once(store):
 async def test_deliberate_flight_mode_never_starts_recovery(store):
     clock = Clock()
     modem = FakeModem(radio_enabled=False)
+    worker, events = build_worker(
+        store,
+        clock,
+        modem,
+        registration_recovery_delay=0.0,
+        recovery_cooldown=0.0,
+    )
+
+    await worker._sample_status()
+
+    assert modem.actions == []
+    assert recovery_logs(events) == []
+
+
+async def test_manual_operator_selection_is_not_undone_by_recovery(store):
+    clock = Clock()
+    modem = FakeModem(operator_selection_mode=1)
     worker, events = build_worker(
         store,
         clock,

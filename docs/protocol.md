@@ -339,10 +339,64 @@ Agent 通过 `AT+CFUN=0/1` 切换并在 `cmd_result.data` 返回当前
 飞行模式是管理员主动状态，不产生“网络未注册”事件；期间到期的保号任务记为
 `skipped`，不消耗重试次数，也不推进 `last_run_at`。
 
+### `scan_operators` —— 扫描可见运营商
+
+```json
+{"type":"scan_operators","cmd_id":"c-9a06","device":"a"}
+```
+
+Agent 执行官方文档中的 `AT+COPS=?`,在 `cmd_result.data.operators` 返回结构化结果:
+
+```json
+{
+  "operators": [
+    {
+      "status": 2,
+      "long_name": "EXAMPLE MOBILE",
+      "short_name": "EXAMPLE",
+      "numeric": "00101",
+      "access_technology": 7
+    }
+  ]
+}
+```
+
+扫描可能持续数分钟,Server 为该命令使用 210 秒等待时间,不走普通 `raw_at` 的
+30 秒路径。同一 MCC/MNC 如果由模块按多个接入制式重复报告,Agent 只返回一项。
+
+### `select_operator` —— 手动 / 自动选择运营商
+
+```json
+{"type":"select_operator","cmd_id":"c-9a07","device":"a","numeric":"00101"}
+```
+
+`numeric` 只接受 5 或 6 位 MCC/MNC;Agent 下发 `AT+COPS=1,2,"<MCCMNC>"`。传
+`null` 时下发 `AT+COPS=0` 恢复自动选择。回执包含 `operator` 的当前 COPS 字段和
+更新后的 `device` 状态。手动模式期间自动注册自愈不会发送 `AT+COPS=0` 撤销选择。
+
+### `network_diagnostics` —— 只读网络诊断
+
+```json
+{"type":"network_diagnostics","cmd_id":"c-9a08","device":"a"}
+```
+
+Agent 依次查询 `AT+CCED` 和 `AT+EEMGINFO`,不解析固件相关字段,而是分别返回原始行
+和可选错误。两条查询各有 30 秒 AT 超时,Server 为整组保留 75 秒等待时间。单条命令
+不支持不会使整个诊断失败:
+
+```json
+{
+  "diagnostics": {
+    "cced": {"lines":["+CCED: ..."],"error":null},
+    "eemginfo": {"lines":[],"error":"AT+EEMGINFO: +CME ERROR: 4"}
+  }
+}
+```
+
 ### `raw_at` —— Web AT 调试台
 
 ```json
-{"type": "raw_at", "cmd_id": "c-9a06", "device": "a", "command": "AT+CSQ"}
+{"type": "raw_at", "cmd_id": "c-9a09", "device": "a", "command": "AT+CSQ"}
 ```
 
 危险操作,server 端必须限制在已认证的管理员会话。

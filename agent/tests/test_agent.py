@@ -612,6 +612,43 @@ async def test_set_radio_requires_a_boolean(agent):
     assert "boolean" in result["error"]
 
 
+async def test_operator_scan_selection_and_network_diagnostics_commands(agent):
+    await agent.wait_online()
+
+    await agent.app.handle_command({
+        "type": "scan_operators", "cmd_id": "c-operators", "device": "a",
+    })
+    scan = agent.events("cmd_result")[-1].payload
+    assert scan["ok"] is True
+    assert scan["data"]["operators"][0]["numeric"] == "46000"
+
+    await agent.app.handle_command({
+        "type": "select_operator", "cmd_id": "c-select", "device": "a",
+        "numeric": "46001",
+    })
+    selected = agent.events("cmd_result")[-1].payload
+    assert selected["ok"] is True
+    assert agent.mocks["a"].operator == "CHINA UNICOM"
+
+    await agent.app.handle_command({
+        "type": "network_diagnostics", "cmd_id": "c-diagnostics", "device": "a",
+    })
+    diagnostics = agent.events("cmd_result")[-1].payload
+    assert diagnostics["ok"] is True
+    assert diagnostics["data"]["diagnostics"]["cced"]["lines"]
+
+
+async def test_select_operator_command_validates_numeric(agent):
+    await agent.wait_online()
+    await agent.app.handle_command({
+        "type": "select_operator", "cmd_id": "c-invalid", "device": "a",
+        "numeric": "not-a-network",
+    })
+    result = agent.events("cmd_result")[-1].payload
+    assert result["ok"] is False
+    assert "5 or 6 digit" in result["error"]
+
+
 async def test_unknown_command_is_reported_not_ignored(agent):
     await agent.wait_online()
     await agent.app.handle_command({"type": "nonsense", "cmd_id": "c-8"})

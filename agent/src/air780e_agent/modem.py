@@ -16,6 +16,7 @@ will not arrive.
 from __future__ import annotations
 
 import asyncio
+import csv
 import logging
 import re
 from collections.abc import Awaitable, Callable
@@ -51,6 +52,11 @@ CEREG_ENABLE = "AT+CEREG=1"  # EPS / LTE
 CIREG_ENABLE = "AT+CIREG=1"  # IMS, optional and diagnostic only
 
 SEND_TIMEOUT = 60.0
+# A network scan can take several minutes while the modem listens for every
+# supported operator.  Keep this separate from the ordinary AT command
+# timeout so callers cannot accidentally put ``AT+COPS=?`` on the short path.
+OPERATOR_SCAN_TIMEOUT = 180.0
+OPERATOR_SELECT_TIMEOUT = 180.0
 
 # States that mean "attached to the network": 1 = home, 5 = roaming.
 REGISTERED_STATES = ("1", "5")
@@ -134,6 +140,132 @@ class StoredIndex:
     pdu: str
 
 
+def _csv_fields(value: str) -> list[str]:
+    """Parse a modem CSV value while preserving quoted commas."""
+    try:
+        return [field.strip() for field in next(csv.reader([value], skipinitialspace=True))]
+    except (csv.Error, StopIteration):
+        return []
+
+
+def parse_current_operator(value: str) -> dict[str, int | str | None]:
+    """Parse the value after ``+COPS:`` from a query response.
+
+    The operator name is only present when the modem is registered or has a
+    selected operator.  Missing fields are deliberately represented as
+    ``None`` rather than guessed values.
+    """
+    if value.lstrip().upper().startswith("+COPS:"):
+        value = value.split(":", 1)[1]
+    fields = _csv_fields(value)
+    out: dict[str, int | str | None] = {
+        "mode": None,
+        "format": None,
+        "operator": "",
+        "numeric": "",
+        "access_technology": None,
+    }
+    if not fields:
+        return out
+    try:
+        out["mode"] = int(fields[0])
+    except ValueError:
+        return out
+    if len(fields) < 2:
+        return out
+    try:
+        out["format"] = int(fields[1])
+    except ValueError:
+        return out
+    if len(fields) >= 3:
+        operator = fields[2].strip()
+        if out["format"] == 2 and re.fullmatch(r"[0-9]{5,6}", operator):
+            out["operator"] = operator
+            out["numeric"] = operator
+        else:
+            out["operator"] = operator
+    if len(fields) >= 4:
+        # With format 2 the third field is the numeric operator; with other
+        # formats it is the optional AcT field.
+        if out["format"] == 2 and re.fullmatch(r"[0-9]{5,6}", fields[2].strip()):
+            out["numeric"] = fields[2].strip()
+            try:
+                out["access_technology"] = int(fields[3])
+            except ValueError:
+                pass
+        else:
+            try:
+                out["access_technology"] = int(fields[3])
+            except ValueError:
+                pass
+    return out
+
+
+def _operator_groups(value: str) -> list[str]:
+    """Extract balanced ``(...)`` entries from an ``AT+COPS=?`` response."""
+    groups: list[str] = []
+    start: int | None = None
+    depth = 0
+    quoted = False
+    escaped = False
+    for index, char in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and quoted:
+            escaped = True
+            continue
+        if char == '"':
+            quoted = not quoted
+            continue
+        if quoted:
+            continue
+        if char == "(":
+            if depth == 0:
+                start = index + 1
+            depth += 1
+        elif char == ")" and depth:
+            depth -= 1
+            if depth == 0 and start is not None:
+                groups.append(value[start:index])
+                start = None
+    return groups
+
+
+def parse_operator_scan(value: str) -> list[dict[str, int | str | None]]:
+    """Parse standard ``+COPS: (stat,long,short,numeric,AcT),...`` data."""
+    operators: list[dict[str, int | str | None]] = []
+    seen: set[str] = set()
+    for group in _operator_groups(value):
+        fields = _csv_fields(group)
+        if len(fields) < 4:
+            continue
+        numeric = fields[3].strip()
+        if not re.fullmatch(r"[0-9]{5,6}", numeric):
+            continue
+        try:
+            status = int(fields[0])
+        except ValueError:
+            status = None
+        try:
+            access_technology: int | None = int(fields[4]) if len(fields) > 4 else None
+        except ValueError:
+            access_technology = None
+        if numeric in seen:
+            continue
+        seen.add(numeric)
+        operators.append(
+            {
+                "status": status,
+                "long_name": fields[1].strip().strip('"'),
+                "short_name": fields[2].strip().strip('"'),
+                "numeric": numeric,
+                "access_technology": access_technology,
+            }
+        )
+    return operators
+
+
 class Air780E:
     def __init__(
         self,
@@ -151,6 +283,7 @@ class Air780E:
         self.storage = storage
         self.delete_after_read = delete_after_read
         self.info = ModemInfo()
+        self.operator_selection_mode: int | None = None
 
         self._reassembler = Reassembler(timeout=reassembly_timeout)
         self._flush_task: asyncio.Task | None = None
@@ -239,8 +372,11 @@ class Air780E:
             info.smsc = match.group(1)
 
         cops = await quiet("AT+COPS?")
-        if cops and (match := re.search(r'"([^"]+)"', cops)):
-            info.operator = match.group(1)
+        if cops:
+            current_operator = parse_current_operator(cops)
+            info.operator = str(current_operator["operator"] or "")
+            mode = current_operator["mode"]
+            self.operator_selection_mode = mode if isinstance(mode, int) else None
 
         info.radio_enabled = await self.read_radio_enabled()
         if info.radio_enabled is False:
@@ -252,6 +388,59 @@ class Air780E:
         info.ims_registered = await self.read_ims_registration()
 
         return info
+
+    async def read_current_operator(self) -> dict[str, int | str | None]:
+        """Return the standard ``AT+COPS?`` selection fields."""
+        response = await self.client.execute("AT+COPS?")
+        value = response.first("+COPS:")
+        current = parse_current_operator(value or "")
+        mode = current["mode"]
+        self.operator_selection_mode = mode if isinstance(mode, int) else None
+        return current
+
+    async def scan_operators(self) -> list[dict[str, int | str | None]]:
+        """Scan visible operators using the documented ``AT+COPS=?`` query."""
+        response = await self.client.execute(
+            "AT+COPS=?", timeout=OPERATOR_SCAN_TIMEOUT
+        )
+        values = response.all("+COPS:")
+        return parse_operator_scan(",".join(values))
+
+    async def select_operator(
+        self, numeric: str | None
+    ) -> dict[str, int | str | None]:
+        """Select a numeric operator, or restore automatic selection.
+
+        Only MCC/MNC values are accepted here.  This keeps the typed command
+        from becoming an unvalidated escape hatch into arbitrary AT syntax.
+        """
+        if numeric is None:
+            command = "AT+COPS=0"
+        else:
+            if not re.fullmatch(r"[0-9]{5,6}", numeric):
+                raise ValueError("operator numeric must contain 5 or 6 digits")
+            command = f'AT+COPS=1,2,"{numeric}"'
+        await self.client.execute(command, timeout=OPERATOR_SELECT_TIMEOUT)
+        current = await self.read_current_operator()
+        self.operator_selection_mode = 0 if numeric is None else 1
+        return current
+
+    async def read_network_diagnostics(self) -> dict[str, dict[str, list[str] | str | None]]:
+        """Read optional engineering diagnostics without imposing a schema.
+
+        ``CCED`` and ``EEMGINFO`` differ across Air780E firmware releases.
+        Preserve their raw lines so a newer firmware remains useful even when
+        it adds fields the agent does not know yet.
+        """
+        diagnostics: dict[str, dict[str, list[str] | str | None]] = {}
+        for key, command in (("cced", "AT+CCED"), ("eemginfo", "AT+EEMGINFO")):
+            try:
+                response = await self.client.execute(command, timeout=30.0)
+            except ATError as exc:
+                diagnostics[key] = {"lines": [], "error": str(exc)}
+            else:
+                diagnostics[key] = {"lines": response.lines, "error": None}
+        return diagnostics
 
     async def read_radio_enabled(self) -> bool | None:
         """Return whether RF is enabled, or ``None`` if the firmware cannot say.
