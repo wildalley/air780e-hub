@@ -84,6 +84,7 @@ function describeSchedule(task: Task): string {
 function describeAction(task: Task): string {
   if (task.action === 'send_sms') return `发送到 ${task.target_number}:「${task.content}」`
   if (task.action === 'ping') return `Ping ${task.content || 'www.baidu.com'}`
+  if (task.action === 'voice_call') return `拨号 ${task.target_number}（响铃后立即挂断）`
   return task.content
 }
 
@@ -505,6 +506,7 @@ function TaskDialog({
             fullWidth
           >
             <MenuItem value="send_sms">发送短信</MenuItem>
+            <MenuItem value="voice_call">拨打电话(响几秒后挂断)</MenuItem>
             <MenuItem value="ping">Ping(消耗流量)</MenuItem>
             <MenuItem value="raw_at">自定义 AT 指令</MenuItem>
           </TextField>
@@ -525,6 +527,15 @@ function TaskDialog({
                 fullWidth
               />
             </>
+          )}
+          {value.action === 'voice_call' && (
+            <TextField
+              label="目标号码"
+              value={value.target_number}
+              onChange={(e) => set('target_number', e.target.value)}
+              fullWidth
+              helperText="拨通后响几秒就挂断,不会真的接通。填你自己的另一个号码最稳妥,别填紧急号码。"
+            />
           )}
           {value.action === 'raw_at' && (
             <TextField

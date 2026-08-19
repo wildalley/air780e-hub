@@ -10,6 +10,7 @@ import asyncio
 
 import pytest
 
+from air780e_agent.at import CmeError
 from air780e_agent.modem import Air780E, Signal
 
 # --------------------------------------------------------------------------
@@ -319,3 +320,154 @@ async def test_cgreg_alias_survives_the_urc_router(rig):
 
     assert await modem.read_registration() is True
     assert modem.info.eps_registered is True
+
+
+# --------------------------------------------------------------------------
+# voice keep-alive
+#
+# The point of these is the inversion: ATD ends on BUSY / NO ANSWER / NO
+# CARRIER, the AT layer raises ATCommandError for all three, and for a
+# keep-alive the first two mean success.  A test suite that only checked "no
+# exception" would call a working keep-alive broken.
+# --------------------------------------------------------------------------
+
+
+async def test_call_keepalive_hangs_up_after_ringing(modem, rig):
+    result = await modem.call_keepalive("10086", ring_seconds=0.2)
+
+    assert result.outcome == "alerting"
+    assert result.reached_network is True
+    assert rig.mock.dialed == ["10086"]
+    assert rig.mock.hangups == 1, "a call left up keeps billing"
+
+
+async def test_call_keepalive_dials_voice_not_data(modem, rig):
+    """The trailing ';' is what makes ATD a voice call.
+
+    Without it the module attempts a data call, which can connect and hold the
+    AT link in data mode — the port stops answering commands entirely.
+    """
+    await modem.call_keepalive("10086", ring_seconds=0.1)
+
+    assert any(cmd.startswith("ATD") and cmd.endswith(";") for cmd in rig.mock.commands)
+
+
+@pytest.mark.parametrize(
+    "final,outcome",
+    [("BUSY", "busy"), ("NO ANSWER", "no_answer")],
+)
+async def test_call_progress_codes_count_as_reaching_the_network(
+    modem, rig, final, outcome
+):
+    """BUSY and NO ANSWER arrive as errors but prove the carrier saw the call."""
+    rig.mock.dial_final = final
+
+    result = await modem.call_keepalive("10086", ring_seconds=0.1)
+
+    assert result.outcome == outcome
+    assert result.reached_network is True
+
+
+async def test_no_carrier_alone_does_not_claim_success(modem, rig):
+    """NO CARRIER is ambiguous: released by the far end, or never sent at all.
+
+    Counting it as success would report a card that silently fails every call
+    as a healthy keep-alive, which is the exact failure this feature exists to
+    detect.
+    """
+    rig.mock.dial_final = "NO CARRIER"
+
+    result = await modem.call_keepalive("10086", ring_seconds=0.1)
+
+    assert result.outcome == "released"
+    assert result.reached_network is False
+
+
+async def test_call_reports_answered_when_the_far_end_picks_up(modem, rig):
+    rig.mock.call_states = [2, 0]  # dialing -> active
+
+    result = await modem.call_keepalive("10086", ring_seconds=0.4)
+
+    assert result.outcome == "answered"
+    assert result.reached_network is True
+    assert rig.mock.hangups == 1
+
+
+async def test_call_without_service_raises(modem, rig):
+    """+CME ERROR 30 is a fault to retry, not an outcome to record."""
+    rig.mock.registered = False
+
+    with pytest.raises(CmeError) as excinfo:
+        await modem.call_keepalive("10086", ring_seconds=0.1)
+
+    assert excinfo.value.code == 30
+
+
+async def test_call_with_no_clcc_evidence_is_not_success(modem, rig):
+    """ATD said OK but the module never listed a call.
+
+    Real firmware does this when the network rejects setup immediately: the
+    dial itself succeeds and nothing else ever happens.
+    """
+    rig.mock.call_states = []
+
+    result = await modem.call_keepalive("10086", ring_seconds=0.2)
+
+    assert result.outcome == "no_progress"
+    assert result.reached_network is False
+    assert rig.mock.hangups == 1
+
+
+@pytest.mark.parametrize("number", ["10086\rATD666", "", "not-a-number", "12"])
+async def test_call_refuses_numbers_that_are_not_dialable(modem, rig, number):
+    """ATD's argument is written into the AT stream verbatim.
+
+    A value carrying \\r would terminate the dial command and run the rest as a
+    command of its own, so these are refused rather than escaped.
+    """
+    with pytest.raises(ValueError):
+        await modem.call_keepalive(number)
+
+    assert rig.mock.dialed == []
+
+
+async def test_hangup_never_raises(modem, rig):
+    """Hangup runs in a cleanup path; a failure must not mask the outcome."""
+    rig.mock.unsupported.add("ATH")
+
+    await modem.hangup()  # must not raise
+
+
+# --------------------------------------------------------------------------
+# incoming calls
+# --------------------------------------------------------------------------
+
+
+async def test_incoming_call_is_recorded_with_caller_id(modem, rig):
+    rig.mock.ring("13800138000")
+    await rig.wait_for_call()
+
+    assert rig.calls[0].number == "13800138000"
+
+
+async def test_repeated_ring_is_one_call(modem, rig):
+    """A single call makes the module emit RING every few seconds.
+
+    Reporting per line would turn one missed call into a dozen log entries.
+    """
+    for _ in range(4):
+        rig.mock.ring("13800138000")
+        await asyncio.sleep(0.05)
+    await rig.wait_for_call()
+    await asyncio.sleep(0.3)
+
+    assert len(rig.calls) == 1
+
+
+async def test_incoming_call_without_caller_id_still_reported(modem, rig):
+    """RING alone carries no number; the call is still worth recording."""
+    rig.mock.ring()
+    await rig.wait_for_call()
+
+    assert rig.calls[0].number == ""
+    assert rig.calls[0].ts

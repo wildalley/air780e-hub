@@ -1520,6 +1520,23 @@ def test_task_can_be_customised(admin):
     assert admin.get("/api/tasks").json() == []
 
 
+def test_task_accepts_the_voice_call_action(admin):
+    """A voice keep-alive dials target_number; content is unused."""
+    task = admin.post("/api/tasks", json={
+        "device": "a", "name": "语音保号",
+        "action": "voice_call", "target_number": "10086",
+    }).json()
+    assert task["action"] == "voice_call"
+    assert task["target_number"] == "10086"
+
+    # The column is free-form TEXT, so the Literal is the only thing rejecting
+    # a typo'd action before it reaches an agent that cannot run it.
+    rejected = admin.post("/api/tasks", json={
+        "device": "a", "name": "错误动作", "action": "voice",
+    })
+    assert rejected.status_code == 422
+
+
 def test_task_can_be_triggered_manually(admin, monkeypatch):
     task = admin.post("/api/tasks", json={"device": "a", "name": "手动保号"}).json()
     gateway = admin.app.state.hub.gateway

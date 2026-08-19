@@ -259,6 +259,20 @@ class KeepAliveScheduler:
                 raise RuntimeError(f"ping {host} got no reply")
             return f"ping {host} ok"
 
+        if action == "voice_call":
+            number = str(task["target_number"] or "").strip()
+            if not number:
+                raise TaskSkipped("task has no target number")
+            result = await worker.call_keepalive(number)
+            if not result["reached_network"]:
+                # The modem dialled but the carrier never engaged with the call,
+                # so nothing was booked as activity.  Reported as a failure so
+                # the task retries and the operator sees it, rather than a
+                # keep-alive that quietly never kept anything alive.
+                raise RuntimeError(f"call to {number} did not reach the network: "
+                                   f"{result['detail']}")
+            return f"called {number}: {result['detail']}"
+
         if action == "raw_at":
             command = str(task["content"] or "").strip()
             if not command:

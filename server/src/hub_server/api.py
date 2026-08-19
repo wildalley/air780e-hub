@@ -256,7 +256,7 @@ class TaskBody(BaseModel):
     device: str
     agent_id: str = ""
     enabled: bool = True
-    action: Literal["send_sms", "ping", "raw_at"] = "send_sms"
+    action: Literal["send_sms", "ping", "raw_at", "voice_call"] = "send_sms"
     target_number: str = "10086"
     content: str = "1"
     schedule_type: Literal["interval", "cron"] = "interval"

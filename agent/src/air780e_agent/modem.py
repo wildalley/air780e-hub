@@ -19,10 +19,12 @@ import asyncio
 import csv
 import logging
 import re
+import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
-from .at import ATClient, ATError, ATUrc, CmsError
+from .at import ATClient, ATCommandError, ATError, ATUrc, CmsError
 from .pdu import (
     DecodedSms,
     PduError,
@@ -37,6 +39,19 @@ log = logging.getLogger(__name__)
 
 SmsCallback = Callable[[DecodedSms], None | Awaitable[None]]
 DeliveryCallback = Callable[[StatusReport], None | Awaitable[None]]
+CallCallback = Callable[["IncomingCall"], None | Awaitable[None]]
+
+# Report the caller's number alongside RING.  Optional and diagnostic: a module
+# that refuses it still reports the call itself, just anonymously.
+CLIP_ENABLE = "AT+CLIP=1"
+
+# RING repeats every ~5s for as long as the caller waits.  Two RINGs further
+# apart than this are treated as separate calls; closer together, as one call
+# still ringing.
+RING_REPEAT_GAP = 12.0
+# +CLIP follows its RING almost immediately, so a short wait is enough to
+# attach the caller's number to the record instead of logging it as anonymous.
+CLIP_GRACE = 1.0
 
 # 2 = forward URCs even while the link is reserved; 1 = store the message and
 # report only its index.  Storing (rather than +CMT push) means a message
@@ -52,6 +67,47 @@ CEREG_ENABLE = "AT+CEREG=1"  # EPS / LTE
 CIREG_ENABLE = "AT+CIREG=1"  # IMS, optional and diagnostic only
 
 SEND_TIMEOUT = 60.0
+
+# A voice keep-alive dials, waits just long enough for the network to start
+# ringing the far end, then hangs up.  Long enough that the carrier books a
+# call attempt, short enough that nobody actually picks up — an answered call
+# would bill the user and, worse, ring a real phone at whatever hour the
+# scheduler chose.
+CALL_RING_SECONDS = 8.0
+# ``ATD`` normally answers OK as soon as call setup starts, but firmware is
+# free to hold the line until the call ends instead, which is why this allows
+# for the whole ring window plus the network's own setup time.
+DIAL_TIMEOUT = 45.0
+HANGUP_TIMEOUT = 15.0
+# How often to ask the module what the call is actually doing while it rings.
+CALL_POLL_INTERVAL = 1.5
+
+# ATD takes a raw dial string that is written straight into the AT stream, so
+# anything that could carry a carriage return has to be refused rather than
+# escaped: a "number" containing \r would end the dial command and run the
+# rest as a command of its own.  Digits plus the DTMF/dial characters GSM
+# 27.007 allows are enough for a real number.
+_DIALABLE_RE = re.compile(r"^\+?[0-9*#ABCD]{3,20}$")
+
+# +CLCC <stat> values.  Only these three say the network engaged with the call.
+CALL_STATE_ACTIVE = 0
+CALL_STATE_DIALING = 2
+CALL_STATE_ALERTING = 3
+
+# Final result codes ATD can end on.  Each says the call reached the network
+# and the network answered for the far end, which is exactly what a keep-alive
+# needs — so they are outcomes to record, not failures to raise.  The AT client
+# turns every one of them into ATCommandError, hence the text lookup.
+_CALL_PROGRESS_OUTCOMES = {
+    "BUSY": ("busy", True),
+    "NO ANSWER": ("no_answer", True),
+    # Ambiguous on purpose: the far end released the call, or the module never
+    # got it out of the door.  +CLCC evidence decides which, so this one does
+    # not claim the network was reached on its own.
+    "NO CARRIER": ("released", False),
+    "NO DIALTONE": ("no_dialtone", False),
+}
+
 # A network scan can take several minutes while the modem listens for every
 # supported operator.  Keep this separate from the ordinary AT command
 # timeout so callers cannot accidentally put ``AT+COPS=?`` on the short path.
@@ -60,6 +116,12 @@ OPERATOR_SELECT_TIMEOUT = 180.0
 
 # States that mean "attached to the network": 1 = home, 5 = roaming.
 REGISTERED_STATES = ("1", "5")
+
+
+def _timestamp() -> str:
+    # Same shape the worker stamps its events with, so an incoming call sorts
+    # against messages without any conversion on the way through.
+    return datetime.now(UTC).astimezone().isoformat(timespec="seconds")
 
 
 def _tpdu_octets(pdu: str) -> int | None:
@@ -131,6 +193,45 @@ class Signal:
             if dbm >= threshold:
                 return bars
         return 1
+
+
+@dataclass
+class CallResult:
+    """What happened to one outgoing keep-alive call.
+
+    ``reached_network`` is the field callers should judge success by, not the
+    absence of an exception.  A keep-alive succeeds when the carrier saw a call
+    attempt, and the codes that prove that (``BUSY``, ``NO ANSWER``, an
+    alerting ``+CLCC``) all arrive as errors from the AT layer.
+    """
+
+    outcome: str
+    reached_network: bool
+    ring_seconds: float = 0.0
+    detail: str = ""
+    states: list[int] = field(default_factory=list)
+
+    def describe(self) -> str:
+        label = {
+            "alerting": "far end rang",
+            "answered": "answered (hung up immediately)",
+            "busy": "far end busy",
+            "no_answer": "no answer",
+            "dialing": "call set up",
+            "released": "released before ringing",
+            "no_dialtone": "no dial tone",
+            "no_progress": "never left the module",
+        }.get(self.outcome, self.outcome)
+        suffix = f"; {self.detail}" if self.detail else ""
+        return f"{label} after {self.ring_seconds:.1f}s{suffix}"
+
+
+@dataclass
+class IncomingCall:
+    """A ``RING``/``+CLIP`` notification, recorded rather than answered."""
+
+    number: str = ""
+    ts: str = ""
 
 
 @dataclass
@@ -273,6 +374,7 @@ class Air780E:
         *,
         on_sms: SmsCallback | None = None,
         on_delivery: DeliveryCallback | None = None,
+        on_call: CallCallback | None = None,
         storage: str = "SM",
         delete_after_read: bool = True,
         reassembly_timeout: float = 30.0,
@@ -280,6 +382,7 @@ class Air780E:
         self.client = client
         self.on_sms = on_sms
         self.on_delivery = on_delivery
+        self.on_call = on_call
         self.storage = storage
         self.delete_after_read = delete_after_read
         self.info = ModemInfo()
@@ -289,6 +392,13 @@ class Air780E:
         self._flush_task: asyncio.Task | None = None
         self._new_message_indexes: asyncio.Queue[int] = asyncio.Queue()
         self._drain_task: asyncio.Task | None = None
+        # RING repeats for as long as the caller waits, so the report is held
+        # briefly (for the +CLIP that carries the number) and the repeats are
+        # collapsed into one.  `_ring_seen` starts far enough in the past that
+        # the very first RING is never mistaken for a repeat.
+        self._ring_call: IncomingCall | None = None
+        self._ring_seen: float = -RING_REPEAT_GAP
+        self._ring_task: asyncio.Task | None = None
 
         client.register_urc("+CMTI", self._on_cmti)
         client.register_urc("+CMT", self._on_cmt, payload_lines=1)
@@ -296,6 +406,10 @@ class Air780E:
         client.register_urc("+CREG", self._on_registration)
         client.register_urc("+CEREG", self._on_registration)
         client.register_urc("+CIREG", self._on_registration)
+        # Incoming calls are recorded, never answered.  RING carries no caller
+        # ID; +CLIP does, and arrives alongside it once AT+CLIP=1 is set.
+        client.register_urc("RING", self._on_ring)
+        client.register_urc("+CLIP", self._on_clip)
 
     # -- setup -------------------------------------------------------------
 
@@ -321,7 +435,9 @@ class Air780E:
         # implements both domains, and a missing one must not abort setup —
         # the periodic refresh in `read_registration` covers whatever URCs
         # never arrive.
-        for command in (CREG_ENABLE, CEREG_ENABLE, CIREG_ENABLE):
+        # CLIP is in the same list for the same reason: caller ID is a nicety,
+        # and a module that refuses it still reports the call itself.
+        for command in (CREG_ENABLE, CEREG_ENABLE, CIREG_ENABLE, CLIP_ENABLE):
             try:
                 await self.client.execute(command)
             except ATError as exc:
@@ -338,11 +454,12 @@ class Air780E:
             self._drain_task = asyncio.create_task(self._index_loop())
 
     async def close(self) -> None:
-        for task in (self._flush_task, self._drain_task):
+        for task in (self._flush_task, self._drain_task, self._ring_task):
             if task is not None:
                 task.cancel()
         self._flush_task = None
         self._drain_task = None
+        self._ring_task = None
 
     # -- information -------------------------------------------------------
 
@@ -808,6 +925,138 @@ class Air780E:
             references.append(int(value) if value and value.isdigit() else -1)
         return references
 
+    # -- voice -------------------------------------------------------------
+
+    async def call_keepalive(
+        self, number: str, *, ring_seconds: float = CALL_RING_SECONDS
+    ) -> CallResult:
+        """Dial ``number``, let it ring briefly, then hang up.
+
+        Some plans count a call attempt but not an SMS, so this exists purely
+        to make the carrier's billing system see activity.  It deliberately
+        never lets the call be answered: the far end is usually the user's own
+        second number, and the scheduler may fire at 04:00.
+
+        Returns a :class:`CallResult` rather than raising for the codes that
+        mean the call reached the network.  ``ATD`` ends on ``BUSY``,
+        ``NO ANSWER`` or ``NO CARRIER``, all of which the AT layer reports as
+        :class:`ATCommandError` — for a keep-alive those are the *successful*
+        shapes, so unpicking them here is the whole point of the method.  What
+        still raises is a module that never dialled at all (``+CME ERROR``,
+        ``ERROR``, a dead port), because that is a fault to retry.
+        """
+        if not _DIALABLE_RE.match(number.strip()):
+            # Refused rather than escaped: ATD's argument goes into the AT
+            # stream verbatim, so a value carrying \r would end the dial and
+            # run whatever followed as its own command.
+            raise ValueError(f"not a dialable number: {number!r}")
+
+        dialed = number.strip()
+        started = time.monotonic()
+        states: list[int] = []
+        outcome: str | None = None
+        reached = False
+        detail = ""
+
+        try:
+            # ``;`` makes this a voice call.  Without it the module tries a
+            # data call, which either fails outright or, worse, connects and
+            # keeps the AT link captured in data mode.
+            await self.client.execute(f"ATD{dialed};", timeout=DIAL_TIMEOUT)
+        except ATCommandError as exc:
+            known = _CALL_PROGRESS_OUTCOMES.get(exc.final)
+            if known is None:
+                raise
+            outcome, reached = known
+            detail = exc.final
+        # Any other ATError (CmeError, ATTimeout, TransportClosed) propagates:
+        # the call never happened and the scheduler should treat it as failure.
+
+        if outcome is None:
+            # ATD returned OK, so the call is up and it is on us to end it.
+            # Poll +CLCC while it rings: the state the network reached is the
+            # only positive evidence that the attempt was real, and it is gone
+            # once we hang up.
+            try:
+                states = await self._watch_call(started, ring_seconds)
+            finally:
+                await self.hangup()
+            if CALL_STATE_ACTIVE in states:
+                outcome, reached = "answered", True
+            elif CALL_STATE_ALERTING in states:
+                outcome, reached = "alerting", True
+            elif CALL_STATE_DIALING in states:
+                # Set-up started but never reached the far end within the ring
+                # window.  Worth recording, but it does not prove the carrier
+                # booked an attempt, so it does not count as reaching them.
+                outcome, reached = "dialing", False
+            else:
+                # ATD said OK yet +CLCC never listed a call.  Seen when the
+                # network rejects setup immediately; the module reports success
+                # for the dial itself.
+                outcome, reached = "no_progress", False
+                detail = "+CLCC never reported a call"
+        elif outcome == "released":
+            # NO CARRIER with no +CLCC evidence either way.  Treated as not
+            # reaching the network, so a card that silently fails every call
+            # is not reported as a healthy keep-alive.
+            detail = f"{detail} (no ringing observed)"
+
+        result = CallResult(
+            outcome=outcome,
+            reached_network=reached,
+            ring_seconds=time.monotonic() - started,
+            detail=detail,
+            states=states,
+        )
+        log.info("[call] %s -> %s", dialed, result.describe())
+        return result
+
+    async def _watch_call(self, started: float, ring_seconds: float) -> list[int]:
+        """Collect the ``+CLCC`` states seen while the call rings.
+
+        Polls before sleeping, and keeps the interval short enough that several
+        polls fit the window: the state right after ``ATD`` is the one most
+        likely to be missed, and sleeping a fixed 1.5s first would both lose it
+        and overshoot any window shorter than the interval.
+        """
+        states: list[int] = []
+        interval = min(CALL_POLL_INTERVAL, max(ring_seconds / 4, 0.05))
+        while True:
+            try:
+                response = await self.client.execute("AT+CLCC")
+            except ATError as exc:
+                # A module that will not report call state is not a reason to
+                # leave a call up; stop watching and let the caller hang up.
+                log.debug("AT+CLCC failed mid-call: %s", exc)
+                break
+            listed = False
+            for value in response.all("+CLCC:"):
+                fields = _csv_fields(value)
+                if len(fields) >= 3 and fields[2].isdigit():
+                    states.append(int(fields[2]))
+                    listed = True
+            if not listed and states:
+                # The call left the list: it ended on its own (far end
+                # rejected, network released).  Nothing more to observe.
+                break
+            if time.monotonic() - started >= ring_seconds:
+                break
+            await asyncio.sleep(interval)
+        return states
+
+    async def hangup(self) -> None:
+        """End whatever call is up.
+
+        Never raises.  This runs in the cleanup path of a keep-alive, and a
+        failure here must not mask the outcome that path is reporting — but a
+        call left up would keep billing, so it is worth a warning.
+        """
+        try:
+            await self.client.execute("ATH", timeout=HANGUP_TIMEOUT)
+        except ATError as exc:
+            log.warning("ATH failed, call may still be up: %s", exc)
+
     async def ping(self, host: str = "www.baidu.com") -> bool:
         """Burn a few bytes of data — some carriers want traffic, not just SMS."""
         try:
@@ -855,6 +1104,64 @@ class Air780E:
         result = self.on_delivery(report)
         if asyncio.iscoroutine(result):
             await result
+
+    def _on_ring(self, urc: ATUrc) -> None:
+        """Note an incoming call.  Never answered — only recorded.
+
+        A single call makes the module emit ``RING`` every few seconds until it
+        stops, so this collapses the repeats into one record: reporting per line
+        would turn one missed call into a dozen log entries.
+        """
+        now = time.monotonic()
+        # Gate on when a RING was last seen, not on whether a report is still
+        # pending: the pending call is cleared after CLIP_GRACE, so a phone that
+        # rings for twenty seconds would otherwise be reported over and over.
+        recent = now - self._ring_seen < RING_REPEAT_GAP
+        self._ring_seen = now
+        if recent:
+            return
+        self._ring_call = IncomingCall(ts=_timestamp())
+        # Wait briefly before reporting: +CLIP carries the caller's number and
+        # arrives just after RING, so reporting immediately would record every
+        # call as anonymous.
+        self._ring_task = asyncio.get_running_loop().create_task(self._report_call())
+
+    def _on_clip(self, urc: ATUrc) -> None:
+        # +CLIP: "13800138000",129,,,,0
+        match = re.match(r'\s*"?([+0-9*#]+)"?', urc.params)
+        number = match.group(1) if match else ""
+        if self._ring_call is not None:
+            if number:
+                self._ring_call.number = number
+            return
+        if time.monotonic() - self._ring_seen < RING_REPEAT_GAP:
+            # The call this belongs to has already been reported; a repeat +CLIP
+            # from the same ringing call must not become a second record.
+            return
+        # +CLIP with no RING in front of it: report it as its own call rather
+        # than dropping the only notice we got.
+        self._ring_seen = time.monotonic()
+        self._ring_call = IncomingCall(number=number, ts=_timestamp())
+        self._ring_task = asyncio.get_running_loop().create_task(self._report_call())
+
+    async def _report_call(self) -> None:
+        """Hand the pending incoming call upstream once +CLIP has had time."""
+        try:
+            await asyncio.sleep(CLIP_GRACE)
+        except asyncio.CancelledError:
+            return
+        call, self._ring_call = self._ring_call, None
+        if call is None or self.on_call is None:
+            return
+        log.info(
+            "[call] incoming from %s", call.number or "unknown number"
+        )
+        try:
+            result = self.on_call(call)
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:
+            log.exception("incoming-call handler failed")
 
     def _on_registration(self, urc: ATUrc) -> None:
         # An unsolicited +CREG/+CEREG/+CIREG is stat-first: "+CREG: 1" or, in mode 2,

@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from .at import ATClient, ATError, SerialTransport, Transport
 from .config import DeviceConfig
-from .modem import Air780E, Signal
+from .modem import Air780E, IncomingCall, Signal
 from .pdu import DecodedSms, StatusReport
 from .store import LocalStore
 
@@ -300,6 +300,7 @@ class DeviceWorker:
             client,
             on_sms=self._on_sms,
             on_delivery=self._on_delivery,
+            on_call=self._on_incoming_call,
             storage=self.config.storage,
             delete_after_read=self.config.delete_after_read,
         )
@@ -810,6 +811,19 @@ class DeviceWorker:
             self.name, report.message_reference, report.status, report.state,
         )
 
+    def _on_incoming_call(self, call: IncomingCall) -> None:
+        """Record an incoming call.  It is never answered.
+
+        Some plans count a received call as activity, so the record is worth
+        keeping on its own; it also shows whether a card can be reached at all,
+        which is the other half of the keep-alive question.
+        """
+        self._log_event(
+            "info",
+            f"来电 {call.number or '未知号码'}（未接听，仅记录）",
+        )
+        log.info("[%s] incoming call from %s", self.name, call.number or "unknown")
+
     # -- commands ----------------------------------------------------------
 
     def _require_modem(self) -> Air780E:
@@ -883,6 +897,45 @@ class DeviceWorker:
 
     async def ping(self, host: str = "www.baidu.com") -> bool:
         return await self._require_radio().ping(host)
+
+    async def call_keepalive(self, number: str) -> dict[str, Any]:
+        """Place a keep-alive call and report what the network did with it.
+
+        Raises when the call could not be attempted at all, and returns a
+        result — including an unsuccessful one — whenever the modem got as far
+        as dialing.  ``reached_network`` is what says whether the carrier
+        actually booked an attempt; on a roaming SIM with no working CS path a
+        call fails the same way an SMS does, so the failure carries the same
+        registration context that makes it diagnosable.
+        """
+        modem = self._require_radio()
+        try:
+            result = await modem.call_keepalive(number)
+        except ATError as exc:
+            # Same context the SMS path attaches: on a roaming card the useful
+            # question is always "which domain was actually registered".
+            error = f"{exc}; modem status: {self._sms_diagnostic_context()}"
+            self._log_event("error", f"保号呼叫 {number} 失败: {error}")
+            raise ATError(error) from exc
+
+        # Reported through the log stream rather than a dedicated event kind:
+        # the scheduler's task_result already carries the outcome for a
+        # scheduled call, and this is the record for a manually placed one.
+        if result.reached_network:
+            self._log_event("info", f"保号呼叫 {number}: {result.describe()}")
+        else:
+            self._log_event(
+                "warning",
+                f"保号呼叫 {number} 未到达网络: {result.describe()}; "
+                f"modem status: {self._sms_diagnostic_context()}",
+            )
+        log.info("[%s] keep-alive call to %s: %s", self.name, number, result.describe())
+        return {
+            "outcome": result.outcome,
+            "reached_network": result.reached_network,
+            "ring_seconds": round(result.ring_seconds, 1),
+            "detail": result.describe(),
+        }
 
     async def set_radio_enabled(self, enabled: bool) -> dict[str, Any]:
         modem = self._require_modem()

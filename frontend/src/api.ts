@@ -287,7 +287,7 @@ export interface Task {
   device: string
   agent_id: string
   enabled: number
-  action: 'send_sms' | 'ping' | 'raw_at'
+  action: 'send_sms' | 'ping' | 'raw_at' | 'voice_call'
   target_number: string
   content: string
   schedule_type: 'interval' | 'cron'

@@ -93,7 +93,16 @@ class ATTimeout(ATError):
 
 
 class ATCommandError(ATError):
-    """The modem replied with a bare ``ERROR``."""
+    """The modem replied with ``ERROR`` or another unstructured failure code."""
+
+    def __init__(self, message: str, *, command: str | None = None) -> None:
+        # The final line exactly as the modem sent it, kept apart from the
+        # formatted message so callers can switch on it.  ATD ends on
+        # NO CARRIER / BUSY / NO ANSWER, and for a keep-alive call those are
+        # outcomes rather than failures; recovering them by unpicking
+        # str(exc) would mean re-deriving what we already had in hand.
+        self.final = message.strip().upper()
+        super().__init__(message, command=command)
 
 
 class CmeError(ATError):

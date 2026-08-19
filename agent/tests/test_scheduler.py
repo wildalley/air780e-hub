@@ -36,13 +36,21 @@ class Clock:
 class FakeWorker:
     """A modem that answers instantly and can be told to fail."""
 
-    def __init__(self, *, fail_times: int = 0, ping_ok: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        fail_times: int = 0,
+        ping_ok: bool = True,
+        call_reaches_network: bool = True,
+    ) -> None:
         self.sent: list[tuple[str, str]] = []
         self.pings: list[str] = []
         self.commands: list[str] = []
+        self.called: list[str] = []
         self.fail_times = fail_times
         self.attempts = 0
         self.ping_ok = ping_ok
+        self.call_reaches_network = call_reaches_network
         self.radio_enabled: bool | None = True
         self.gate: asyncio.Event | None = None
 
@@ -62,6 +70,16 @@ class FakeWorker:
     async def raw_at(self, command: str) -> list[str]:
         self.commands.append(command)
         return ["+CSQ: 24,99", "OK"]
+
+    async def call_keepalive(self, number: str) -> dict:
+        self.called.append(number)
+        reached = self.call_reaches_network
+        return {
+            "outcome": "alerting" if reached else "no_progress",
+            "reached_network": reached,
+            "ring_seconds": 8.0,
+            "detail": "far end rang after 8.0s" if reached else "never left the module",
+        }
 
 
 @pytest.fixture
@@ -379,6 +397,54 @@ async def test_raw_at_action(store):
 
     assert worker.commands == ["AT+CSQ"]
     assert "+CSQ: 24,99" in results(events)[0]["detail"]
+
+
+async def test_voice_call_action(store):
+    worker = FakeWorker()
+    scheduler, events = build(
+        store, worker, tasks=[make_task(action="voice_call", target_number="10086")]
+    )
+    due_now(store)
+
+    await scheduler.tick_once()
+    await scheduler.drain()
+
+    assert worker.called == ["10086"]
+    assert results(events)[0]["status"] == "ok"
+
+
+async def test_voice_call_that_never_reaches_the_network_is_a_failure(store):
+    """A dial the carrier ignored keeps nothing alive, so it must not read ok.
+
+    The modem reports success for the dial itself in this case, which is
+    exactly how a roaming card with no working CS path behaves — the whole
+    point of judging the call on `reached_network` rather than on the absence
+    of an exception.
+    """
+    worker = FakeWorker(call_reaches_network=False)
+    scheduler, events = build(
+        store, worker, tasks=[make_task(action="voice_call", target_number="10086")]
+    )
+    due_now(store)
+
+    await scheduler.tick_once()
+    await scheduler.drain()
+
+    assert results(events)[0]["status"] == "failed"
+
+
+async def test_voice_call_without_a_number_is_skipped(store):
+    worker = FakeWorker()
+    scheduler, events = build(
+        store, worker, tasks=[make_task(action="voice_call", target_number="")]
+    )
+    due_now(store)
+
+    await scheduler.tick_once()
+    await scheduler.drain()
+
+    assert worker.called == []
+    assert results(events)[0]["status"] == "skipped"
 
 
 async def test_raw_at_without_a_command_is_skipped(store):

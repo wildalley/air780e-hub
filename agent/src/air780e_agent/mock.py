@@ -110,6 +110,18 @@ class MockAir780E:
     radio_enabled: bool = True
     pin_ready: bool = True
 
+    # Voice.  `call_states` is the +CLCC <stat> progression a dialled call walks
+    # through, one step per poll: 2 = dialing, 3 = alerting (the far end is
+    # ringing), 0 = active.  The default stops at alerting because that is what
+    # a keep-alive wants — an answered call would mean someone picked up.
+    call_states: list[int] = field(default_factory=lambda: [2, 3])
+    # Set to "BUSY", "NO ANSWER" or "NO CARRIER" to make ATD end on that code
+    # instead of OK.  All three arrive as errors from the AT layer while meaning
+    # the call reached the network, which is the case worth testing.
+    dial_final: str | None = None
+    dialed: list[str] = field(default_factory=list)
+    hangups: int = 0
+
     # Failure injection for tests.
     fail_next_send: bool = False
     unsupported: set[str] = field(default_factory=set)
@@ -137,6 +149,9 @@ class MockAir780E:
     _cnmi: str = ""
     _pending_send: int | None = None
     _send_buffer: str = ""
+    _clip: bool = False
+    _call_state: int | None = None
+    _call_polls: int = 0
     _buffer: bytearray = field(default_factory=bytearray)
     sent: list[codec.DecodedSms] = field(default_factory=list)
     pings: list[str] = field(default_factory=list)
@@ -390,6 +405,20 @@ class MockAir780E:
         if upper.startswith("AT+CIPPING"):
             return self._handle_ping(line)
 
+        # Voice.  ATD must be matched before the generic AT+ prefixes because it
+        # carries its argument with no '=' separator.
+        if upper.startswith("ATD"):
+            return self._handle_dial(line)
+        if upper in ("ATH", "ATH0", "AT+CHUP"):
+            return self._handle_hangup()
+        if upper == "AT+CLCC":
+            return self._handle_clcc()
+        if upper.startswith("AT+CLIP="):
+            self._clip = upper.endswith("1")
+            return self._reply()
+        if upper == "AT+CLIP?":
+            return self._reply([f"+CLIP: {1 if self._clip else 0},0"])
+
         self._error(cme=4)
 
     def _handle_cpms(self, line: str) -> None:
@@ -498,6 +527,49 @@ class MockAir780E:
         host = match.group(1) if match else "unknown"
         self.pings.append(host)
         self._reply([f'+CIPPING: 1,"{host}",32,118,64'])
+
+    # -- voice -------------------------------------------------------------
+
+    def _handle_dial(self, line: str) -> None:
+        # ATD<number>; — the trailing ';' means voice rather than data.
+        number = line[3:].rstrip(";").strip()
+        self.dialed.append(number)
+
+        if self.dial_final is not None:
+            # BUSY / NO ANSWER / NO CARRIER: the call never becomes active, so
+            # there is nothing for +CLCC to list afterwards.
+            self._call_state = None
+            return self._reply(final=self.dial_final)
+        if not self.radio_enabled or not self.registered:
+            self._call_state = None
+            return self._error(cme=30)  # no network service
+
+        self._call_state = self.call_states[0] if self.call_states else None
+        self._call_polls = 0
+        self._reply()
+
+    def _handle_clcc(self) -> None:
+        if self._call_state is None:
+            return self._reply()  # no call up: OK with no +CLCC lines
+        state = self._call_state
+        # Walk the configured progression one step per poll, so a test can watch
+        # dialing -> alerting the way real firmware reports it.
+        self._call_polls += 1
+        if self._call_polls < len(self.call_states):
+            self._call_state = self.call_states[self._call_polls]
+        # <id>,<dir>,<stat>,<mode>,<mpty>[,<number>,<type>]
+        self._reply([f"+CLCC: 1,0,{state},0,0"])
+
+    def _handle_hangup(self) -> None:
+        self._call_state = None
+        self.hangups += 1
+        self._reply()
+
+    def ring(self, number: str = "") -> None:
+        """Simulate an incoming call: RING, optionally followed by +CLIP."""
+        self._urc("RING")
+        if number and self._clip:
+            self._urc(f'+CLIP: "{number}",129,,,,0')
 
 
 # --------------------------------------------------------------------------
