@@ -52,6 +52,23 @@ class AgentRig:
                     return found
                 await asyncio.sleep(0.01)
 
+    async def wait_for_event_where(
+        self, kind: str, predicate, timeout: float = 3.0
+    ):
+        """Wait for an event *matching* a condition, not merely for the Nth one.
+
+        ``wait_for_events`` counts from the start of the run, so a test that
+        mutates a mock and then asks for "one status event" is answered by a
+        frame emitted before the mutation.  This waits for the frame that
+        actually shows the change.
+        """
+        async with asyncio.timeout(timeout):
+            while True:
+                for event in self.events(kind):
+                    if predicate(event.payload):
+                        return event.payload
+                await asyncio.sleep(0.01)
+
     def events(self, kind: str):
         return [e for e in self.app.store.unacked_events(limit=1000) if e.kind == kind]
 
@@ -692,3 +709,83 @@ async def test_signal_change_is_reported(agent):
     await asyncio.sleep(0.3)
 
     assert len(agent.events("status")) > before
+
+
+# --------------------------------------------------------------------------
+# supply voltage
+# --------------------------------------------------------------------------
+
+
+async def test_status_carries_the_supply_reading_and_its_threshold(agent):
+    """The threshold travels with the reading.
+
+    The Server judges the voltage but does not own the number: what counts as
+    low is a property of this module's supply, which only the Agent's config
+    knows.  A frame carrying the reading alone would force the Server to keep a
+    second copy of the default.
+    """
+    await agent.wait_online()
+    agent.mocks["a"].voltage_mv = 3968
+    payload = await agent.wait_for_event_where(
+        "status", lambda p: p["device"] == "a" and p.get("voltage_mv") is not None
+    )
+
+    assert payload["voltage_mv"] == 3968
+    assert payload["low_voltage_mv"] > 0
+
+
+async def test_a_drifting_supply_reading_does_not_flood_the_queue(agent):
+    """A few millivolts of wander is not an event.
+
+    Without a noise floor this metric alone would defeat the whole status
+    filter: the reading moves by single millivolts between polls, so every
+    single sample would count as "changed" and reach the wire.
+    """
+    await agent.wait_online()
+    await agent.wait_for_events("status", 2)
+    before = len(agent.events("status"))
+
+    for millivolts in (3970, 3966, 3971, 3969):
+        agent.mocks["a"].voltage_mv = millivolts
+        await asyncio.sleep(0.08)
+
+    assert len(agent.events("status")) == before
+
+
+async def test_crossing_the_low_voltage_threshold_is_reported_at_once(agent):
+    """The threshold edge is exempt from the noise floor.
+
+    A supply sagging past the alert line one millivolt at a time is exactly the
+    case the noise floor would swallow, and it is the one sample that must not
+    wait up to fifteen minutes for the heartbeat.
+    """
+    await agent.wait_online()
+    worker = agent.app.workers["a"]
+    threshold = worker._low_voltage_threshold
+
+    agent.mocks["a"].voltage_mv = threshold + 1
+    await agent.wait_for_events("status", 1)
+    before = len(agent.events("status"))
+
+    agent.mocks["a"].voltage_mv = threshold - 1
+    await asyncio.sleep(0.3)
+
+    payload = agent.events("status")[-1].payload
+    assert len(agent.events("status")) > before
+    assert payload["voltage_mv"] == threshold - 1
+
+
+async def test_a_firmware_without_cbc_reports_no_voltage(agent):
+    """A module that refuses AT+CBC stays online and unjudged.
+
+    None means "no reading", which must not read as 0 mV — that would look like
+    a dead supply on a perfectly healthy module.
+    """
+    await agent.wait_online()
+    agent.mocks["a"].unsupported.add("AT+CBC")
+    payload = await agent.wait_for_event_where(
+        "status", lambda p: p["device"] == "a" and p.get("voltage_mv") is None
+    )
+
+    assert payload["voltage_mv"] is None
+    assert agent.app.workers["a"].online is True

@@ -110,6 +110,10 @@ class MockAir780E:
     radio_enabled: bool = True
     pin_ready: bool = True
 
+    # Supply voltage in millivolts, reported by +CBC.  Set to None to model a
+    # module that answers the command but gives no usable figure.
+    voltage_mv: int | None = 3968
+
     # Voice.  `call_states` is the +CLCC <stat> progression a dialled call walks
     # through, one step per poll: 2 = dialing, 3 = alerting (the far end is
     # ringing), 0 = active.  The default stops at alerting because that is what
@@ -126,6 +130,12 @@ class MockAir780E:
     fail_next_send: bool = False
     unsupported: set[str] = field(default_factory=set)
     silent: set[str] = field(default_factory=set)
+    # Command (upper case) -> the exact information lines to answer with, in
+    # place of this mock's own reply.  For the cases where the point of the test
+    # is a *different* firmware's response shape: this mock reproduces the one
+    # module family that was measured, and a parser that must accept several
+    # shapes cannot be tested against a mock that only emits one of them.
+    replies: dict[str, list[str]] = field(default_factory=dict)
     # Air780E V1011 quirks, both measured on real hardware (2026-08-18):
     # errors come back as text even under +CMEE=1, and AT+CEREG? answers under
     # the +CGREG prefix.
@@ -279,6 +289,12 @@ class MockAir780E:
                 self._error(cme=4)
                 return
 
+        # Checked before the real handlers so a test can stand in another
+        # firmware's answer, but after `silent` and `unsupported` so those keep
+        # taking precedence over any canned reply.
+        if (override := self.replies.get(upper)) is not None:
+            return self._reply(list(override))
+
         if upper == "AT":
             return self._reply()
         if upper == "ATI":
@@ -387,7 +403,15 @@ class MockAir780E:
         if upper == "AT+CSCA?":
             return self._reply([f'+CSCA: "{self.smsc}",145'])
         if upper == "AT+CBC":
-            return self._reply(["+CBC: 0,80,4012"])
+            # Measured shape on AirM2M_780EPV_V1011: the millivolt figure on its
+            # own, not the 27.007 <bcs>,<bcl>,<voltage> triple this fixture used
+            # to return.  A module without a battery has no charge state to
+            # report, so the two leading fields were never there to read.
+            # None answers the command with no figure at all, which is a real
+            # shape: the reply must stay unparseable rather than say "None".
+            if self.voltage_mv is None:
+                return self._reply(["+CBC:"])
+            return self._reply([f"+CBC: {self.voltage_mv}"])
         if upper == "AT+CCLK?":
             now = datetime.now(timezone(timedelta(hours=8)))
             return self._reply([f'+CCLK: "{now:%y/%m/%d,%H:%M:%S}+32"'])

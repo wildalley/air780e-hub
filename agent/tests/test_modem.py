@@ -73,6 +73,33 @@ async def test_storage_usage(modem, rig):
     assert capacity == rig.mock.capacity
 
 
+async def test_read_voltage(modem, rig):
+    rig.mock.voltage_mv = 3968
+    assert await modem.read_voltage() == 3968
+
+
+@pytest.mark.parametrize(
+    "reply, expected",
+    [
+        # Measured V1011 shape: the millivolt figure on its own.
+        ("+CBC: 3968", 3968),
+        # The 27.007 triple, where the voltage is the third field.
+        ("+CBC: 0,80,4012", 4012),
+        # Reading by position would take this 80 as 80 mV.
+        ("+CBC: 0,80", None),
+        ("+CBC:", None),
+    ],
+)
+async def test_read_voltage_across_response_shapes(modem, rig, reply, expected):
+    rig.mock.replies["AT+CBC"] = [reply]
+    assert await modem.read_voltage() == expected
+
+
+async def test_read_voltage_when_the_firmware_refuses(modem, rig):
+    rig.mock.unsupported.add("AT+CBC")
+    assert await modem.read_voltage() is None
+
+
 # --------------------------------------------------------------------------
 # receiving
 # --------------------------------------------------------------------------

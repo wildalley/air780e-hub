@@ -76,6 +76,9 @@ class FakeModem:
     async def read_signal(self) -> Signal:
         return Signal(rssi=20)
 
+    async def read_voltage(self) -> int:
+        return 3968
+
     async def storage_usage(self) -> tuple[int, int]:
         return 0, 10
 

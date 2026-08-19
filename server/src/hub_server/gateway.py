@@ -50,6 +50,13 @@ COMMAND_TIMEOUT = 30.0
 SETTING_PREVIOUS_AGENT_TOKEN_HASH = "previous_agent_token_hash"
 SETTING_PREVIOUS_AGENT_TOKEN_EXPIRES_AT = "previous_agent_token_expires_at"
 
+# Below the EC618's own 3.3 V floor the module is not merely poorly fed: a
+# transmit burst can drop it under the brown-out point and reset it mid-send.
+# The Agent decides what counts as *low* (its config knows the supply); this is
+# only the line between "watch it" and "it can fail right now", which follows
+# from the chip rather than from any one installation.
+VOLTAGE_CRITICAL_MV = 3300
+
 RECOVERY_ACTION_NAMES = {
     "serial_reconnect": "串口重连",
     "operator_reselect": "自动选择运营商",
@@ -503,7 +510,58 @@ class Gateway:
                 )
             else:
                 self.db.resolve_incident(fingerprint, detail="移动网络注册已恢复")
+        self._apply_supply_voltage(agent_id, frame)
         return device_change
+
+    def _apply_supply_voltage(self, agent_id: str, frame: dict[str, Any]) -> None:
+        """Open or resolve the low-supply incident for one status frame.
+
+        The threshold arrives in the frame rather than being configured here:
+        it is a property of the module's own supply, which only the Agent knows.
+        A frame that carries no reading is left alone — an older Agent, or a
+        firmware that refuses ``AT+CBC``, must not resolve a real incident by
+        being silent about it.
+        """
+        device = str(frame.get("device") or "")
+        voltage = _optional_int(frame.get("voltage_mv"))
+        threshold = _optional_int(frame.get("low_voltage_mv"))
+        if voltage is None or not threshold:
+            return
+
+        fingerprint = f"supply-voltage:{agent_id}:{device}"
+        if frame.get("online") is False:
+            # The last reading before the module went away is not evidence about
+            # now, and an offline module cannot produce a new one to clear this.
+            self.db.resolve_incident(
+                fingerprint, detail="模块已离线，供电状态由掉线事件跟踪"
+            )
+            return
+        if voltage >= threshold:
+            self.db.resolve_incident(
+                fingerprint, detail=f"供电已恢复至 {voltage} mV"
+            )
+            return
+
+        # Two levels, because they call for different responses: a little low is
+        # worth watching, while below the EC618's own floor the module can brown
+        # out mid-transmit and the symptom shows up as random unregistrations.
+        critical = voltage < VOLTAGE_CRITICAL_MV
+        self.db.open_incident(
+            fingerprint,
+            kind="device_supply_voltage",
+            severity="critical" if critical else "warning",
+            source=f"{agent_id}/{device}",
+            title="模块供电电压过低" if critical else "模块供电电压偏低",
+            detail=(
+                f"当前 {voltage} mV，低于阈值 {threshold} mV"
+                + (
+                    "；已低于模块标称下限，发送时可能掉电重启，"
+                    "表现为随机掉网。请检查供电与线材。"
+                    if critical
+                    else "。USB 线材或供电可能供流不足，建议更换。"
+                )
+            ),
+        )
 
     def _apply_log(self, agent_id: str, frame: dict[str, Any]) -> None:
         self.db.execute(

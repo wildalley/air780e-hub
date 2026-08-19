@@ -54,6 +54,7 @@ import {
   networkRegistrationStatus,
   radioStatus,
 } from '../deviceStatus'
+import { supplyVoltageStatus } from '../supplyVoltage'
 import { LIVE_MS } from '../swr'
 
 function deviceLabel(device: Device): string {
@@ -457,6 +458,11 @@ function DeviceDrawer({
     }
   }
 
+  // A healthy supply is just a number; an unhealthy one has to say so here,
+  // because this drawer is where someone looks after a module has been
+  // misbehaving and the reading alone would not explain why.
+  const supply = supplyVoltageStatus(device?.voltage_mv, device?.low_voltage_mv)
+
   const fields = device
     ? [
         ['模块名称', device.name],
@@ -472,6 +478,7 @@ function DeviceDrawer({
         ['电话号码', device.phone_number || '—'],
         ['运营商', device.operator || '—'],
         ['RSRP / RSRQ', device.rsrp != null ? `${device.rsrp} / ${device.rsrq ?? '—'}` : '—'],
+        ['供电电压', supply ? supply.reading : '—'],
         ['最后上报', formatTs(device.last_seen_at)],
       ]
     : []
@@ -518,6 +525,17 @@ function DeviceDrawer({
               </Box>
             ))}
           </Box>
+          {supply && supply.level !== 'normal' && (
+            <Alert
+              severity={supply.level === 'critical' ? 'error' : 'warning'}
+              sx={{ mt: 2.5 }}
+            >
+              {supply.label}
+              {supply.level === 'critical'
+                ? '，已低于模块标称下限。发送时可能掉电重启，表现为随机掉网，请检查供电与线材。'
+                : '，USB 线材或供电可能供流不足，建议更换。'}
+            </Alert>
+          )}
           <Divider sx={{ my: 2.5 }} />
           <Stack spacing={1.5}>
             <Typography variant="h3">运营商选择</Typography>

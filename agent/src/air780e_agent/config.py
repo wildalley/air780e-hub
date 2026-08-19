@@ -34,6 +34,11 @@ class DeviceConfig:
     label: str = ""
     baudrate: int = 115200
     delete_after_read: bool = True
+    # Warn below this supply voltage, in millivolts.  Per device rather than
+    # per agent because the modules need not share a supply: one on a bench PSU
+    # and one on a long USB run from a hub have different healthy ranges.
+    # 0 means "use the agent's built-in default".
+    low_voltage_mv: int = 0
 
     @property
     def is_pinned(self) -> bool:
@@ -167,6 +172,7 @@ class AgentConfig:
                     label=str(entry.get("label", "")),
                     baudrate=int(entry.get("baudrate", 115200)),
                     delete_after_read=bool(entry.get("delete_after_read", True)),
+                    low_voltage_mv=int(entry.get("low_voltage_mv", 0)),
                 )
             )
 
@@ -213,6 +219,8 @@ token = "change-me"
 name = "modem-a"
 label = "SIM A"
 imei = "000000000000001"
+# Warn below this supply voltage in millivolts; omit to use the default.
+# low_voltage_mv = 3500
 
 [[devices]]
 name = "modem-b"

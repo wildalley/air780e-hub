@@ -702,6 +702,68 @@ def test_v7_upgrade_adds_modem_diagnostics_and_keeps_devices(tmp_path):
         snapshot.close()
 
 
+def test_v9_upgrade_adds_the_supply_voltage_columns_and_keeps_devices(tmp_path):
+    path = tmp_path / "hub.db"
+    database = Database(path)
+    device_id = database.upsert_device(
+        "agent-a",
+        {
+            "name": "a",
+            "model": "AirM2M_780EPV",
+            "registered": True,
+            "voltage_mv": 3968,
+            "low_voltage_mv": 3500,
+        },
+    )
+    database.record_status(
+        device_id,
+        {"ts": utcnow(), "online": True, "registered": True, "voltage_mv": 3968},
+    )
+    database.close()
+
+    connection = sqlite3.connect(path)
+    try:
+        for table, column in (
+            ("devices", "voltage_mv"),
+            ("devices", "low_voltage_mv"),
+            ("device_status", "voltage_mv"),
+        ):
+            connection.execute(f"ALTER TABLE {table} DROP COLUMN {column}")
+        connection.execute("PRAGMA user_version = 8")
+        connection.commit()
+    finally:
+        connection.close()
+
+    database = Database(path)
+    try:
+        assert _user_version(path) == SCHEMA_VERSION
+        device_columns = {
+            row["name"] for row in database.query("PRAGMA table_info(devices)")
+        }
+        assert {"voltage_mv", "low_voltage_mv"} <= device_columns
+        status_columns = {
+            row["name"] for row in database.query("PRAGMA table_info(device_status)")
+        }
+        assert "voltage_mv" in status_columns
+        # The rows survive; the readings themselves were dropped with the
+        # columns, so they come back NULL rather than wrong.
+        assert database.one("SELECT name, voltage_mv FROM devices") == {
+            "name": "a",
+            "voltage_mv": None,
+        }
+        assert database.one("SELECT COUNT(*) AS n FROM device_status") == {"n": 1}
+    finally:
+        database.close()
+
+    snapshot = sqlite3.connect(path.with_name(f"{path.name}.v8.bak"))
+    try:
+        columns = {row[1] for row in snapshot.execute("PRAGMA table_info(devices)")}
+        assert "voltage_mv" not in columns
+        assert "low_voltage_mv" not in columns
+    finally:
+        snapshot.close()
+
+
 def test_message_read_paths_use_the_new_indexes(tmp_path):
     database = Database(tmp_path / "hub.db")
     try:

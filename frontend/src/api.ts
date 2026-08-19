@@ -116,6 +116,10 @@ export interface Device {
   rsrq: number | null
   storage_used: number
   storage_cap: number
+  // Supply voltage in millivolts, and the threshold the Agent judges it by.
+  // Both null when the firmware refuses AT+CBC or the Agent predates the field.
+  voltage_mv?: number | null
+  low_voltage_mv?: number | null
   last_seen_at: string | null
   iccid?: string
   sim_label?: string
@@ -224,6 +228,7 @@ export interface StatusPoint {
   rsrq: number | null
   storage_used: number | null
   storage_cap: number | null
+  voltage_mv?: number | null
 }
 
 export interface Overview {

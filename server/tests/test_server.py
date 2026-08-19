@@ -897,25 +897,28 @@ def test_history_collapses_a_long_window_into_buckets(admin):
     assert 0 < len(points) <= 2, f"12 samples collapsed to {len(points)} points"
 
 
-def test_history_bucket_keeps_an_outage_and_the_storage_peak(admin):
+def test_history_bucket_keeps_an_outage_a_storage_peak_and_a_voltage_dip(admin):
     """Aggregation must not smooth away the things an operator looks for.
 
-    A module that dropped out inside a bucket has to read as down, and storage
-    has to read as its high-water mark — an average would hide both.
+    A module that dropped out inside a bucket has to read as down, storage has
+    to read as its high-water mark, and the supply has to read as its dip — an
+    average would hide all three.  Each metric's aggregate is chosen for the
+    direction its fault lies in, which is why they are not all the same.
     """
     with _connect(admin) as ws:
         _greet(ws)
         samples = [
-            (1, True, True, 10),
-            (2, False, False, 90),   # the outage, and the storage peak
-            (3, True, True, 20),
+            (1, True, True, 10, 3968),
+            (2, False, False, 90, 3210),  # the outage, storage peak, brown-out
+            (3, True, True, 20, 3971),
         ]
-        for seq, online, registered, used in samples:
+        for seq, online, registered, used, voltage in samples:
             ws.send_json({
                 "type": "status", "seq": seq, "device": "a",
                 "online": online, "registered": registered,
                 "rssi": 20, "dbm": -70, "bars": 3,
                 "storage_used": used, "storage_capacity": 100,
+                "voltage_mv": voltage,
                 "ts": _minutes_ago(seq),
             })
             ws.receive_json()
@@ -927,6 +930,7 @@ def test_history_bucket_keeps_an_outage_and_the_storage_peak(admin):
     assert collapsed["online"] == 0, "an outage inside the bucket must survive"
     assert collapsed["registered"] == 0
     assert collapsed["storage_used"] == 90, "storage must read as the peak"
+    assert collapsed["voltage_mv"] == 3210, "a brown-out must read as the dip"
 
 
 def test_history_window_respects_offset_timestamps(admin):
@@ -1711,6 +1715,130 @@ def test_radio_on_but_unregistered_still_opens_a_network_incident(admin):
 
     incidents = _items(admin.get("/api/operations/incidents?status=open"))
     assert any(i["kind"] == "network_unregistered" for i in incidents)
+
+
+def test_supply_voltage_incident_warns_escalates_and_resolves(admin):
+    """The threshold arrives in the frame, and severity has two levels.
+
+    A little low is worth watching; below the module's own nominal floor a
+    transmit burst can brown it out, and the symptom presents as random
+    unregistrations rather than as a power problem — so it reads as critical.
+    """
+    with _connect(admin) as ws:
+        _greet(ws)
+        ws.send_json({
+            "type": "status", "seq": 1, "device": "a", "online": True,
+            "registered": True, "voltage_mv": 3968, "low_voltage_mv": 3500,
+            "ts": _minutes_ago(3),
+        })
+        assert ws.receive_json() == {"type": "ack", "seq": 1}
+        assert not any(
+            i["kind"] == "device_supply_voltage"
+            for i in _items(admin.get("/api/operations/incidents?status=open"))
+        )
+
+        ws.send_json({
+            "type": "status", "seq": 2, "device": "a", "online": True,
+            "registered": True, "voltage_mv": 3420, "low_voltage_mv": 3500,
+            "ts": _minutes_ago(2),
+        })
+        assert ws.receive_json() == {"type": "ack", "seq": 2}
+        incident = next(
+            i for i in _items(admin.get("/api/operations/incidents?status=open"))
+            if i["kind"] == "device_supply_voltage"
+        )
+        assert incident["severity"] == "warning"
+        assert "3420" in incident["detail"]
+        assert "3500" in incident["detail"]
+
+        ws.send_json({
+            "type": "status", "seq": 3, "device": "a", "online": True,
+            "registered": True, "voltage_mv": 3180, "low_voltage_mv": 3500,
+            "ts": _minutes_ago(1),
+        })
+        assert ws.receive_json() == {"type": "ack", "seq": 3}
+        incident = next(
+            i for i in _items(admin.get("/api/operations/incidents?status=open"))
+            if i["kind"] == "device_supply_voltage"
+        )
+        assert incident["severity"] == "critical"
+        assert "随机掉网" in incident["detail"]
+
+        ws.send_json({
+            "type": "status", "seq": 4, "device": "a", "online": True,
+            "registered": True, "voltage_mv": 3960, "low_voltage_mv": 3500,
+            "ts": _minutes_ago(0),
+        })
+        assert ws.receive_json() == {"type": "ack", "seq": 4}
+
+    assert not any(
+        i["kind"] == "device_supply_voltage"
+        for i in _items(admin.get("/api/operations/incidents?status=open"))
+    )
+    device = next(d for d in admin.get("/api/devices").json() if d["name"] == "a")
+    assert device["voltage_mv"] == 3960
+    assert device["low_voltage_mv"] == 3500
+
+
+def test_a_frame_without_a_voltage_leaves_the_supply_incident_alone(admin):
+    """Silence is not evidence of recovery.
+
+    An Agent too old to send the field, and a firmware that refuses ``AT+CBC``,
+    both look like a frame with no reading — neither should close a real
+    incident.  An offline module resolves it instead, because its last reading
+    says nothing about now and it cannot produce a new one to clear this with.
+    """
+    with _connect(admin) as ws:
+        _greet(ws)
+        ws.send_json({
+            "type": "status", "seq": 1, "device": "a", "online": True,
+            "registered": True, "voltage_mv": 3150, "low_voltage_mv": 3500,
+            "ts": _minutes_ago(2),
+        })
+        assert ws.receive_json() == {"type": "ack", "seq": 1}
+
+        ws.send_json({
+            "type": "status", "seq": 2, "device": "a", "online": True,
+            "registered": True, "rssi": 20, "ts": _minutes_ago(1),
+        })
+        assert ws.receive_json() == {"type": "ack", "seq": 2}
+        assert any(
+            i["kind"] == "device_supply_voltage"
+            for i in _items(admin.get("/api/operations/incidents?status=open"))
+        ), "a frame carrying no reading must not resolve the incident"
+
+        ws.send_json({
+            "type": "status", "seq": 3, "device": "a", "online": False,
+            "voltage_mv": 3150, "low_voltage_mv": 3500, "ts": _minutes_ago(0),
+        })
+        assert ws.receive_json() == {"type": "ack", "seq": 3}
+
+    assert not any(
+        i["kind"] == "device_supply_voltage"
+        for i in _items(admin.get("/api/operations/incidents?status=open"))
+    ), "an offline module's supply is tracked by the offline incident instead"
+
+
+def test_a_reading_without_a_threshold_is_stored_but_not_judged(admin):
+    """No threshold configured means no opinion, not a default one.
+
+    The number that counts as low belongs to the module's own supply, which only
+    the Agent knows; inventing one here would second-guess the operator.
+    """
+    with _connect(admin) as ws:
+        _greet(ws)
+        ws.send_json({
+            "type": "status", "seq": 1, "device": "a", "online": True,
+            "registered": True, "voltage_mv": 3100, "ts": _minutes_ago(1),
+        })
+        assert ws.receive_json() == {"type": "ack", "seq": 1}
+
+    device = next(d for d in admin.get("/api/devices").json() if d["name"] == "a")
+    assert device["voltage_mv"] == 3100
+    assert not any(
+        i["kind"] == "device_supply_voltage"
+        for i in _items(admin.get("/api/operations/incidents?status=open"))
+    )
 
 
 def test_overview_carries_the_sim_label(admin):

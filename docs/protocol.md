@@ -178,12 +178,24 @@ Agent 通过 `AT+CNMI=2,1,0,1,0` 接收 `+CDS`，解码 SMS-STATUS-REPORT 后持
   "rsrp": 55,
   "rsrq": 20,
   "storage_used": 0,
-  "storage_capacity": 50
+  "storage_capacity": 50,
+  "voltage_mv": 3968,
+  "low_voltage_mv": 3500
 }
 ```
 
 采样周期默认 60 秒。EPS、CS 或 IMS 注册域变化会立即使本次采样值得上报。
-**变化不大时不上报**(rssi 变动 < 2 且其余字段不变则跳过),避免信号曲线被噪声灌满。
+**变化不大时不上报**(rssi 变动 < 2、供电变动 < 50 mV 且其余字段不变则跳过),
+避免信号曲线被噪声灌满。供电**跨过阈值**不受这 50 mV 限制:那一个样本是告警的边沿,
+不能等最长 15 分钟的心跳。
+
+`voltage_mv` 是模块供电电压(`AT+CBC`),取不到时为 `null` —— 固件拒答与旧版 Agent
+在 Server 看来一样,都不会去动已有的供电告警,沉默不算恢复。`low_voltage_mv` 是判定
+下限,**由 Agent 随帧带上**而不是 Server 自己配:多低算低是这块模块供电方式的属性
+(实验室电源与经 hub 的长 USB 线不是一个健康区间),只有 Agent 的 `low_voltage_mv`
+配置知道。Server 只负责判定,不保存第二份默认值,免得两边对同一个电压有不同意见。
+低于阈值开 `device_supply_voltage` 告警,低于 3300 mV 升为 critical —— 到那儿模块还能
+跑,但一次发送突发就可能掉电重启,现象是随机掉网而不像供电问题。
 
 ### `task_result` —— 保号任务执行结果
 

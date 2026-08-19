@@ -82,6 +82,11 @@ def history_bucket_seconds(hours: int) -> int:
 #                   point, which is the one thing an operations view must not do.
 #   storage         MAX — a high-water mark.  Storage matters when it is nearly
 #                   full, and the peak is what says so; a mean would hide it.
+#   voltage         MIN — a low-water mark, for the same reason inverted.  The
+#                   supply matters when it sags, and a sag is brief by nature:
+#                   a transmit burst that pulls the module down for two seconds
+#                   is exactly the event being looked for, and an average over
+#                   half an hour would report it as a perfectly healthy supply.
 HISTORY_AGGREGATES = (
     ("online", "MIN({c})"),
     ("registered", "MIN({c})"),
@@ -92,6 +97,7 @@ HISTORY_AGGREGATES = (
     ("rsrq", "CAST(ROUND(AVG({c})) AS INTEGER)"),
     ("storage_used", "MAX({c})"),
     ("storage_cap", "MAX({c})"),
+    ("voltage_mv", "MIN({c})"),
 )
 
 

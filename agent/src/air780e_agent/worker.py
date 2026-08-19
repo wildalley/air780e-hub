@@ -35,6 +35,15 @@ ClockCallback = Callable[[], float]
 
 # Below this change in +CSQ a sample is not worth a row in the graph.
 RSSI_NOISE_FLOOR = 2
+# Same idea for the supply reading, which wanders by single millivolts between
+# polls even on a steady supply.  Measured spread on two idle V1011 modules was
+# under 30 mV, so a 50 mV step is movement rather than noise.
+VOLTAGE_NOISE_MV = 50
+# A module fed from USB sits near 4.0 V; the EC618 datasheet floor is 3.3 V.
+# Below this the module still runs but a transmit burst can brown it out, which
+# looks like random unregistrations rather than a power problem — which is the
+# whole reason for reporting the voltage at all.
+VOLTAGE_LOW_MV = 3500
 # Re-send an unchanged status at least this often, so "still alive" is visible.
 STATUS_HEARTBEAT = 900.0
 # Registration actions are counted in a rolling window and persisted locally,
@@ -77,6 +86,9 @@ class DeviceState:
     signal: Signal = field(default_factory=Signal)
     storage_used: int = 0
     storage_capacity: int = 0
+    # Supply voltage in millivolts, None while the module has not answered
+    # AT+CBC or answered in a shape the parser does not trust.
+    voltage_mv: int | None = None
     last_error: str = ""
 
     def describe(self) -> dict[str, Any]:
@@ -101,6 +113,7 @@ class DeviceState:
             "rsrq": self.signal.rsrq,
             "storage_used": self.storage_used,
             "storage_capacity": self.storage_capacity,
+            "voltage_mv": self.voltage_mv,
         }
 
 
@@ -686,6 +699,7 @@ class DeviceWorker:
         modem.info.ims_registered = self.state.ims_registered
         await self._maybe_recover_registration(modem)
         self.state.signal = await modem.read_signal()
+        self.state.voltage_mv = await modem.read_voltage()
         used, capacity = await modem.storage_usage()
         self.state.storage_used = used
         self.state.storage_capacity = capacity
@@ -709,6 +723,12 @@ class DeviceWorker:
             "device": self.name,
             "ts": _now(),
             "port": self._port or self.config.port,
+            # The threshold travels with the reading so the Server never keeps a
+            # second copy of the default: the voltage that counts as low is a
+            # property of this module's supply, which only the Agent's config
+            # knows.  Sent even when the reading is None, so the Server can say
+            # what it was comparing against.
+            "low_voltage_mv": self._low_voltage_threshold,
             **self.state.describe(),
         }
         if not force and not self._status_worth_sending(payload):
@@ -739,12 +759,42 @@ class DeviceWorker:
             if previous.get(key) != payload.get(key):
                 return True
 
-        old, new = previous.get("rssi"), payload.get("rssi")
+        if self._metric_changed(previous, payload, "rssi", RSSI_NOISE_FLOOR):
+            return True
+        # A supply reading wanders by a few millivolts between polls, so an
+        # exact comparison would make every single poll "worth sending" and
+        # defeat the whole filter.  Crossing the alert threshold is exempt from
+        # the noise floor: that edge is the one sample that must not wait for
+        # the heartbeat.
+        if self._crossed_voltage_threshold(previous, payload):
+            return True
+        return self._metric_changed(previous, payload, "voltage_mv", VOLTAGE_NOISE_MV)
+
+    @staticmethod
+    def _metric_changed(
+        previous: dict[str, Any], payload: dict[str, Any], key: str, floor: int
+    ) -> bool:
+        """True when *key* moved by at least *floor*, or appeared/disappeared."""
+        old, new = previous.get(key), payload.get(key)
         if (old is None) != (new is None):
             return True
-        if old is not None and new is not None:
-            return abs(old - new) >= RSSI_NOISE_FLOOR
-        return False
+        if old is None or new is None:
+            return False
+        return abs(old - new) >= floor
+
+    @property
+    def _low_voltage_threshold(self) -> int:
+        """Millivolts below which this module's supply counts as low."""
+        return self.config.low_voltage_mv or VOLTAGE_LOW_MV
+
+    def _crossed_voltage_threshold(
+        self, previous: dict[str, Any], payload: dict[str, Any]
+    ) -> bool:
+        old, new = previous.get("voltage_mv"), payload.get("voltage_mv")
+        if old is None or new is None:
+            return False
+        threshold = self._low_voltage_threshold
+        return (old < threshold) != (new < threshold)
 
     # -- incoming ----------------------------------------------------------
 

@@ -48,7 +48,7 @@ log = logging.getLogger(__name__)
 # Never renumber or edit a released entry — a database that already ran it will
 # not run it again, so an edit only affects databases that have not, and the two
 # then disagree about what version N means.
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # Persisted (settings table) key for the SMS retention window, in days.  The
 # operator edits it on the Notify page; when unset the env default applies.
@@ -141,6 +141,12 @@ CREATE TABLE IF NOT EXISTS devices (
     rsrq         INTEGER,
     storage_used INTEGER NOT NULL DEFAULT 0,
     storage_cap  INTEGER NOT NULL DEFAULT 0,
+    voltage_mv   INTEGER,
+    -- What this module's Agent considers a low supply, in millivolts.  Stored
+    -- alongside the reading because the threshold lives in the Agent's
+    -- per-device config: keeping a second default here would let the two
+    -- disagree about whether the same voltage is a problem.
+    low_voltage_mv INTEGER,
     last_seen_at TEXT,
     UNIQUE (agent_id, name)
 );
@@ -220,7 +226,8 @@ CREATE TABLE IF NOT EXISTS device_status (
     rsrp         INTEGER,
     rsrq         INTEGER,
     storage_used INTEGER,
-    storage_cap  INTEGER
+    storage_cap  INTEGER,
+    voltage_mv   INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_status_device_ts ON device_status(device_id, ts DESC);
 -- The dashboard reads every device at once, so it filters on ts alone and the
@@ -546,6 +553,8 @@ class Database:
          "_migration_message_conversation_index"),
         (8, "record modem firmware and registration domains",
          "_migration_modem_diagnostics"),
+        (9, "record module supply voltage and its low-voltage threshold",
+         "_migration_supply_voltage"),
     )
 
     def _add_columns_if_missing(self, table: str, columns: dict[str, str]) -> None:
@@ -668,6 +677,28 @@ class Database:
                 "hardware_model": "TEXT NOT NULL DEFAULT ''",
                 "firmware": "TEXT NOT NULL DEFAULT ''",
             },
+        )
+
+    def _migration_supply_voltage(self) -> None:
+        """v8 -> v9: keep the module supply voltage and the threshold it is judged by.
+
+        Both tables get the reading: ``devices`` answers "what is it now" for the
+        device page, ``device_status`` builds the trend, and a brown-out is only
+        recognisable as one from the trend.  ``low_voltage_mv`` is stored beside
+        the current reading because the threshold belongs to the module's supply
+        and lives in the Agent's config — without it the Server would have to
+        keep a second copy of the default and the two could disagree.
+        """
+        self._add_columns_if_missing(
+            "devices",
+            {
+                "voltage_mv": "INTEGER",
+                "low_voltage_mv": "INTEGER",
+            },
+        )
+        self._add_columns_if_missing(
+            "device_status",
+            {"voltage_mv": "INTEGER"},
         )
 
     def _snapshot_before_migration(self, from_version: int) -> Path | None:
@@ -1083,6 +1114,12 @@ class Database:
         "bars",
         "rsrp",
         "rsrq",
+        # Both may legitimately be NULL: a firmware that refuses AT+CBC has no
+        # reading to give, and writing NULL over a previous good one is right —
+        # "the module stopped answering" is not the same as the last value it
+        # happened to report.
+        "voltage_mv",
+        "low_voltage_mv",
     )
     # Identity fields.  A blank here always means "this frame didn't carry it",
     # never "the module lost its IMEI" — status frames are a subset of hello,
@@ -1179,8 +1216,8 @@ class Database:
         self.execute(
             "INSERT INTO device_status "
             "(device_id, ts, online, registered, rssi, dbm, bars, rsrp, rsrq, "
-            " storage_used, storage_cap) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " storage_used, storage_cap, voltage_mv) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 device_id,
                 to_utc_iso(payload.get("ts")),
@@ -1193,6 +1230,9 @@ class Database:
                 payload.get("rsrq"),
                 payload.get("storage_used"),
                 payload.get("storage_capacity"),
+                # The threshold is deliberately not stored per sample: it is
+                # configuration, not measurement, and it lives on `devices`.
+                payload.get("voltage_mv"),
             ),
         )
 

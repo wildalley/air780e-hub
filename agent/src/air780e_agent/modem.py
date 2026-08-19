@@ -68,6 +68,12 @@ CIREG_ENABLE = "AT+CIREG=1"  # IMS, optional and diagnostic only
 
 SEND_TIMEOUT = 60.0
 
+# Bounds a `+CBC` reading has to fall inside to be believed, in millivolts.
+# The module runs on a nominal 3.3-4.2V supply, so anything outside this is a
+# field this parser has misread rather than a real measurement — the `80` of a
+# `+CBC: 0,80` charge-percentage reply being the case that matters.
+VOLTAGE_PLAUSIBLE_MV = (2000, 6000)
+
 # A voice keep-alive dials, waits just long enough for the network to start
 # ringing the far end, then hangs up.  Long enough that the carrier books a
 # call attempt, short enough that nobody actually picks up — an answered call
@@ -781,6 +787,40 @@ class Air780E:
                 if parts[5].isdigit() and int(parts[5]) != 255:
                     signal.rsrp = int(parts[5])
         return signal
+
+    async def read_voltage(self) -> int | None:
+        """Supply voltage in millivolts, or ``None`` if the module will not say.
+
+        Two response shapes are in the wild and the field count tells them
+        apart.  GSM 27.007 defines ``+CBC: <bcs>,<bcl>,<voltage>``, while
+        Air780E ``V1011`` answers with the millivolt figure on its own
+        (``+CBC: 3968`` measured).  Reading by position would take the ``80``
+        of a ``0,80`` reply as 80 mV, so a value outside a plausible supply
+        range is discarded rather than reported.
+        """
+        try:
+            response = await self.client.execute("AT+CBC")
+        except ATError as exc:
+            log.debug("AT+CBC failed: %s", exc)
+            return None
+        value = response.first("+CBC:")
+        if value is None:
+            return None
+        numbers = [int(n) for n in re.findall(r"\d+", value)]
+        if not numbers:
+            return None
+        # One field is the voltage; three put it last.  Anything else is a
+        # shape this parser does not claim to know.
+        if len(numbers) == 1:
+            millivolts = numbers[0]
+        elif len(numbers) >= 3:
+            millivolts = numbers[2]
+        else:
+            return None
+        if not VOLTAGE_PLAUSIBLE_MV[0] <= millivolts <= VOLTAGE_PLAUSIBLE_MV[1]:
+            log.debug("ignoring implausible +CBC voltage: %s", value)
+            return None
+        return millivolts
 
     async def storage_usage(self) -> tuple[int, int]:
         """(used, capacity) for the active message store."""
