@@ -14,12 +14,14 @@ from .codec import (
     encode_submit,
 )
 from .concat import Reassembler
+from .salvage import Salvage
 
 __all__ = [
     "Concat",
     "DecodedSms",
     "EncodedPdu",
     "PduError",
+    "Salvage",
     "StatusReport",
     "Reassembler",
     "alphabet_from_dcs",

@@ -18,7 +18,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
-from . import gsm7
+from . import gsm7, salvage
 
 # Payload ceilings per segment, from TS 23.040 §9.2.3.24.
 MAX_GSM7_SINGLE = 160
@@ -68,6 +68,17 @@ class DecodedSms:
     status_report_requested: bool = False
     #: TP-PID, retained so operator-specific empty control messages stay data.
     pid: int = 0
+    #: The frame reached us with octets missing, so ``text`` is not the
+    #: message: the header fields it was decoded under are not those fields.
+    truncated: bool = False
+    #: Best-effort re-phasing of a truncated frame — a fragment of the middle
+    #: of the message, never the whole of it.  Empty when nothing recovered
+    #: was worth showing.  See :mod:`.salvage`.
+    recovered_text: str = ""
+    #: Code-shaped digits found in ``recovered_text``.  Empty on a truncated
+    #: frame means "no code survived", which is not the same as "no code sent"
+    #: — the head this decoder cannot recover is where a code usually sits.
+    code: str = ""
 
     @property
     def is_multipart(self) -> bool:
@@ -75,7 +86,7 @@ class DecodedSms:
 
     @property
     def is_binary(self) -> bool:
-        """True when this carries data rather than a message for a person.
+        """True when ``text`` must not be shown to a person as it stands.
 
         Any of these independent signals is enough:
 
@@ -84,17 +95,23 @@ class DecodedSms:
           (OTA provisioning, WAP push, SIM toolkit), not to the inbox;
         * a structurally invalid UDH — its payload boundary cannot be trusted,
           so rendering the remaining octets as text only produces mojibake;
+        * a truncated frame — ``text`` was decoded under header fields that
+          are really message body, so it is mojibake for the same reason.
+          What is readable of such a message is in ``recovered_text``, and it
+          is a fragment;
         * an empty service-centre-specific TP-PID message — an operator control
           frame with no text to show or forward.
 
-        Worth surfacing because such a payload decoded as text becomes a wall of
-        mojibake in a conversation.  ``text`` is still whatever the decode
-        produced; the caller decides whether to show it.
+        The name is older than the last two entries and undersells it: what
+        these share is not that the payload is data, but that decoding it as
+        text produced something no reader should be handed.  ``text`` is still
+        whatever the decode produced; the caller decides whether to show it.
         """
         return (
             self.alphabet == "8bit"
             or self.ports is not None
             or self.udh_malformed
+            or self.truncated
             or (not self.text and self.pid >= 0xC0)
         )
 
@@ -156,6 +173,9 @@ class _Reader:
     def byte(self) -> int:
         return self.take(1)[0]
 
+    def tell(self) -> int:
+        return self._pos
+
     def rest(self) -> bytes:
         chunk = self._data[self._pos :]
         self._pos = len(self._data)
@@ -199,18 +219,28 @@ def alphabet_from_dcs(dcs: int) -> str:
     return {0: "gsm7", 1: "8bit", 2: "ucs2"}.get(coding, "gsm7")
 
 
-def _decode_address(reader: _Reader) -> str:
+def _decode_address(reader: _Reader) -> tuple[str, int]:
+    """Decode an address field, returning it with its type-of-address octet.
+
+    The caller needs the TOA as well as the text: an alphanumeric address is
+    the one place a sender name can appear, and that is half the signature of
+    the truncation this decoder has to recognise.
+    """
     length = reader.byte()  # in semi-octets (digits), not bytes
     if length == 0:
-        return ""
+        return "", 0
     toa = reader.byte()
     octets = reader.take((length + 1) // 2)
     if (toa & 0x70) == 0x50:
         # Alphanumeric address (e.g. a bank's short name) packed as GSM 7-bit.
         septet_count = (length * 4) // 7
-        return gsm7.decode(gsm7.unpack(octets, septet_count))
+        return gsm7.decode(gsm7.unpack(octets, septet_count)), toa
     digits = _decode_digits(octets, length)
-    return ("+" + digits) if (toa & 0x70) == 0x10 else digits
+    return (("+" + digits) if (toa & 0x70) == 0x10 else digits), toa
+
+
+def _is_alphanumeric(toa: int) -> bool:
+    return (toa & 0x70) == 0x50
 
 
 def _encode_address(number: str) -> bytes:
@@ -374,7 +404,10 @@ def decode_pdu(pdu_hex: str) -> DecodedSms:
     status_report_requested = False
 
     if mti == MTI_DELIVER:
-        address = _decode_address(reader)
+        address, toa = _decode_address(reader)
+        # Everything from here on is suspect if the frame turns out truncated:
+        # remember where the header claims to start.
+        body_start = reader.tell()
         pid = reader.byte()
         dcs = reader.byte()
         timestamp = _decode_scts(reader.take(7))
@@ -382,7 +415,8 @@ def decode_pdu(pdu_hex: str) -> DecodedSms:
     elif mti == MTI_SUBMIT:
         status_report_requested = bool(first & 0x20)
         reader.byte()  # TP-MR
-        address = _decode_address(reader)
+        address, toa = _decode_address(reader)
+        body_start = None
         pid = reader.byte()
         dcs = reader.byte()
         vpf = (first >> 3) & 0x03
@@ -400,6 +434,16 @@ def decode_pdu(pdu_hex: str) -> DecodedSms:
         reader.rest(), udl, dcs, has_udh
     )
 
+    # A deliver whose TP-SCTS is not a real date reached us damaged: the field
+    # is mandatory and fixed-width, so a conformant network cannot produce one
+    # that fails to parse.  Every such frame we have captured also had an
+    # alphanumeric sender, and no numeric-sender frame has ever shown the
+    # fault, so the bypass stays behind both signals rather than the one.
+    # Nothing above this line is reconsidered — ``text`` keeps whatever the
+    # spec-conformant decode made of it, and a healthy PDU cannot get here.
+    truncated = kind == "deliver" and _is_alphanumeric(toa) and timestamp is None
+    recovered = salvage.recover(data[body_start:]) if truncated else salvage.Salvage()
+
     return DecodedSms(
         kind=kind,
         address=address,
@@ -414,6 +458,9 @@ def decode_pdu(pdu_hex: str) -> DecodedSms:
         udh_malformed=udh_malformed,
         status_report_requested=status_report_requested,
         pid=pid,
+        truncated=truncated,
+        recovered_text=recovered.text,
+        code=recovered.code,
     )
 
 
@@ -434,7 +481,7 @@ def decode_status_report(pdu_hex: str) -> StatusReport:
             f"(first octet 0x{first:02X})"
         )
     message_reference = reader.byte()
-    recipient = _decode_address(reader)
+    recipient, _ = _decode_address(reader)
     service_center_timestamp = _decode_scts(reader.take(7))
     discharge_time = _decode_scts(reader.take(7))
     status = reader.byte()

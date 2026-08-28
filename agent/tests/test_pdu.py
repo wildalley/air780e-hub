@@ -8,6 +8,7 @@ a change to packing, splitting or alignment shows up immediately.
 from __future__ import annotations
 
 import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -21,8 +22,9 @@ from air780e_agent.pdu import (
     encode_status_report,
     encode_submit,
     gsm7,
+    salvage,
 )
-from air780e_agent.pdu.codec import _decode_ucs2
+from air780e_agent.pdu.codec import _decode_ucs2, _encode_address, _encode_scts
 
 # A textbook SMS-DELIVER: "How are you?" from +31641600986.
 DELIVER_HOW_ARE_YOU = (
@@ -30,32 +32,107 @@ DELIVER_HOW_ARE_YOU = (
     "0000208062917314080CC8F71D14969741F977FD07"
 )
 
-# Three giffgaff data messages seen on a real modem.  Each claims GSM-7 text and
-# sets TP-UDHI, but its first information element runs past the declared header.
-# Treating bytes after that untrustworthy boundary as text is what produced the
-# visible wall of mojibake.
-DELIVER_GIFFGAFF_MALFORMED_UDH = (
+# Frames captured from a real modem with octets missing between the
+# originating address and the user data.  They are kept exactly as received,
+# trailing zero padding and all.
+#
+# Each has an alphanumeric sender and a TP-SCTS that is not a date, because
+# the "SCTS" is really message body: the fields the decoder reads at their
+# nominal offsets are all shifted.  Decoding them to the letter of the spec
+# therefore yields mojibake, and the readable middle only comes back by
+# re-phasing the 7-bit stream.
+#
+# The giffgaff four were once read as *data* messages, on the strength of the
+# invalid UDH that the shifted read reports.  Re-phasing shows what they are:
+# ordinary English roaming notices, hit by the same truncation as the
+# verification codes.  The UDH those tests keyed on was never a UDH.
+DELIVER_TRUNCATED_KRAKEN = (
+    (
+        "0791448720003023240BD04B79785D7603B21B642FCBD3E6F4384C4FBFDDA0F19B5C06A5E73AD0EC"
+        "46C3D9722E10F1ED3ED1417374585E06D1D1E93968FC269741F7341D0D0ABBF36F7779077AD7E5A0"
+        "721BCE7EE7CBE539E89E66B341EEB2BD2C0785E76B90F9",
+        "374869",
+    ),
+    (
+        "0791448720003023240BD04B79785D7603B21B642FCBD3E6F4384C4FBFDDA0F19B5C06A5E73A90CD"
+        "76C3E1622E10F1ED3ED1417374585E06D1D1E93968FC269741F7341D0D0ABBF36F7779077AD7E5A0"
+        "721BCE7EE7CBE539E89E66B341EEB2BD2C0785E76B90F9",
+        "667881",
+    ),
+)
+
+# The same fault, but the octets that went missing took the code with them.
+# What survives reads like a whole sentence — which is exactly why it must not
+# be shown as one.
+DELIVER_TRUNCATED_GITHUB = (
+    "0791448720003023240BD0E7341D5D170350F65D97838E693AB22E0685EB7474D94D4F8FC3F4F4DB0D"
+    "9A97E9753868FC26975D"
+)
+
+# Roaming notices from giffgaff, paired with a phrase from the recoverable
+# middle of each.
+DELIVER_TRUNCATED_GIFFGAFF = (
     (
         "0791448720003023440ED0E7B4D97C0E9BCDCF0016A81D7687CF65A01C5E7693D3EE330B34BFA7E9"
         "6334C8FDA6A7CDE971989E7EBBE7A0B7FBC0369B416F39885E97BB41F277B89D769F416FB3199476"
         "83F2EFBA1C141E8FDF75375D073AA7CD66173BFF2287E768F13B2C272B144374B92C9FBB40D3B0B9"
         "0CA2CBC3F6327BEE0200000000000000000000000000000000000000000000000000000000000000"
-        "0000000000000000"
+        "0000000000000000",
+        "turn roaming off in your account: giff.ly/dashboard",
     ),
     (
         "0791448720003023400ED0E7B4D97C0E9BCDCD00D0DB0DAACFD3EE3328FFAECB4170F4DB5D0685C5"
-        "F27798CC02CDCB747ADA7D06CDE1653739ED3E83C661F89C050ABBC9203ABA0C12"
+        "F27798CC02CDCB747ADA7D06CDE1653739ED3E83C661F89C050ABBC9203ABA0C12",
+        "on using your phone abroad, setting spending caps",
     ),
     (
         "0791448720003023640ED0E7B4D97C0E9BCD59007B993D7EB7CB20A01B3444A7DD6117A8195E9741"
         "F3BABC0CCABFEB7250783C7ED7DD74507A0E4ABB416379999CA683E86F507D5E06C9DFE176DA7D06"
         "CDCB727B7A5C9E83D06579D905CABEEBA0F1BBCE2683C2ECF91B24AEE74161105D1EB697D9207298"
         "1E0685C9E4D6DB0D4ABB417474191486C341F437A83E2F83E8000000000000000000000000000000"
-        "0000000000000000"
+        "0000000000000000",
+        "Make sure your account is in credit to use roaming services",
     ),
 )
 
-DELIVER_GIFFGAFF_EMPTY = "0791448720003023000ED0E7B4D97C0E9BCDDD00BA0E740E9BCD2E00"
+# The fourth giffgaff frame: 28 octets, and the modem's own TP-UDL lands on
+# zero.  It was read as an empty operator control message, on a TP-PID that is
+# body like everything else after the sender.  Ten octets of a roaming notice
+# is not enough to recover anything worth showing.
+DELIVER_TRUNCATED_GIFFGAFF_FRAGMENT = (
+    "0791448720003023000ED0E7B4D97C0E9BCDDD00BA0E740E9BCD2E00"
+)
+
+_SMSC_HEX = "0791448720003023"  # +447802003032, the centre in every capture
+_WHEN = datetime(2026, 8, 18, 9, 30, 15, tzinfo=timezone(timedelta(hours=1)))
+
+
+def _alphanumeric_oa(name: str) -> bytes:
+    """An originating-address field carrying a sender name, as a network sends."""
+    septets = gsm7.encode(name)
+    # The length is in semi-octets of packed 7-bit data, not in characters.
+    return bytes([-(-len(septets) * 7 // 4), 0xD0]) + gsm7.pack(septets)
+
+
+def _build_deliver(
+    oa: bytes,
+    *,
+    first: int = 0x04,
+    pid: int = 0x00,
+    dcs: int = 0x00,
+    body: bytes = b"",
+    udl: int | None = None,
+) -> str:
+    """A well-formed SMS-DELIVER around whatever fields a test wants to vary."""
+    tpdu = (
+        bytes([first])
+        + oa
+        + bytes([pid, dcs])
+        + _encode_scts(_WHEN)
+        + bytes([len(body) if udl is None else udl])
+        + body
+    )
+    return (_SMSC_HEX + tpdu.hex()).upper()
 
 
 # --------------------------------------------------------------------------
@@ -144,25 +221,176 @@ def test_alphabet_from_dcs():
     assert alphabet_from_dcs(0xF4) == "8bit"
 
 
-@pytest.mark.parametrize("pdu", DELIVER_GIFFGAFF_MALFORMED_UDH)
-def test_malformed_udh_is_treated_as_binary_instead_of_displaying_mojibake(pdu: str):
+# --------------------------------------------------------------------------
+# truncated frames and best-phase recovery
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("pdu,code", DELIVER_TRUNCATED_KRAKEN)
+def test_truncated_frame_gives_up_its_verification_code(pdu: str, code: str):
+    sms = decode_pdu(pdu)
+
+    assert sms.address == "Kraken"
+    assert sms.truncated
+    assert sms.code == code
+    assert "verification code is: " + code in sms.recovered_text
+    # The code is the point of the exercise, but the frame is still a fragment
+    # and nothing may present it otherwise.
+    assert sms.is_binary
+
+
+def test_truncated_frame_keeps_its_spec_conformant_decode_untouched():
+    # Recovery is a bypass, not a repair: what the letter of the spec made of
+    # these octets stays in `text`, so a later reading of the same capture is
+    # comparing like with like.
+    pdu, _ = DELIVER_TRUNCATED_KRAKEN[0]
+    sms = decode_pdu(pdu)
+
+    assert sms.dcs == 0x1B  # body read as TP-DCS: UCS-2, message class 3
+    assert sms.alphabet == "ucs2"
+    assert sms.timestamp is None
+    assert sms.text != sms.recovered_text
+    assert "374869" not in sms.text
+
+
+def test_truncated_frame_whose_code_was_in_the_lost_octets():
+    # Reads as a complete sentence and is not one: the code sat in the head the
+    # modem dropped.  Showing this as a normal body would say GitHub sent no
+    # code, so it stays in the salvage field with the frame marked damaged.
+    sms = decode_pdu(DELIVER_TRUNCATED_GITHUB)
+
+    assert sms.address == "github"
+    assert sms.truncated
+    assert sms.code == ""
+    assert sms.recovered_text == "Your GitHub authentication setup code."
+    assert sms.is_binary
+
+
+@pytest.mark.parametrize("pdu,phrase", DELIVER_TRUNCATED_GIFFGAFF)
+def test_truncated_roaming_notices_recover_as_english_text(pdu: str, phrase: str):
+    # Not data messages: English roaming notices caught by the truncation.
     sms = decode_pdu(pdu)
 
     assert sms.address == "giffgaff"
     assert sms.dcs == 0
-    assert sms.alphabet == "gsm7"
-    assert sms.udh_malformed
-    assert sms.is_binary
+    assert sms.truncated
+    assert phrase in sms.recovered_text
+    assert sms.code == ""  # a roaming notice carries no code to find
 
 
-def test_zero_length_giffgaff_control_message_is_treated_as_data():
-    sms = decode_pdu(DELIVER_GIFFGAFF_EMPTY)
+def test_truncated_fragment_too_short_to_recover_claims_nothing():
+    # Damaged is a fact about the frame; recovered is a claim about content.
+    # Ten octets support the first and not the second.
+    sms = decode_pdu(DELIVER_TRUNCATED_GIFFGAFF_FRAGMENT)
 
     assert sms.address == "giffgaff"
-    assert sms.dcs == 0
-    assert sms.pid == 0xDD
+    assert sms.truncated
+    assert sms.recovered_text == ""
+    assert sms.code == ""
+    assert sms.is_binary
+
+
+def test_healthy_alphanumeric_sender_is_not_touched_by_the_bypass():
+    # An alphanumeric sender is half the signature and must not be enough on
+    # its own, or every bank and courier message would route through salvage.
+    body = "Your Kraken verification code is: 374869. Do not share it."
+    septets = gsm7.encode(body)
+    pdu = _build_deliver(
+        _alphanumeric_oa("Kraken"), body=gsm7.pack(septets), udl=len(septets)
+    )
+    sms = decode_pdu(pdu)
+
+    assert sms.address == "Kraken"
+    assert sms.text == body
+    assert sms.timestamp == _WHEN
+    assert not sms.truncated
+    assert not sms.is_binary
+    # `code` belongs to the salvage path; a healthy message carries its own.
+    assert sms.recovered_text == ""
+    assert sms.code == ""
+
+
+def test_healthy_message_with_an_unreadable_body_is_not_called_truncated():
+    # Chinese scores badly on an English readability test, so nothing may hang
+    # on that score alone.  Class 3 UCS-2 (TP-DCS 0x1B) is the case the
+    # truncated frames imitate, and here it is genuine.
+    text = "验证码 8899,请勿泄露"
+    pdu = _build_deliver(
+        _encode_address("+8613800138000"), dcs=0x1B, body=text.encode("utf-16-be")
+    )
+    sms = decode_pdu(pdu)
+
+    assert sms.dcs == 0x1B
+    assert sms.alphabet == "ucs2"
+    assert sms.text == text
+    assert not sms.truncated
+    assert not sms.is_binary
+
+
+def test_genuinely_malformed_udh_is_still_treated_as_data():
+    # The signal the giffgaff frames were wrongly credited with, on a frame
+    # that really has it: a well-formed header whose UDHL overruns the body.
+    pdu = _build_deliver(
+        _encode_address("+8613800138000"),
+        first=0x04 | 0x40,  # TP-UDHI
+        body=bytes([0x20]) + b"short",
+        udl=6,
+    )
+    sms = decode_pdu(pdu)
+
+    assert sms.udh_malformed
+    assert sms.is_binary
+    assert not sms.truncated
+
+
+def test_empty_control_message_is_treated_as_data():
+    # An operator control frame: service-centre-specific TP-PID, no user data.
+    pdu = _build_deliver(_encode_address("+8613800138000"), pid=0xC0)
+    sms = decode_pdu(pdu)
+
+    assert sms.pid == 0xC0
     assert sms.text == ""
     assert sms.is_binary
+    assert not sms.truncated
+
+
+# --------------------------------------------------------------------------
+# recovery internals
+# --------------------------------------------------------------------------
+
+
+def test_readability_separates_a_real_phase_from_a_wrong_one():
+    # Both are printable ASCII; only one is a message.  Printability alone
+    # cannot choose between them, which is why the score weighs word shape.
+    assert salvage.readability("Your GitHub authentication setup code.") > 0.9
+    assert salvage.readability("Plw:9Pc4:d:1Pp::t27ztq0zt77Py2z:8Pq7r2") < 0.6
+
+
+def test_extract_code_ignores_digits_that_are_not_code_shaped():
+    assert salvage.extract_code("your code is 374869 today") == "374869"
+    assert salvage.extract_code("no digits here") == ""
+    # Code-shaped digits with nothing calling them a code: a phone number
+    # handed back as a verification code is a number someone would act on.
+    assert salvage.extract_code("call 020 7946 0018 at 9am") == ""
+
+
+def test_extract_code_prefers_the_run_nearest_the_word_code():
+    text = "Ref 90210447 for order 5567: your code is 374869"
+    assert salvage.extract_code(text) == "374869"
+    assert salvage.extract_code("374869 is your Kraken code") == "374869"
+
+
+def test_recover_declines_rather_than_invent_a_reading():
+    # Random octets have a best phase like anything else; it must not be
+    # dressed up as a recovery.
+    assert salvage.recover(bytes(range(40))).text == ""
+
+
+def test_recover_declines_on_too_few_characters_to_judge():
+    # "Code 8829" would score well on a ratio, and says nothing: seven octets
+    # read on the right phase look much like seven read on the wrong one.
+    short = gsm7.pack(gsm7.encode("Code 8829"))
+    assert salvage.recover(short).text == ""
 
 
 # --------------------------------------------------------------------------

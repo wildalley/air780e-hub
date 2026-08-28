@@ -46,6 +46,11 @@ class _Partial:
             ports=next((part.ports for part in ordered if part.ports is not None), None),
             udh_malformed=any(part.udh_malformed for part in ordered),
             pid=head.pid,
+            # One damaged segment damages the message: the join is missing
+            # whatever that segment was missing.
+            truncated=any(part.truncated for part in ordered),
+            recovered_text="".join(p.recovered_text for p in ordered),
+            code=next((part.code for part in ordered if part.code), ""),
         )
 
 
