@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import glob as globmodule
 import logging
+import os
 from collections.abc import Awaitable
 from dataclasses import dataclass
 from typing import Protocol
@@ -181,3 +182,49 @@ class PortRegistry:
 
     def release(self, port: str) -> None:
         self._claimed.pop(port, None)
+
+    async def survey(self, reserved: list[DeviceConfig]) -> list[ProbeResult]:
+        """Identify unclaimed modules that no configured device is waiting for.
+
+        This is the autodetect half of discovery, and it is deliberately the
+        mirror image of :meth:`acquire`: that one starts from a device block
+        and hunts for its module, this one starts from a module and asks
+        whether anybody has a claim on it.
+
+        A module is only reported when every ``reserved`` block would reject
+        it.  Adopting one that a configured device is merely waiting for —
+        unplugged at this moment, or still enumerating — would take the name
+        that device is entitled to and send keep-alive SMS from the wrong
+        card, which is the failure this module exists to prevent.
+
+        Ports named outright by a pinned device are skipped without probing.
+        Pinned workers bypass the registry, so their ports never appear in
+        ``_claimed``, and probing one would mean opening a tty another worker
+        already holds.
+
+        Probing does not claim: the caller decides what to adopt, and a port
+        left unadopted stays available to :meth:`acquire`.
+        """
+        # Resolved, because a pinned port is usually a udev symlink and the
+        # glob yields the tty it points at.
+        pinned = {
+            os.path.realpath(config.port)
+            for config in reserved
+            if config.is_pinned
+        }
+        async with self._lock:
+            found: list[ProbeResult] = []
+            for port in sorted(globmodule.glob(self.port_glob)):
+                if port in self._claimed or port in pinned:
+                    continue
+                result = await self._probe(port, timeout=self.probe_timeout)
+                if result is None:
+                    continue
+                if any(_matches(config, result) for config in reserved):
+                    log.debug(
+                        "survey: %s is spoken for by a configured device", port
+                    )
+                    continue
+                found.append(result)
+            return found
+

@@ -89,6 +89,14 @@ class AgentConfig:
     # port.  Every match is probed; the ones that do not speak AT drop out.
     port_glob: str = "/dev/ttyACM*"
     probe_timeout: float = 3.0
+    # Adopt a module that matches no [[devices]] block, under a name derived
+    # from its IMEI.  Only modules no configured device is waiting for are
+    # eligible, so this never competes with an explicit binding — it means
+    # "plug in a new module and it works" rather than "guess between two".
+    autodetect: bool = True
+    # How often to look for newly plugged modules.  Rescanning is three AT
+    # commands per unclaimed port, so this can stay in the tens of seconds.
+    autodetect_interval: float = 60.0
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> AgentConfig:
@@ -128,6 +136,8 @@ class AgentConfig:
             scheduler_retry_delay=float(agent.get("scheduler_retry_delay", 60.0)),
             port_glob=str(agent.get("port_glob", "/dev/ttyACM*")),
             probe_timeout=float(agent.get("probe_timeout", 3.0)),
+            autodetect=bool(agent.get("autodetect", True)),
+            autodetect_interval=float(agent.get("autodetect_interval", 60.0)),
         )
 
         server = data.get("server", {})
@@ -138,8 +148,10 @@ class AgentConfig:
         )
 
         devices = data.get("devices", [])
-        if not devices:
-            raise ConfigError("no [[devices]] configured — nothing to do")
+        if not devices and not config.autodetect:
+            raise ConfigError(
+                "no [[devices]] configured and autodetect is off — nothing to do"
+            )
 
         seen: set[str] = set()
         for entry in devices:
@@ -196,6 +208,12 @@ health_failure_threshold = 3
 registration_recovery_delay = 300.0
 recovery_cooldown = 300.0
 recovery_max_attempts_24h = 6
+# Adopt a module that no [[devices]] block below matches, under a name derived
+# from its IMEI (auto-372050).  A brand new module works as soon as it is
+# plugged in; the name is remembered, so it stays the same across restarts.
+# Set to false to accept only the modules named below.
+autodetect = true
+autodetect_interval = 60.0
 
 [server]
 # Leave url empty to run fully standalone (messages still stored locally,
@@ -207,6 +225,9 @@ token = "change-me"
 # they are (ATI / AT+CGSN / AT+ICCID) and claiming the port whose identity
 # matches — so it does not matter which USB socket a module is in, or how
 # /dev/ttyACM* happens to be numbered after a reboot.
+#
+# Blocks are optional when autodetect is on.  Name a module here to give it a
+# stable name and a label, or to hold its name while it is unplugged.
 #
 # Find the values with:  python -m air780e_agent.probe --scan
 #

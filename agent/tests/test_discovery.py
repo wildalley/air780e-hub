@@ -183,3 +183,117 @@ async def test_identity_comparison_ignores_case_and_padding(patched_glob):
         DeviceConfig(name="a", iccid="  8964052040035110800F  ")
     )
     assert port == "/dev/ttyACM0"
+
+
+# --------------------------------------------------------------------------
+# survey: the autodetect half, which starts from the module and asks whether
+# anybody has a claim on it
+# --------------------------------------------------------------------------
+
+
+async def test_survey_reports_a_module_nobody_configured(patched_glob):
+    patched_glob("/dev/ttyACM0")
+    registry = PortRegistry(prober=fake_world({
+        "/dev/ttyACM0": ("862323088372050", "8944110068802881339F"),
+    }))
+
+    found = await registry.survey([])
+    assert [r.imei for r in found] == ["862323088372050"]
+
+
+async def test_survey_leaves_a_configured_module_alone(patched_glob):
+    """The module is present and its device block is waiting for it: adopting
+    it would take the name that device is entitled to."""
+    patched_glob("/dev/ttyACM0")
+    registry = PortRegistry(prober=fake_world({
+        "/dev/ttyACM0": ("862323088372050", ""),
+    }))
+
+    assert await registry.survey([
+        DeviceConfig(name="b", imei="862323088372050")
+    ]) == []
+
+
+async def test_survey_reports_only_the_unconfigured_module(patched_glob):
+    patched_glob("/dev/ttyACM0", "/dev/ttyACM1")
+    registry = PortRegistry(prober=fake_world({
+        "/dev/ttyACM0": ("863304089655700", ""),
+        "/dev/ttyACM1": ("862323088372050", ""),
+    }))
+
+    found = await registry.survey([DeviceConfig(name="a", imei="863304089655700")])
+    assert [r.port for r in found] == ["/dev/ttyACM1"]
+
+
+async def test_survey_skips_ports_already_claimed(patched_glob):
+    patched_glob("/dev/ttyACM0", "/dev/ttyACM1")
+    prober = fake_world({
+        "/dev/ttyACM0": ("863304089655700", ""),
+        "/dev/ttyACM1": ("862323088372050", ""),
+    })
+    registry = PortRegistry(prober=prober)
+    await registry.acquire(DeviceConfig(name="a", imei="863304089655700"))
+
+    prober.seen.clear()
+    found = await registry.survey([DeviceConfig(name="a", imei="863304089655700")])
+    assert [r.port for r in found] == ["/dev/ttyACM1"]
+    # A port another worker owns must not even be opened: a second AT client on
+    # it would interleave with the first.
+    assert prober.seen == ["/dev/ttyACM1"]
+
+
+async def test_survey_does_not_open_a_pinned_port(patched_glob, monkeypatch):
+    """A pinned worker bypasses the registry, so its port is never in
+    ``_claimed`` — but it is very much in use."""
+    monkeypatch.setattr("air780e_agent.discovery.os.path.realpath", lambda p: p)
+    patched_glob("/dev/ttyACM0", "/dev/ttyACM1")
+    prober = fake_world({
+        "/dev/ttyACM0": ("863304089655700", ""),
+        "/dev/ttyACM1": ("862323088372050", ""),
+    })
+    registry = PortRegistry(prober=prober)
+
+    found = await registry.survey([DeviceConfig(name="a", port="/dev/ttyACM0")])
+    assert [r.port for r in found] == ["/dev/ttyACM1"]
+    assert prober.seen == ["/dev/ttyACM1"]
+
+
+async def test_survey_resolves_a_pinned_symlink(patched_glob, monkeypatch):
+    """Configs pin udev symlinks; the glob yields the tty they point at."""
+    monkeypatch.setattr(
+        "air780e_agent.discovery.os.path.realpath",
+        lambda p: "/dev/ttyACM0" if p == "/dev/air780e-a" else p,
+    )
+    patched_glob("/dev/ttyACM0")
+    registry = PortRegistry(prober=fake_world({
+        "/dev/ttyACM0": ("863304089655700", ""),
+    }))
+
+    assert await registry.survey([
+        DeviceConfig(name="a", port="/dev/air780e-a")
+    ]) == []
+
+
+async def test_survey_does_not_claim_what_it_finds(patched_glob):
+    """Surveying is a question, not a decision — the port must stay available
+    to whichever worker ends up wanting it."""
+    patched_glob("/dev/ttyACM0")
+    registry = PortRegistry(prober=fake_world({
+        "/dev/ttyACM0": ("862323088372050", ""),
+    }))
+
+    await registry.survey([])
+    assert registry.claimed_by("/dev/ttyACM0") is None
+    assert await registry.acquire(
+        DeviceConfig(name="adopted", imei="862323088372050")
+    ) == "/dev/ttyACM0"
+
+
+async def test_survey_ignores_mute_ports(patched_glob):
+    patched_glob("/dev/ttyACM0", "/dev/ttyACM1", "/dev/ttyACM2")
+    registry = PortRegistry(prober=fake_world({
+        "/dev/ttyACM2": ("862323088372050", ""),
+    }))
+
+    found = await registry.survey([])
+    assert [r.port for r in found] == ["/dev/ttyACM2"]

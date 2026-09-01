@@ -35,6 +35,7 @@ import RefreshIcon from '@mui/icons-material/RefreshOutlined'
 import DownloadIcon from '@mui/icons-material/FileDownloadOutlined'
 import ContentCopyIcon from '@mui/icons-material/ContentCopyOutlined'
 import DataIcon from '@mui/icons-material/DataObjectOutlined'
+import WarningIcon from '@mui/icons-material/WarningAmberOutlined'
 import CheckIcon from '@mui/icons-material/CheckOutlined'
 import {
   deliveryStatusLabel,
@@ -145,6 +146,10 @@ export function MessagesPage() {
       (t) =>
         t.peer.toLowerCase().includes(needle) ||
         t.last_body.toLowerCase().includes(needle) ||
+        // A damaged thread's `last_body` is mojibake, so the words the user can
+        // actually see in the preview live only here. Matching the same text the
+        // list renders is the point — typing what is on screen has to work.
+        (t.last_recovered_body ?? '').toLowerCase().includes(needle) ||
         (t.sim_label ?? '').toLowerCase().includes(needle),
     )
   }, [threads, search])
@@ -694,7 +699,20 @@ function Bubble({
   // boundary, or an empty operator control message. Decoding data as characters
   // is what produced the wall of mojibake this replaces.
   const binary = Boolean(message.is_binary)
-  const code = binary ? null : detectOtp(message.body)
+  // Damaged is a separate state from data, and has to be checked first: the
+  // modem dropped octets out of the frame, so `body` was decoded under header
+  // fields that are really message body. It is mojibake — hence `is_binary` —
+  // but a person wrote it, and the agent re-phased part of it back out.
+  const damaged = Boolean(message.truncated)
+  const salvaged = (message.recovered_body || '').trim()
+  // A code the agent recovered still gets a copy button. Running `detectOtp`
+  // over the mojibake instead would offer digits that are decoder noise, so
+  // for a damaged message only the salvage is trusted.
+  const code = damaged
+    ? (message.recovered_code || '').trim() || null
+    : binary
+      ? null
+      : detectOtp(message.body)
   const [copied, setCopied] = useState(false)
   const [pduCopied, setPduCopied] = useState(false)
 
@@ -767,7 +785,31 @@ function Bubble({
               wordBreak: 'break-word',
             }}
           >
-            {binary ? (
+            {damaged ? (
+              <Stack spacing={0.5}>
+                {/* Says it is a fragment every time, including when nothing was
+                    recovered. A fragment rendered as if it were the whole
+                    message is worse than no message: the reader takes "no code
+                    in here" at face value, when the code was most likely in the
+                    head the decoder cannot reach. */}
+                <Stack direction="row" spacing={0.75} sx={{ alignItems: 'center' }}>
+                  <WarningIcon sx={{ fontSize: 16, color: STATUS.warning }} />
+                  <Typography
+                    variant="caption"
+                    sx={{ color: STATUS.warning, fontWeight: 600 }}
+                  >
+                    短信在模组内损坏,以下不是全文
+                  </Typography>
+                </Stack>
+                {salvaged ? (
+                  <Typography variant="body2">{highlightOtp(salvaged)}</Typography>
+                ) : (
+                  <Typography variant="body2" sx={{ fontStyle: 'italic', opacity: 0.85 }}>
+                    正文未能恢复,可复制原始 PDU 排查。
+                  </Typography>
+                )}
+              </Stack>
+            ) : binary ? (
               <Stack direction="row" spacing={0.75} sx={{ alignItems: 'center' }}>
                 <DataIcon fontSize="small" sx={{ opacity: 0.7 }} />
                 <Typography variant="body2" sx={{ fontStyle: 'italic', opacity: 0.85 }}>
@@ -842,7 +884,16 @@ function Bubble({
               </>
             )}
             {code && (
-              <Tooltip title={copied ? '已复制' : `复制验证码 ${code}`}>
+              <Tooltip
+                title={
+                  copied
+                    ? '已复制'
+                    // Hedged for a damaged message: this came out of a
+                    // re-phasing pass, and the digits either side of the hole
+                    // are gone.
+                    : `${damaged ? '复制救回的可能验证码' : '复制验证码'} ${code}`
+                }
+              >
                 <IconButton size="small" onClick={() => void copy()} aria-label="复制验证码">
                   {copied ? (
                     <CheckIcon sx={{ fontSize: 14, color: STATUS.good }} />
@@ -1040,6 +1091,10 @@ function SearchDialog({
       last_id: message.id,
       last_body: message.body,
       last_is_binary: message.is_binary,
+      // Without these the preview of a damaged hit reads "运营商数据短信" until
+      // the conversations list refetches and replaces this optimistic row.
+      last_truncated: message.truncated,
+      last_recovered_body: message.recovered_body,
       last_direction: message.direction,
       last_status: message.status,
       last_ts: message.ts,

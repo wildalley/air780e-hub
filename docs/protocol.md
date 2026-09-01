@@ -419,8 +419,14 @@ Agent 执行官方文档中的 `AT+COPS=?`,在 `cmd_result.data.operators` 返�
 ```
 
 `numeric` 只接受 5 或 6 位 MCC/MNC;Agent 下发 `AT+COPS=1,2,"<MCCMNC>"`。传
-`null` 时下发 `AT+COPS=0` 恢复自动选择。回执包含 `operator` 的当前 COPS 字段和
-更新后的 `device` 状态。手动模式期间自动注册自愈不会发送 `AT+COPS=0` 撤销选择。
+`null` 时下发 `AT+COPS=0` 恢复自动选择。
+
+选网命令的 `OK` 只代表「请求已受理」,不代表「已切换」:模块是异步重选网的。
+因此 Agent 在收到 `OK` 后轮询 CS/EPS 注册域(< 30 秒),等到任一路注册成功才读取
+`AT+COPS?`;若在窗口内始终未注册,也如实返回当前搜索中的快照。回执包含 `operator`
+(当前 COPS 字段)、更新后的 `device` 状态,以及 `settled` 布尔值——`true` 表示手动
+选择期间确实观察到注册(或 `AT+COPS=0` 恢复后重新入网),`false` 表示窗口超时、模块
+仍处于搜索中。手动模式期间自动注册自愈不会发送 `AT+COPS=0` 撤销选择。
 
 ### `network_diagnostics` —— 只读网络诊断
 

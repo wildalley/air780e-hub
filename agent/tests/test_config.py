@@ -63,9 +63,26 @@ def test_full_config():
     assert config.devices[1].storage == "SM"  # default
 
 
-def test_devices_are_required():
+def test_no_devices_is_fine_when_autodetect_can_find_them():
+    """An empty config is a legitimate starting point: plug a module in and it
+    gets adopted, with nothing declared in advance."""
+    config = AgentConfig.parse(b"[agent]\nid = 'x'\n")
+    assert config.devices == []
+    assert config.autodetect is True
+
+
+def test_devices_are_required_when_autodetect_is_off():
     with pytest.raises(ConfigError, match="no \\[\\[devices\\]\\]"):
-        AgentConfig.parse(b"[agent]\nid = 'x'\n")
+        AgentConfig.parse(b"[agent]\nid = 'x'\nautodetect = false\n")
+
+
+def test_autodetect_settings_are_read():
+    config = AgentConfig.parse(
+        b"[agent]\nautodetect = false\nautodetect_interval = 15.0\n"
+        b'[[devices]]\nname = "a"\n'
+    )
+    assert config.autodetect is False
+    assert config.autodetect_interval == 15.0
 
 
 def test_duplicate_device_names_rejected():

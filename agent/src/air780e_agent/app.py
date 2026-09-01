@@ -12,8 +12,8 @@ import logging
 from typing import Any
 
 from . import __version__
-from .config import AgentConfig
-from .discovery import PortRegistry
+from .config import AgentConfig, DeviceConfig
+from .discovery import PortRegistry, ProbeResult, ProbeResult
 from .link import ServerLink
 from .scheduler import KeepAliveScheduler
 from .store import LocalStore
@@ -43,21 +43,13 @@ class AgentApp:
             sole_device=len(config.devices) == 1,
         )
 
+        self._transport_factory = transport_factory
+        # Modules adopted by autodetect.  Kept alongside config.devices so a
+        # later survey sees them as spoken for.
+        self._adopted: list[DeviceConfig] = []
+
         for device in config.devices:
-            self.workers[device.name] = DeviceWorker(
-                device,
-                self.store,
-                self.emit,
-                status_interval=config.status_interval,
-                reconnect_max_delay=config.reconnect_max_delay,
-                health_check_timeout=config.health_check_timeout,
-                health_failure_threshold=config.health_failure_threshold,
-                registration_recovery_delay=config.registration_recovery_delay,
-                recovery_cooldown=config.recovery_cooldown,
-                recovery_max_attempts_24h=config.recovery_max_attempts_24h,
-                transport_factory=transport_factory,
-                registry=self.registry,
-            )
+            self.workers[device.name] = self._build_worker(device)
 
         self.link = ServerLink(
             config.server,
@@ -82,6 +74,22 @@ class AgentApp:
         self._tasks: list[asyncio.Task] = []
         self._stopped = False
 
+    def _build_worker(self, device: DeviceConfig) -> DeviceWorker:
+        return DeviceWorker(
+            device,
+            self.store,
+            self.emit,
+            status_interval=self.config.status_interval,
+            reconnect_max_delay=self.config.reconnect_max_delay,
+            health_check_timeout=self.config.health_check_timeout,
+            health_failure_threshold=self.config.health_failure_threshold,
+            registration_recovery_delay=self.config.registration_recovery_delay,
+            recovery_cooldown=self.config.recovery_cooldown,
+            recovery_max_attempts_24h=self.config.recovery_max_attempts_24h,
+            transport_factory=self._transport_factory,
+            registry=self.registry,
+        )
+
     # -- event plumbing ----------------------------------------------------
 
     def emit(self, kind: str, payload: dict[str, Any]) -> None:
@@ -97,9 +105,11 @@ class AgentApp:
 
     async def run(self) -> None:
         log.info(
-            "agent %s starting: %d device(s), %d queued event(s), %d task(s)",
+            "agent %s starting: %d device(s), %d queued event(s), %d task(s), "
+            "autodetect %s",
             self.config.agent_id, len(self.workers),
             self.store.unacked_count(), len(self.store.all_tasks()),
+            "on" if self.config.autodetect else "off",
         )
 
         self._tasks = [
@@ -110,11 +120,101 @@ class AgentApp:
         self._tasks.append(
             asyncio.create_task(self.scheduler.run(), name="scheduler")
         )
+        if self.config.autodetect:
+            self._tasks.append(
+                asyncio.create_task(self._autodetect_loop(), name="autodetect")
+            )
 
         try:
-            await asyncio.gather(*self._tasks)
+            # Copied, because adopting a module appends to self._tasks and a
+            # gather over the live list would not notice either way.
+            await asyncio.gather(*list(self._tasks))
         except asyncio.CancelledError:
             pass
+
+    # -- autodetect --------------------------------------------------------
+
+    async def _autodetect_loop(self) -> None:
+        """Adopt modules that no [[devices]] block is waiting for.
+
+        The first pass runs immediately so a module plugged in before startup
+        does not wait out a whole interval.
+        """
+        while not self._stopped:
+            try:
+                await self._autodetect_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # A module mid-enumeration, a port that vanished between glob
+                # and open: none of that should take down the loop.
+                log.warning("autodetect scan failed: %s", exc)
+            await asyncio.sleep(self.config.autodetect_interval)
+
+    async def _autodetect_once(self) -> None:
+        # A configured device with no port, imei or iccid means "the one module
+        # that answers is mine" (see PortRegistry.sole_device).  Nothing in a
+        # survey could be shown not to be that module, so adopting anything
+        # would be taking it.
+        if any(
+            not (d.port or d.imei or d.iccid) for d in self.config.devices
+        ):
+            return
+
+        reserved = self.config.devices + self._adopted
+        for found in await self.registry.survey(reserved):
+            if not found.imei:
+                # Identity is the whole point: a module that will not say who
+                # it is cannot be given a name that survives a replug.
+                log.debug("autodetect: %s has no IMEI, leaving it alone", found.port)
+                continue
+            self._adopt(found)
+
+    def _adopt(self, found: ProbeResult) -> None:
+        name = self._name_for(found.imei)
+        device = DeviceConfig(name=name, imei=found.imei, label=found.model)
+        worker = self._build_worker(device)
+
+        # Both lists, so the next survey sees this module as spoken for even
+        # before the worker has managed to open its port.
+        self._adopted.append(device)
+        self.workers[name] = worker
+        self._tasks.append(asyncio.create_task(worker.run(), name=f"worker-{name}"))
+
+        log.info("autodetect adopted %s as device %r", found.describe(), name)
+        self.emit("log", {
+            "level": "info",
+            "device": name,
+            "message": f"自动识别到新模块 {found.model or '?'}，已作为设备 {name} 接管",
+            "event": "device_adopted",
+            "imei": found.imei,
+            "iccid": found.iccid,
+        })
+
+    def _name_for(self, imei: str) -> str:
+        """A stable device name for this IMEI, remembered across restarts.
+
+        The name ends up on every event the module produces, so it must not
+        drift: the server would see the history split in two.  Hence the kv
+        table rather than deriving it fresh each time — the derivation could
+        change, or collide differently, and the stored answer cannot.
+        """
+        key = f"autodetect:imei:{imei}"
+        remembered = self.store.get(key)
+        if remembered and remembered not in self.workers:
+            return remembered
+
+        # Suffix rather than the full IMEI: short enough to type into the web
+        # UI, and the last digits are what differs between two modules from
+        # the same batch.
+        base = f"auto-{imei[-6:]}" if len(imei) > 6 else f"auto-{imei}"
+        name = base
+        suffix = 2
+        while name in self.workers:
+            name = f"{base}-{suffix}"
+            suffix += 1
+        self.store.set(key, name)
+        return name
 
     async def stop(self) -> None:
         if self._stopped:

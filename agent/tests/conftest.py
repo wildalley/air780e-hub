@@ -28,6 +28,20 @@ def fault_cycles(pytestconfig) -> int:
     return max(1, pytestconfig.getoption("--fault-cycles"))
 
 
+@pytest.fixture(autouse=True)
+def no_real_ports(monkeypatch):
+    """Keep the suite away from /dev.
+
+    Autodetect globs for unclaimed ports and opens whatever answers, so on a
+    machine with a module actually plugged in an unrelated test would start
+    talking to real hardware.  Tests that want ports to exist patch this same
+    name themselves, which takes precedence.
+    """
+    monkeypatch.setattr(
+        "air780e_agent.discovery.globmodule.glob", lambda pattern: []
+    )
+
+
 @dataclass
 class Rig:
     client: ATClient

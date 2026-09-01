@@ -184,6 +184,35 @@ describe('threadPreview', () => {
     // claiming it was data.
     expect(threadPreview({ last_body: '' })).toBe('(空)')
   })
+
+  it('shows the salvage for a damaged message, not the data label', () => {
+    // A damaged frame is `last_is_binary` too, and the old order called this
+    // "运营商数据短信" — a person's SMS filed as operator traffic.
+    expect(
+      threadPreview({
+        last_body: '鼠S耸盘涌羹',
+        last_is_binary: 1,
+        last_truncated: 1,
+        last_recovered_body: 'code is 123456 for GitHub',
+      }),
+    ).toBe('⚠️ 损坏片段：code is 123456 for GitHub')
+  })
+
+  it('still says damaged when nothing was recovered', () => {
+    // Silence here is the failure mode: the reader has to know a message
+    // arrived at all before they can go dig out the PDU.
+    expect(
+      threadPreview({ last_body: '鼠S耸盘涌羹', last_is_binary: 1, last_truncated: 1 }),
+    ).toBe('⚠️ 短信损坏，正文未恢复')
+    expect(
+      threadPreview({
+        last_body: '鼠S耸盘涌羹',
+        last_is_binary: 1,
+        last_truncated: 1,
+        last_recovered_body: '   ',
+      }),
+    ).toBe('⚠️ 短信损坏，正文未恢复')
+  })
 })
 
 describe('messagePreview', () => {
@@ -196,6 +225,19 @@ describe('messagePreview', () => {
   it('keeps text and the empty-message fallback', () => {
     expect(messagePreview({ body: '验证码 123456', is_binary: 0 })).toBe('验证码 123456')
     expect(messagePreview({ body: '' })).toBe('(空)')
+  })
+
+  it('marks a damaged message everywhere it is summarized', () => {
+    // Dashboard's recent-messages list calls this too, so the fix reaches it
+    // for free — but only if the damaged branch stays ahead of `is_binary`.
+    expect(
+      messagePreview({
+        body: '鼠S耸盘涌羹',
+        is_binary: 1,
+        truncated: 1,
+        recovered_body: 'code is 123456',
+      }),
+    ).toBe('⚠️ 损坏片段：code is 123456')
   })
 })
 

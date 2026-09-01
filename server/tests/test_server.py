@@ -679,13 +679,47 @@ def test_message_export_is_utf8_csv_with_intact_multiline_bodies(admin):
     rows = list(csv.reader(io.StringIO(response.content.decode("utf-8-sig"))))
     assert rows[0] == [
         "id", "ts", "direction", "sim_id", "sim_label", "peer", "body", "status",
-        "is_binary", "dcs", "raw_pdu",
+        "is_binary", "truncated", "recovered_body", "recovered_code",
+        "dcs", "raw_pdu",
     ]
     assert rows[1][5:7] == ["10086", body]
     # New diagnostic columns are present; values are empty for a pre-upgrade row.
-    assert rows[1][8] == "0"    # is_binary
-    assert rows[1][9] == ""     # dcs (None → "")
-    assert rows[1][10] == ""    # raw_pdu (None → "")
+    assert rows[1][8] == "0"     # is_binary
+    assert rows[1][9] == "0"     # truncated
+    assert rows[1][10] == ""     # recovered_body
+    assert rows[1][11] == ""     # recovered_code
+    assert rows[1][12] == ""     # dcs (None → "")
+    assert rows[1][13] == ""     # raw_pdu (None → "")
+
+
+def test_message_export_carries_the_salvage_of_a_damaged_message(admin):
+    """An export whose only body column is mojibake has lost the message.
+
+    The readable part of a truncated frame lives in `recovered_body`, so leaving
+    it out would hand someone a CSV of decoder noise where a verification code
+    used to be.
+    """
+    import csv
+    import io
+
+    admin.app.state.hub.db.insert_message(
+        agent_id="home-arch",
+        device="a",
+        direction="in",
+        peer="GitHub",
+        body="鼠S耸盘涌羹",
+        ts=_minutes_ago(1),
+        iccid="89860622180012345670",
+        is_binary=True,
+        truncated=True,
+        recovered_body="GitHub code 314159",
+        recovered_code="314159",
+    )
+
+    response = admin.get("/api/messages/export")
+    assert response.status_code == 200
+    rows = list(csv.reader(io.StringIO(response.content.decode("utf-8-sig"))))
+    assert rows[1][9:12] == ["1", "GitHub code 314159", "314159"]
 
 
 def test_message_list_total_uses_the_same_filters(admin):
@@ -905,6 +939,14 @@ def test_history_bucket_keeps_an_outage_a_storage_peak_and_a_voltage_dip(admin):
     average would hide all three.  Each metric's aggregate is chosen for the
     direction its fault lies in, which is why they are not all the same.
     """
+    # Anchored to a bucket boundary instead of "n minutes ago": a 168h window
+    # buckets at 1800s, so relative offsets put the three samples in one bucket
+    # only when no half-hour boundary happens to fall between them. That made
+    # this fail for real about 3% of runs — the collapse under test never
+    # happened, because there was nothing to collapse.
+    width = 1800
+    start = datetime.now(UTC).replace(microsecond=0)
+    start -= timedelta(seconds=start.timestamp() % width + width)
     with _connect(admin) as ws:
         _greet(ws)
         samples = [
@@ -919,13 +961,13 @@ def test_history_bucket_keeps_an_outage_a_storage_peak_and_a_voltage_dip(admin):
                 "rssi": 20, "dbm": -70, "bars": 3,
                 "storage_used": used, "storage_capacity": 100,
                 "voltage_mv": voltage,
-                "ts": _minutes_ago(seq),
+                "ts": (start + timedelta(seconds=seq * 10)).isoformat(),
             })
             ws.receive_json()
 
-    # One bucket wide enough to hold all three samples.
+    # All three samples share one bucket by construction.
     points = admin.get("/api/devices/a/history?hours=168").json()
-    assert len(points) >= 1
+    assert len(points) == 1, f"3 samples in one bucket collapsed to {len(points)}"
     collapsed = points[0]
     assert collapsed["online"] == 0, "an outage inside the bucket must survive"
     assert collapsed["registered"] == 0

@@ -8,8 +8,11 @@ a mode-2 URC that carries location fields the old parser tripped over.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import pytest
 
+import air780e_agent.modem as modem_module
 from air780e_agent.at import ATError, ATResponse, ATUrc
 from air780e_agent.modem import Air780E, parse_current_operator, parse_operator_scan
 
@@ -49,6 +52,35 @@ def _reg_response(command: str, prefix: str, stat: int) -> ATResponse:
 
 def _modem(responses: dict[str, object]) -> Air780E:
     return Air780E(FakeClient(responses))
+
+
+@contextmanager
+def _patched_sleep(record):
+    """Run a settle window on a fake clock, recording what it waited for.
+
+    ``record`` sees every requested delay.  The clock the driver measures its
+    deadline against advances by that same amount, so a window that would take
+    half a minute of wall time resolves instantly while still ending after the
+    number of polls it really would have made — swallowing the sleep alone would
+    leave the deadline pinned to real time and poll thousands of times.
+    """
+    elapsed = 0.0
+
+    async def sleep(seconds):
+        nonlocal elapsed
+        elapsed += seconds
+        await record(seconds)
+
+    class _Clock:
+        def monotonic(self) -> float:
+            return elapsed
+
+    real_sleep, real_time = modem_module.asyncio.sleep, modem_module.time
+    modem_module.asyncio.sleep, modem_module.time = sleep, _Clock()
+    try:
+        yield
+    finally:
+        modem_module.asyncio.sleep, modem_module.time = real_sleep, real_time
 
 
 def test_current_operator_parser_handles_quoted_name_and_act():
@@ -209,6 +241,7 @@ async def test_operator_scan_and_selection_use_typed_commands():
             "AT+COPS?": ATResponse(
                 "AT+COPS?", ['+COPS: 1,2,"23420",7']
             ),
+            "AT+CEREG?": _reg_response("AT+CEREG?", "+CEREG", 1),
         }
     )
 
@@ -216,6 +249,7 @@ async def test_operator_scan_and_selection_use_typed_commands():
     assert [item["numeric"] for item in operators] == ["46000", "23420"]
     selected = await modem.select_operator("23420")
     assert selected["numeric"] == "23420"
+    assert selected["settled"] is True
     assert modem.operator_selection_mode == 1
     assert 'AT+COPS=1,2,"23420"' in modem.client.calls
 
@@ -232,13 +266,92 @@ async def test_select_operator_none_restores_automatic_selection():
     modem = _modem(
         {
             "AT+COPS=0": ATResponse("AT+COPS=0", []),
-            "AT+COPS?": ATResponse("AT+COPS?", ["+COPS: 0"]),
+            "AT+COPS?": ATResponse("AT+COPS?", ['+COPS: 0,0,"CHINA MOBILE",7']),
+            "AT+CEREG?": _reg_response("AT+CEREG?", "+CEREG", 1),
         }
     )
     current = await modem.select_operator(None)
     assert current["mode"] == 0
+    assert current["settled"] is True
     assert modem.operator_selection_mode == 0
     assert modem.client.calls[0] == "AT+COPS=0"
+
+
+async def test_select_operator_waits_for_registration_before_snapshotting():
+    """The mid-switch `+COPS: 1` must not be what the caller gets.
+
+    Three polls stay unregistered — the module has taken the request but not
+    settled — then the CS domain attaches.  Only after that is AT+COPS? read,
+    so the answer carries the operator instead of a bare mode.
+    """
+    modem = _modem(
+        {
+            'AT+COPS=1,2,"46001"': ATResponse('AT+COPS=1,2,"46001"', []),
+            "AT+CEREG?": [
+                _reg_response("AT+CEREG?", "+CEREG", 2),
+                _reg_response("AT+CEREG?", "+CEREG", 2),
+                _reg_response("AT+CEREG?", "+CEREG", 2),
+                _reg_response("AT+CEREG?", "+CEREG", 0),
+            ],
+            "AT+CREG?": [
+                _reg_response("AT+CREG?", "+CREG", 0),
+                _reg_response("AT+CREG?", "+CREG", 0),
+                _reg_response("AT+CREG?", "+CREG", 0),
+                _reg_response("AT+CREG?", "+CREG", 5),
+            ],
+            "AT+COPS?": ATResponse("AT+COPS?", ['+COPS: 1,2,"46001",7']),
+        }
+    )
+
+    slept: list[float] = []
+
+    async def record_sleep(seconds):
+        slept.append(seconds)
+
+    with _patched_sleep(record_sleep):
+        current = await modem.select_operator("46001")
+
+    assert current["settled"] is True
+    assert current["numeric"] == "46001"
+    # Waited out the three unregistered polls, and no longer than that.
+    assert slept == [3.0, 3.0, 3.0]
+    # The snapshot is the last thing on the wire, after registration settled.
+    assert modem.client.calls[-1] == "AT+COPS?"
+    assert modem.operator_selection_mode == 1
+
+
+async def test_select_operator_returns_the_honest_snapshot_when_never_registered():
+    """Never attaching is an outcome to report, not an error to raise.
+
+    The caller gets the real searching state — a bare `+COPS: 1` — with
+    ``settled`` false, and manual mode still recorded so registration recovery
+    stays suspended rather than sending AT+COPS=0 over the top of the choice.
+    """
+    modem = _modem(
+        {
+            'AT+COPS=1,2,"46001"': ATResponse('AT+COPS=1,2,"46001"', []),
+            "AT+CEREG?": _reg_response("AT+CEREG?", "+CEREG", 2),
+            "AT+CREG?": _reg_response("AT+CREG?", "+CREG", 2),
+            "AT+COPS?": ATResponse("AT+COPS?", ["+COPS: 1"]),
+        }
+    )
+
+    slept: list[float] = []
+
+    async def record_sleep(seconds):
+        slept.append(seconds)
+
+    with _patched_sleep(record_sleep):
+        current = await modem.select_operator("46001")
+
+    assert current["settled"] is False
+    assert current["mode"] == 1
+    assert current["operator"] == ""
+    assert modem.operator_selection_mode == 1
+    # The window is bounded: it does not poll forever, and the total wait does
+    # not overrun the budget even though the interval does not divide it evenly.
+    assert sum(slept) == pytest.approx(27.0)
+    assert modem.info.registered is False
 
 
 async def test_network_diagnostics_preserve_partial_firmware_support():

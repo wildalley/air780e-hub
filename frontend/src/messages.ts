@@ -42,20 +42,37 @@ export function hasOlderMessages(total: number, fetched: number): boolean {
  * A data SMS has no text to preview, and its decoded body is mojibake or empty
  * — the list used to show a run of CJK garbage, or "(空)" for the ones that
  * decoded to nothing at all. Naming what it is beats showing either.
+ *
+ * A damaged message is `is_binary` too — its `body` is mojibake for the same
+ * reason — but it was a person writing to a person, so the damaged branch has
+ * to come first or the list calls a personal SMS operator data. The preview
+ * shows the salvaged fragment behind a marker, never bare: a fragment that
+ * looks like a whole message is how someone concludes there was no code in a
+ * message whose code was in the octets that went missing.
  */
 export function messagePreview(
-  message: Pick<Message, 'body' | 'is_binary'>,
+  message: Pick<Message, 'body' | 'is_binary' | 'truncated' | 'recovered_body'>,
 ): string {
+  if (message.truncated) {
+    const salvaged = (message.recovered_body || '').trim()
+    return salvaged ? `⚠️ 损坏片段：${salvaged}` : '⚠️ 短信损坏，正文未恢复'
+  }
   if (message.is_binary) return '运营商数据短信'
   return message.body || '(空)'
 }
 
 export function threadPreview(
-  thread: Pick<Conversation, 'last_body'> & { last_is_binary?: number },
+  thread: Pick<Conversation, 'last_body'> & {
+    last_is_binary?: number
+    last_truncated?: number
+    last_recovered_body?: string | null
+  },
 ): string {
   return messagePreview({
     body: thread.last_body,
     is_binary: thread.last_is_binary,
+    truncated: thread.last_truncated,
+    recovered_body: thread.last_recovered_body,
   })
 }
 

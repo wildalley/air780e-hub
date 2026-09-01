@@ -120,6 +120,18 @@ _CALL_PROGRESS_OUTCOMES = {
 OPERATOR_SCAN_TIMEOUT = 180.0
 OPERATOR_SELECT_TIMEOUT = 180.0
 
+# Manual selection is asynchronous.  V1011 answers ``AT+COPS=1,2,"<MCCMNC>"``
+# with OK as soon as it accepts the request — measured at 0s — and only settles
+# on a network seconds later; a 46001 selection that the SIM could not hold was
+# observed falling back to 46000 about 15s after the OK.  Reading ``AT+COPS?``
+# straight off that OK therefore snapshots the module mid-switch, as a bare
+# ``+COPS: 1`` with no operator field, which reads on the device page as "the
+# selection did nothing".  So wait for registration to settle before taking the
+# snapshot.  These bound that wait and are unrelated to the timeouts above,
+# which are the AT timeouts for a single command.
+OPERATOR_SETTLE_TIMEOUT = 27.0
+OPERATOR_SETTLE_INTERVAL = 3.0
+
 # States that mean "attached to the network": 1 = home, 5 = roaming.
 REGISTERED_STATES = ("1", "5")
 
@@ -536,6 +548,13 @@ class Air780E:
 
         Only MCC/MNC values are accepted here.  This keeps the typed command
         from becoming an unvalidated escape hatch into arbitrary AT syntax.
+
+        The OK for the selection means "request accepted", not "switched", so
+        this waits for the module to reattach before reporting — otherwise the
+        answer is a mid-switch ``+COPS: 1`` that looks like nothing happened.
+        Staying unregistered for the whole window is a real outcome, not an
+        error: the caller gets the honest searching snapshot, plus ``settled``
+        to say the wait ran out.
         """
         if numeric is None:
             command = "AT+COPS=0"
@@ -544,9 +563,33 @@ class Air780E:
                 raise ValueError("operator numeric must contain 5 or 6 digits")
             command = f'AT+COPS=1,2,"{numeric}"'
         await self.client.execute(command, timeout=OPERATOR_SELECT_TIMEOUT)
+        settled = await self._await_registration(
+            OPERATOR_SETTLE_TIMEOUT, OPERATOR_SETTLE_INTERVAL
+        )
         current = await self.read_current_operator()
+        # The mode the operator asked for, not the one the mid-switch snapshot
+        # happens to report — this is what suspends automatic recovery, and it
+        # must not be undone by a module that answered `+COPS: 0` while still
+        # acting on a manual request.
         self.operator_selection_mode = 0 if numeric is None else 1
+        current["settled"] = settled
         return current
+
+    async def _await_registration(self, timeout: float, interval: float) -> bool:
+        """Poll until either domain reports registered, or the window closes.
+
+        Returns whether registration was seen.  The first read happens before
+        any sleep so an already-attached module is not made to wait out an
+        interval it does not need.
+        """
+        deadline = time.monotonic() + timeout
+        while True:
+            if await self.read_registration():
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(interval, remaining))
 
     async def read_network_diagnostics(self) -> dict[str, dict[str, list[str] | str | None]]:
         """Read optional engineering diagnostics without imposing a schema.
@@ -884,6 +927,13 @@ class Air780E:
                 pdu = response.lines[i + 1].strip()
                 declared = _declared_octets(line.split(":", 1)[1])
                 actual = _tpdu_octets(pdu)
+                # DIAG(readpath): the raw read-out PDU before any decoding, so
+                # a short body can be pinned to CMGR rather than the decoder.
+                log.info(
+                    "DIAG cmgr index=%d header=%r declared=%s actual=%s "
+                    "hexlen=%d pdu=%s",
+                    index, line, declared, actual, len(pdu), pdu,
+                )
                 if declared is None or actual is None or declared == actual:
                     return pdu
 
@@ -1234,11 +1284,34 @@ class Air780E:
             except Exception:
                 log.exception("failed to fetch message at index %d", index)
 
+    async def _diag_dump_store(self, index: int) -> None:
+        """DIAG(readpath): raw ``AT+CMGL`` dump, to compare store vs read-out.
+
+        Runs after the ``+CMGR`` for ``index`` and before the ``AT+CMGD``, on
+        the same serialized ``_index_loop`` turn, so it cannot interleave with
+        another fetch.  Never raises: a diagnostic must not cost a message.
+        """
+        try:
+            response = await self.client.execute("AT+CMGL=4", timeout=30.0)
+        except Exception as exc:  # noqa: BLE001 — diagnostics stay silent
+            log.info("DIAG cmgl for index=%d failed: %r", index, exc)
+            return
+        log.info("DIAG cmgl after index=%d: %d line(s)", index, len(response.lines))
+        for i, line in enumerate(response.lines):
+            if line.upper().startswith("+CMGL:"):
+                header = line.split(":", 1)[1]
+                pdu = response.lines[i + 1].strip() if i + 1 < len(response.lines) else ""
+                log.info(
+                    "DIAG cmgl header=%r declared=%s actual=%s hexlen=%d pdu=%s",
+                    line, _declared_octets(header), _tpdu_octets(pdu), len(pdu), pdu,
+                )
+
     async def _fetch_index(self, index: int) -> None:
         pdu = await self.read_stored(index)
         if pdu is None:
             log.warning("index %d vanished before it could be read", index)
             return
+        await self._diag_dump_store(index)
         try:
             sms = decode_pdu(pdu)
         except PduError as exc:

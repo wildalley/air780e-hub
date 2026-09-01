@@ -121,12 +121,13 @@ def add_rule(
 
 def add_message(
     db, *, body="验证码 123456", peer="10086", iccid=ICCID, device="a",
-    is_binary=False,
+    is_binary=False, truncated=False, recovered_body=None, recovered_code=None,
 ) -> int:
     return db.insert_message(
         agent_id="home-arch", device=device, direction="in", peer=peer,
         body=body, ts="2026-08-02T18:00:00+08:00", iccid=iccid,
-        is_binary=is_binary,
+        is_binary=is_binary, truncated=truncated,
+        recovered_body=recovered_body, recovered_code=recovered_code,
     )
 
 
@@ -282,6 +283,80 @@ async def test_data_sms_is_never_forwarded_by_notification_rules(db, settings):
     assert await notifier.deliver(message_id) == []
     assert recorder.requests == []
     assert notify_logs(db) == []
+
+
+async def test_a_damaged_message_pushes_what_was_salvaged(db, settings):
+    """The bug this exists to prevent: a lost verification code, silently.
+
+    A truncated frame is ``is_binary`` for the same reason a data SMS is — its
+    decoded ``body`` is mojibake — so the data-SMS suppression above used to
+    swallow it whole, and nothing was pushed at all.
+    """
+    channel = add_channel(db)
+    add_rule(db, channel_id=channel, match="all")
+    message_id = add_message(
+        db,
+        body="鼠S耸盘涌羹",
+        is_binary=True,
+        truncated=True,
+        recovered_body="code is 481920, do not share",
+        recovered_code="481920",
+    )
+    recorder = Recorder()
+    notifier = make_notifier(db, settings, recorder)
+
+    results = await notifier.deliver(message_id)
+    assert [(r["channel_id"], r["status"]) for r in results] == [(channel, "ok")]
+    pushed = recorder.bodies[0]["message"]
+    assert "481920" in pushed
+    assert "code is 481920, do not share" in pushed
+    # Marked as a fragment, and the mojibake never reaches the channel.
+    assert "不是全文" in pushed
+    assert "鼠S耸盘涌羹" not in pushed
+
+
+async def test_a_damaged_message_with_nothing_recovered_still_warns(db, settings):
+    """Silence would send someone hunting for a code that never arrives."""
+    channel = add_channel(db)
+    add_rule(db, channel_id=channel, match="all")
+    message_id = add_message(db, body="鼠S耸盘涌羹", is_binary=True, truncated=True)
+    recorder = Recorder()
+    notifier = make_notifier(db, settings, recorder)
+
+    results = await notifier.deliver(message_id)
+    assert [(r["channel_id"], r["status"]) for r in results] == [(channel, "ok")]
+    pushed = recorder.bodies[0]["message"]
+    assert "损坏" in pushed
+    assert "鼠S耸盘涌羹" not in pushed
+
+
+async def test_a_keyword_rule_matches_the_salvage_not_the_mojibake(db, settings):
+    """Matched text and rendered text are the same text.
+
+    Matching ``body`` would fire on decoder noise and miss the words the reader
+    can actually see — a push claiming a keyword the recipient cannot find.
+    """
+    channel = add_channel(db)
+    add_rule(db, channel_id=channel, match="keyword", pattern="GitHub")
+    hit = add_message(
+        db,
+        body="鼠S耸盘涌羹",
+        is_binary=True,
+        truncated=True,
+        recovered_body="GitHub code 314159",
+    )
+    recorder = Recorder()
+    notifier = make_notifier(db, settings, recorder)
+    results = await notifier.deliver(hit)
+    assert [(r["channel_id"], r["status"]) for r in results] == [(channel, "ok")]
+
+    # The same rule against mojibake that happens to contain the keyword's
+    # bytes nowhere the reader can see it: no match.
+    miss = add_message(
+        db, body="GitHub 鼠S耸盘涌羹", is_binary=True, truncated=True,
+        recovered_body="code 271828",
+    )
+    assert await notifier.deliver(miss) == []
 
 
 async def test_retry_then_success(db, settings):

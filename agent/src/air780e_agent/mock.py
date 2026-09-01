@@ -199,6 +199,25 @@ class MockAir780E:
             self._urc(f'+CMTI: "{self.storage}",{index}')
         return True
 
+    def deliver_pdu(self, pdu: str) -> bool:
+        """Store a PDU verbatim and announce it.
+
+        `deliver` builds a well-formed frame, which is the wrong tool for the
+        faults worth testing: the modem sometimes hands over a frame with octets
+        already missing, and no encoder will produce one.  A captured PDU goes
+        in untouched so the agent's read path sees exactly what the hardware
+        produced.
+        """
+        if len(self._messages) + 1 > self.capacity:
+            log.warning("mock storage full (%d/%d), dropping message",
+                        len(self._messages), self.capacity)
+            return False
+        index = self._next_index
+        self._next_index += 1
+        self._messages[index] = StoredMessage(index, STAT_REC_UNREAD, pdu)
+        self._urc(f'+CMTI: "{self.storage}",{index}')
+        return True
+
     @property
     def stored_count(self) -> int:
         return len(self._messages)

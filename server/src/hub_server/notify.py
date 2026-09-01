@@ -120,6 +120,50 @@ def scrub(text: str) -> str:
     return cleaned[:DETAIL_LIMIT]
 
 
+def _salvaged(message: dict[str, Any], frame: dict[str, Any]) -> str | None:
+    """What to push for a damaged message, or None if it is not damaged.
+
+    The modem sometimes drops octets out of the middle of a frame before the
+    agent ever sees it; the stored ``body`` is then mojibake and the agent's
+    re-phased fragment is the only readable part.  The text says so, because a
+    fragment presented as a whole message is worse than no message: the reader
+    would take "no code here" at face value when the code was in the octets
+    that went missing.
+
+    Returns a string even when nothing was recovered.  "This SMS arrived
+    damaged" is itself the notification — the alternative is silence, and the
+    user goes looking for a code that never arrives.
+    """
+    if not (message.get("truncated") or frame.get("truncated")):
+        return None
+
+    body = (message.get("recovered_body") or frame.get("recovered_text") or "").strip()
+    code = (message.get("recovered_code") or frame.get("code") or "").strip()
+
+    lines = ["⚠️ 短信在模组内损坏，以下是可读部分（不是全文）"]
+    if code:
+        lines.append(f"可能的验证码：{code}")
+    if body:
+        lines.append(body)
+    if not body and not code:
+        lines.append("正文未能恢复，请到管理界面查看原始 PDU。")
+    return "\n".join(lines)
+
+
+def notification_body(
+    message: dict[str, Any], frame: dict[str, Any] | None = None
+) -> str:
+    """The text a channel should receive for this message.
+
+    Normally the decoded body.  For a damaged frame it is the salvage notice
+    instead, so what a rule matched on is what the channel renders — the two
+    drifting apart is how a push ends up saying it matched a keyword the reader
+    cannot find anywhere in the text.
+    """
+    frame = frame or {}
+    return _salvaged(message, frame) or message.get("body") or frame.get("body") or ""
+
+
 # --------------------------------------------------------------------------
 # rule matching
 # --------------------------------------------------------------------------
@@ -627,14 +671,23 @@ class Notifier:
             (message_id,),
         ) or {}
 
-        # Data SMS (OTA provisioning, WAP push, SIM toolkit, malformed UDH)
-        # is retained for diagnosis but has no human-readable notification
-        # body. Suppress it before matching even an `all` rule.
-        if message.get("is_binary") or frame.get("binary"):
+        # A damaged message is `is_binary` too — its decoded body is mojibake
+        # for the same reason — but unlike a data SMS it was written by a person
+        # for a person, and the agent salvaged part of it.  Push what survived:
+        # suppressing it is how a verification code goes missing silently, which
+        # is the worse failure of the two.
+        damaged = _salvaged(message, frame) is not None
+        if not damaged and (message.get("is_binary") or frame.get("binary")):
+            # Data SMS (OTA provisioning, WAP push, SIM toolkit, malformed UDH)
+            # is retained for diagnosis but has no human-readable notification
+            # body.  Suppress it before matching even an `all` rule.
             log.debug("suppressing notification for data SMS %s", message_id)
             return []
 
-        body = message.get("body") or frame.get("body") or ""
+        # Matched on exactly what the channel will render, salvage included: a
+        # keyword rule for "GitHub" should fire when the recovered fragment says
+        # GitHub, and must not fire on mojibake the reader never sees.
+        body = notification_body(message, frame)
         targets = match_rules(self.db, sim_id=message.get("sim_id"), body=body)
         if not targets:
             log.debug("no rule matched message %s", message_id)
@@ -812,7 +865,10 @@ class Notifier:
         device = message.get("device") or frame.get("device") or ""
         return {
             "sender": message.get("peer") or frame.get("peer") or "",
-            "message": message.get("body") or frame.get("body") or "",
+            # A damaged message renders its salvaged fragment, not the mojibake
+            # in ``body``.  Decided here rather than at the call site so the
+            # text a rule matched on is the text the channel receives.
+            "message": notification_body(message, frame),
             "timestamp": self._local(message.get("ts") or frame.get("ts") or utcnow()),
             "card": self._card_name(message, iccid, device),
             "device": device,

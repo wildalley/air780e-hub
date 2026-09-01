@@ -48,7 +48,7 @@ log = logging.getLogger(__name__)
 # Never renumber or edit a released entry — a database that already ran it will
 # not run it again, so an edit only affects databases that have not, and the two
 # then disagree about what version N means.
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 # Persisted (settings table) key for the SMS retention window, in days.  The
 # operator edits it on the Notify page; when unset the env default applies.
@@ -178,6 +178,17 @@ CREATE TABLE IF NOT EXISTS messages (
     -- malformed UDH whose payload boundary cannot be trusted, or an empty
     -- service-centre-specific PID message. The UI renders what it is.
     is_binary  INTEGER NOT NULL DEFAULT 0,
+    -- The modem handed us this frame with octets already missing, so `body` is
+    -- mojibake: it was decoded under header fields that are really message
+    -- body. These three are what the agent could re-phase out of the wreckage.
+    -- `recovered_body` is always a fragment of the middle — the head and tail
+    -- were gone before the agent saw the frame — and an empty `recovered_code`
+    -- on a truncated row means "the code did not survive", never "no code was
+    -- sent". Kept apart from `body`/`is_binary` so nothing renders a fragment
+    -- as if it were the whole message.
+    truncated      INTEGER NOT NULL DEFAULT 0,
+    recovered_body TEXT,
+    recovered_code TEXT,
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts DESC);
@@ -555,6 +566,8 @@ class Database:
          "_migration_modem_diagnostics"),
         (9, "record module supply voltage and its low-voltage threshold",
          "_migration_supply_voltage"),
+        (10, "keep what was salvaged from a truncated message",
+         "_migration_salvaged_messages"),
     )
 
     def _add_columns_if_missing(self, table: str, columns: dict[str, str]) -> None:
@@ -699,6 +712,24 @@ class Database:
         self._add_columns_if_missing(
             "device_status",
             {"voltage_mv": "INTEGER"},
+        )
+
+    def _migration_salvaged_messages(self) -> None:
+        """v9 -> v10: keep what was salvaged from a message that arrived damaged.
+
+        Existing rows keep ``truncated = 0``.  Backfilling them is not possible
+        and would be wrong to guess at: the salvage runs in the Agent against a
+        frame it has just read, and a stored row's ``raw_pdu`` is the damaged
+        PDU with no record of which fields were really body.  A message that
+        was lost before this migration stays lost; only new ones are recovered.
+        """
+        self._add_columns_if_missing(
+            "messages",
+            {
+                "truncated": "INTEGER NOT NULL DEFAULT 0",
+                "recovered_body": "TEXT",
+                "recovered_code": "TEXT",
+            },
         )
 
     def _snapshot_before_migration(self, from_version: int) -> Path | None:
@@ -1255,15 +1286,20 @@ class Database:
         raw_pdu: str | None = None,
         dcs: int | None = None,
         is_binary: bool = False,
+        truncated: bool = False,
+        recovered_body: str | None = None,
+        recovered_code: str | None = None,
     ) -> int:
         sim_id = self.upsert_sim(iccid)
         cursor = self.execute(
             "INSERT INTO messages "
             "(agent_id, device, sim_id, direction, peer, body, ts, status, "
-            " segments, seq, error, raw_pdu, dcs, is_binary, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " segments, seq, error, raw_pdu, dcs, is_binary, truncated, "
+            " recovered_body, recovered_code, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (agent_id, device, sim_id, direction, peer, body, to_utc_iso(ts), status,
-             segments, seq, error, raw_pdu, dcs, int(is_binary), utcnow()),
+             segments, seq, error, raw_pdu, dcs, int(is_binary), int(truncated),
+             recovered_body or None, recovered_code or None, utcnow()),
         )
         return int(cursor.lastrowid)
 
@@ -1541,6 +1577,11 @@ class Database:
             "SELECT summary.sim_id, summary.peer, latest.device, "
             "       latest.id AS last_id, latest.body AS last_body, "
             "       latest.is_binary AS last_is_binary, "
+            # A damaged newest message is is_binary too, but the list must not
+            # call it an operator data SMS — it was a person writing to a
+            # person, and the salvage is what the preview should show.
+            "       latest.truncated AS last_truncated, "
+            "       latest.recovered_body AS last_recovered_body, "
             "       latest.direction AS last_direction, "
             "       latest.status AS last_status, summary.last_ts, "
             "       summary.message_count, "
@@ -1629,8 +1670,14 @@ class Database:
             clauses.append("m.peer = ?")
             params.append(peer)
         if search:
-            clauses.append("(m.body LIKE ? OR m.peer LIKE ?)")
-            params.extend([f"%{search}%", f"%{search}%"])
+            # The salvaged fragment is searched alongside the body: on a damaged
+            # message `body` is mojibake, so a search for the code that *was*
+            # recovered would otherwise find nothing.
+            clauses.append(
+                "(m.body LIKE ? OR m.peer LIKE ? OR m.recovered_body LIKE ? "
+                " OR m.recovered_code LIKE ?)"
+            )
+            params.extend([f"%{search}%"] * 4)
         if content == "text":
             clauses.append("m.is_binary = 0")
         elif content == "data":

@@ -829,10 +829,31 @@ class DeviceWorker:
                 "dcs": sms.dcs,
                 "alphabet": sms.alphabet,
                 "binary": sms.is_binary,
+                # The frame reached us with octets missing, so `body` above is
+                # mojibake — it was decoded under header fields that are really
+                # message body.  These three are the only readable thing left,
+                # and without them on the wire the salvage would exist only in
+                # the agent's log: the Server would store the mojibake, the UI
+                # would call it an operator data SMS, and the push engine would
+                # suppress it.  A lost verification code has to be visible.
+                "truncated": sms.truncated,
+                "recovered_text": sms.recovered_text,
+                "code": sms.code,
             },
         )
         # Deliberately no message body in logs: verification codes are sensitive.
-        log.info("[%s] sms from %s (%d chars)", self.name, sms.address, len(sms.text))
+        if sms.truncated:
+            log.warning(
+                "[%s] sms from %s arrived damaged; recovered %d char(s), code %s",
+                self.name,
+                sms.address,
+                len(sms.recovered_text),
+                "found" if sms.code else "not recoverable",
+            )
+        else:
+            log.info(
+                "[%s] sms from %s (%d chars)", self.name, sms.address, len(sms.text)
+            )
 
     def _on_delivery(self, report: StatusReport) -> None:
         """Persist a modem delivery report in the outbound event queue."""

@@ -14,6 +14,18 @@ from air780e_agent.discovery import PortRegistry, ProbeResult
 from air780e_agent.mock import MockAir780E
 from air780e_agent.store import LocalStore
 
+# A real capture: the modem handed this over with octets missing between the
+# originating address and the user data, so a spec-conformant decode reads
+# message body as TP-DCS and TP-SCTS.  `test_pdu.py` owns the decoding side of
+# it; here it is only a frame that must reach the Server with its salvage
+# attached.  Kept as a literal rather than imported so a test-module rename
+# cannot quietly disarm this one.
+DELIVER_TRUNCATED_KRAKEN = (
+    "0791448720003023240BD04B79785D7603B21B642FCBD3E6F4384C4FBFDDA0F19B5C06A5E73AD0EC"
+    "46C3D9722E10F1ED3ED1417374585E06D1D1E93968FC269741F7341D0D0ABBF36F7779077AD7E5A0"
+    "721BCE7EE7CBE539E89E66B341EEB2BD2C0785E76B90F9"
+)
+
 TWO_DEVICES = b"""
 [agent]
 id = "test-agent"
@@ -430,6 +442,67 @@ async def test_queued_events_survive_a_restart(agent, tmp_path):
         reopened.close()
 
 
+async def test_a_damaged_message_carries_its_salvage_to_the_server(agent):
+    """The salvage has to be on the wire, or it exists only in the agent's log.
+
+    `body` here is mojibake — the modem dropped octets before the agent saw the
+    frame, so the decoder read message body as TP-DCS/SCTS.  Without these three
+    fields the Server would store that mojibake, the UI would file it as an
+    operator data SMS, and the push engine would suppress it: a verification
+    code lost with nothing anywhere saying so.
+    """
+    await agent.wait_online()
+    agent.mocks["a"].deliver_pdu(DELIVER_TRUNCATED_KRAKEN)
+
+    events = await agent.wait_for_events("sms_in", 1)
+    payload = events[0].payload
+    assert payload["truncated"] is True
+    assert payload["code"] == "374869"
+    assert "verification code is: 374869" in payload["recovered_text"]
+    # The spec-conformant decode still travels untouched, and still says
+    # "not text" — the salvage is a bypass, not a repair.
+    assert payload["binary"] is True
+    assert payload["body"] != payload["recovered_text"]
+
+
+async def test_an_undamaged_message_claims_no_salvage(agent):
+    """The fields are always present, and false/empty on a healthy frame.
+
+    A `truncated` that is merely absent would make the Server's default the
+    thing under test on every upgrade; asserting it here keeps the damaged
+    branch reachable only by actually damaged frames.
+    """
+    await agent.wait_online()
+    agent.mocks["a"].deliver("10086", "验证码 123456")
+
+    events = await agent.wait_for_events("sms_in", 1)
+    payload = events[0].payload
+    assert payload["truncated"] is False
+    assert payload["recovered_text"] == ""
+    assert payload["code"] == ""
+
+
+async def test_a_damaged_message_keeps_its_salvage_out_of_the_logs(agent, caplog):
+    """The damaged path logs too, and must not become the body's way out.
+
+    It warns instead of logging at info, which is a second place the no-body
+    rule has to hold — a recovered verification code is still a verification
+    code.
+    """
+    import logging
+
+    caplog.set_level(logging.DEBUG, logger="air780e_agent.worker")
+    await agent.wait_online()
+    agent.mocks["a"].deliver_pdu(DELIVER_TRUNCATED_KRAKEN)
+    await agent.wait_for_events("sms_in", 1)
+
+    assert "374869" not in caplog.text
+    assert "verification code is" not in caplog.text
+    # It does say a message arrived damaged: silence here is how the fault went
+    # unnoticed in the first place.
+    assert "damaged" in caplog.text
+
+
 async def test_message_body_is_not_written_to_logs(agent, caplog):
     import logging
 
@@ -789,3 +862,170 @@ async def test_a_firmware_without_cbc_reports_no_voltage(agent):
 
     assert payload["voltage_mv"] is None
     assert agent.app.workers["a"].online is True
+
+
+# --------------------------------------------------------------------------
+# autodetect: a module nobody configured
+# --------------------------------------------------------------------------
+
+
+ONE_PINNED_DEVICE = b"""
+[agent]
+id = "test-agent"
+status_interval = 0.05
+autodetect_interval = 0.05
+
+[[devices]]
+name = "a"
+port = "/dev/fake-a"
+"""
+
+
+@dataclass
+class AdoptRig:
+    """An agent whose /dev holds one configured module and one stranger."""
+
+    app: AgentApp
+    mocks: dict[str, MockAir780E]
+    runner: asyncio.Task
+
+    async def wait_for_worker(self, predicate, timeout: float = 3.0) -> str:
+        async with asyncio.timeout(timeout):
+            while True:
+                for name, worker in list(self.app.workers.items()):
+                    if predicate(name, worker):
+                        return name
+                await asyncio.sleep(0.01)
+
+
+@pytest.fixture
+async def adopting(tmp_path, monkeypatch):
+    config = AgentConfig.parse(ONE_PINNED_DEVICE)
+    config.db_path = tmp_path / "agent.db"
+
+    mocks: dict[str, MockAir780E] = {}
+    transports: dict[str, PipeTransport] = {}
+    # "/dev/fake-a" is device a, pinned.  "/dev/ttyACM7" is a module that no
+    # [[devices]] block mentions — the one autodetect exists for.
+    for port, imei in (
+        ("/dev/fake-a", "867567048825490"),
+        ("/dev/ttyACM7", "862323088372050"),
+    ):
+        agent_side, modem_side = PipeTransport.create_pair()
+        mock = MockAir780E(
+            transport=modem_side, imei=imei, iccid=f"89860622180012345{imei[-2:]}"
+        )
+        await mock.start()
+        mocks[port] = mock
+        transports[port] = agent_side
+
+    async def prober(port: str, *, timeout: float):
+        mock = mocks.get(port)
+        return None if mock is None else ProbeResult(
+            port=port, model=mock.model, imei=mock.imei, iccid=mock.iccid
+        )
+
+    monkeypatch.setattr(
+        "air780e_agent.discovery.globmodule.glob", lambda pattern: ["/dev/ttyACM7"]
+    )
+
+    def factory(device: DeviceConfig) -> PipeTransport:
+        return transports[device.port]
+
+    app = AgentApp(
+        config,
+        transport_factory=factory,
+        registry=PortRegistry(prober=prober, probe_timeout=0.1),
+    )
+    runner = asyncio.create_task(app.run())
+    rig = AdoptRig(app=app, mocks=mocks, runner=runner)
+    try:
+        yield rig
+    finally:
+        await app.stop()
+        runner.cancel()
+        await asyncio.gather(runner, return_exceptions=True)
+        for mock in mocks.values():
+            await mock.stop()
+
+
+async def test_a_new_module_is_adopted_without_being_configured(adopting):
+    """The point of the feature: plug in a module, it works.
+
+    Swapping hardware used to mean reading the new IMEI by hand and editing
+    the config before the agent would touch it.
+    """
+    name = await adopting.wait_for_worker(lambda n, w: n != "a")
+
+    assert name == "auto-372050", "the name must be derived from the IMEI"
+    worker = adopting.app.workers[name]
+    assert worker.config.imei == "862323088372050"
+
+    async with asyncio.timeout(3.0):
+        while not worker.online:
+            await asyncio.sleep(0.01)
+    assert worker.describe()["port"] == "/dev/ttyACM7"
+
+
+async def test_adoption_is_announced_to_the_server(adopting):
+    """A module that starts sending SMS under a name nobody typed has to be
+    visible, or the server shows an unexplained device."""
+    await adopting.wait_for_worker(lambda n, w: n != "a")
+
+    async with asyncio.timeout(3.0):
+        while True:
+            adopted = [
+                e.payload
+                for e in adopting.app.store.unacked_events(limit=1000)
+                if e.kind == "log"
+                and e.payload.get("event") == "device_adopted"
+            ]
+            if adopted:
+                break
+            await asyncio.sleep(0.01)
+
+    assert adopted[0]["imei"] == "862323088372050"
+    assert adopted[0]["device"] == "auto-372050"
+
+
+async def test_a_module_is_adopted_only_once(adopting):
+    """The scan repeats every interval; a claimed port must drop out of it."""
+    await adopting.wait_for_worker(lambda n, w: n != "a")
+    # Several more scan intervals.
+    await asyncio.sleep(0.3)
+
+    auto = [n for n in adopting.app.workers if n.startswith("auto-")]
+    assert auto == ["auto-372050"]
+
+
+async def test_the_configured_device_keeps_its_own_module(adopting):
+    """Adoption must not touch a pinned port, even though the glob could
+    return it — the pinned worker already holds that tty open."""
+    await adopting.wait_for_worker(lambda n, w: n != "a")
+    assert adopting.app.workers["a"].config.port == "/dev/fake-a"
+    assert "a" in adopting.app.workers
+
+
+async def test_an_adopted_name_survives_a_restart(adopting):
+    """The name is on every event the module produces, so it must not drift.
+
+    A name derived fresh each run would be fine while the derivation stays
+    put — but the server keys history by device name, and a rename splits one
+    module's history into two devices.  Hence the kv table: the stored answer
+    cannot change even if the derivation does.
+    """
+    name = await adopting.wait_for_worker(lambda n, w: n != "a")
+    key = "autodetect:imei:862323088372050"
+    assert adopting.app.store.get(key) == name
+
+    # Rewritten to something the derivation would never produce, standing in
+    # for a name this module was adopted under by an older version.  Asserting
+    # only that a second run agrees would prove nothing — the derivation is
+    # deterministic, so it agrees with itself even with the lookup removed.
+    adopting.app.store.set(key, "auto-from-an-older-agent")
+    revived = AgentApp(
+        adopting.app.config,
+        transport_factory=lambda device: None,
+        store=adopting.app.store,
+    )
+    assert revived._name_for("862323088372050") == "auto-from-an-older-agent"

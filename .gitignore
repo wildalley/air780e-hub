@@ -48,3 +48,8 @@ config.toml
 *.key
 cookies.txt
 *.csv
+
+# --- Claude Code diagnostic scratch / probe scripts (never part of the repo) ---
+.diag/
+_*.py
+_*_task.md

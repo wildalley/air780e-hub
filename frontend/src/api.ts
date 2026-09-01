@@ -197,6 +197,16 @@ export interface Message {
   raw_pdu?: string | null
   dcs?: number | null
   is_binary?: number   // 1 for 8-bit/port data, malformed UDH, or an operator control SMS
+  /**
+   * 1 when the modem dropped octets out of the frame before the agent saw it.
+   * `body` is then mojibake — it was decoded under header fields that are
+   * really message body — and these two hold what could be re-phased out of
+   * it. `recovered_body` is always a fragment of the middle, and an empty
+   * `recovered_code` means the code did not survive, not that none was sent.
+   */
+  truncated?: number
+  recovered_body?: string | null
+  recovered_code?: string | null
 }
 
 /** One thread: everything exchanged with one number through one card. */
@@ -208,6 +218,10 @@ export interface Conversation {
   last_body: string
   /** 1 when the newest message was data rather than text. */
   last_is_binary?: number
+  /** 1 when the newest message reached us damaged; see `Message.truncated`. */
+  last_truncated?: number
+  last_recovered_body?: string | null
+  last_recovered_code?: string | null
   last_direction: 'in' | 'out'
   last_status: string
   last_ts: string

@@ -19,6 +19,11 @@ MESSAGE_CSV_HEADER = (
     "body",
     "status",
     "is_binary",
+    # A damaged frame's `body` is mojibake, so an export without these three
+    # loses the only readable part of it.
+    "truncated",
+    "recovered_body",
+    "recovered_code",
     "dcs",
     "raw_pdu",
 )
@@ -64,6 +69,9 @@ def iter_message_csv(
                 message["body"],
                 message["status"],
                 message.get("is_binary") or 0,
+                message.get("truncated") or 0,
+                message.get("recovered_body") or "",
+                message.get("recovered_code") or "",
                 "" if message.get("dcs") is None else message["dcs"],
                 message.get("raw_pdu") or "",
             )

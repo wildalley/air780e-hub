@@ -764,6 +764,92 @@ def test_v9_upgrade_adds_the_supply_voltage_columns_and_keeps_devices(tmp_path):
         snapshot.close()
 
 
+def test_v10_upgrade_adds_the_salvage_columns_and_keeps_the_messages(tmp_path):
+    path = tmp_path / "hub.db"
+    database = Database(path)
+    message_id = database.insert_message(
+        agent_id="agent-a", device="a", direction="in", peer="10086",
+        body="鼠S耸盘涌羹", ts=utcnow(), iccid="8986000000000000001",
+        is_binary=True,
+    )
+    database.close()
+
+    connection = sqlite3.connect(path)
+    try:
+        for column in ("truncated", "recovered_body", "recovered_code"):
+            connection.execute(f"ALTER TABLE messages DROP COLUMN {column}")
+        connection.execute("PRAGMA user_version = 9")
+        connection.commit()
+    finally:
+        connection.close()
+
+    database = Database(path)
+    try:
+        assert _user_version(path) == SCHEMA_VERSION
+        columns = {row["name"] for row in database.query("PRAGMA table_info(messages)")}
+        assert {"truncated", "recovered_body", "recovered_code"} <= columns
+        row = database.one(
+            "SELECT body, is_binary, truncated, recovered_body, recovered_code "
+            "FROM messages WHERE id = ?",
+            (message_id,),
+        )
+        # A message stored before the salvage existed reads as undamaged rather
+        # than as damaged-with-nothing-recovered: `truncated` has to default to
+        # 0, or every historical data SMS would start pushing a "损坏" warning.
+        assert row == {
+            "body": "鼠S耸盘涌羹",
+            "is_binary": 1,
+            "truncated": 0,
+            "recovered_body": None,
+            "recovered_code": None,
+        }
+    finally:
+        database.close()
+
+    snapshot = sqlite3.connect(path.with_name(f"{path.name}.v9.bak"))
+    try:
+        columns = {row[1] for row in snapshot.execute("PRAGMA table_info(messages)")}
+        assert not {"truncated", "recovered_body", "recovered_code"} & columns
+    finally:
+        snapshot.close()
+
+
+def test_a_salvaged_message_round_trips_and_is_searchable(tmp_path):
+    """Storing the salvage is only useful if it can be found again.
+
+    Searching `body` alone searches mojibake: the words the reader actually saw
+    live in `recovered_body`, so a search for the code in a damaged message
+    would come back empty while the code sat in the database.
+    """
+    database = Database(tmp_path / "hub.db")
+    try:
+        damaged = database.insert_message(
+            agent_id="agent-a", device="a", direction="in", peer="GitHub",
+            body="鼠S耸盘涌羹", ts=utcnow(), iccid="8986000000000000001",
+            is_binary=True, truncated=True,
+            recovered_body="GitHub code 314159", recovered_code="314159",
+        )
+        row = database.one(
+            "SELECT truncated, recovered_body, recovered_code FROM messages "
+            "WHERE id = ?",
+            (damaged,),
+        )
+        assert row == {
+            "truncated": 1,
+            "recovered_body": "GitHub code 314159",
+            "recovered_code": "314159",
+        }
+
+        found = database.messages(search="314159")
+        assert [m["id"] for m in found] == [damaged]
+
+        thread = database.conversations()[0]
+        assert thread["last_truncated"] == 1
+        assert thread["last_recovered_body"] == "GitHub code 314159"
+    finally:
+        database.close()
+
+
 def test_message_read_paths_use_the_new_indexes(tmp_path):
     database = Database(tmp_path / "hub.db")
     try:

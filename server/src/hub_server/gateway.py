@@ -388,6 +388,12 @@ class Gateway:
             # during a Server-first rolling upgrade.
             is_binary=bool(frame.get("binary"))
             or bool(raw_pdu and _pdu_is_data(raw_pdu)),
+            # Optional v1 extension: an Agent old enough not to send these
+            # simply has no salvage to report, and the row reads as an
+            # undamaged message — which is what it looked like before.
+            truncated=bool(frame.get("truncated")),
+            recovered_body=frame.get("recovered_text") or None,
+            recovered_code=frame.get("code") or None,
         )
         return message_id
 
