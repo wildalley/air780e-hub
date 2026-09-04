@@ -288,6 +288,7 @@ class AgentApp:
             "scan_operators": self._cmd_scan_operators,
             "select_operator": self._cmd_select_operator,
             "network_diagnostics": self._cmd_network_diagnostics,
+            "ussd": self._cmd_ussd,
             "raw_at": self._cmd_raw_at,
         }
         handler = handlers.get(kind or "")
@@ -412,3 +413,10 @@ class AgentApp:
 
     async def _cmd_network_diagnostics(self, frame: dict[str, Any]) -> dict[str, Any]:
         return await self._worker(frame).network_diagnostics()
+
+    async def _cmd_ussd(self, frame: dict[str, Any]) -> dict[str, Any]:
+        worker = self._worker(frame)
+        code = str(frame.get("code", "")).strip()
+        if not code:
+            raise ValueError("ussd needs a code")
+        return await worker.ussd(code)

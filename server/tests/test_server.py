@@ -2565,8 +2565,8 @@ def test_every_paged_log_endpoint_answers_with_items_and_total(admin):
 
 def test_ussd_query_returns_the_raw_response(admin):
     """Manual USSD for foreign PAYG cards where automatic parsing would fail."""
-    import threading
     import queue
+    import threading
 
     result_queue = queue.Queue()
 
@@ -2577,8 +2577,8 @@ def test_ussd_query_returns_the_raw_response(admin):
             _greet(ws)
             # Wait for the USSD command
             frame = ws.receive_json()
-            assert frame["type"] == "command"
-            assert "AT+CUSD=1," in frame["command"]
+            assert frame["type"] == "ussd"
+            assert frame["code"] == "*101#"
             # Send back a mock response
             ws.send_json({
                 "type": "cmd_result",
