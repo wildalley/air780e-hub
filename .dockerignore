@@ -16,6 +16,7 @@ SECURITY.md
 CHANGELOG.md
 
 frontend/node_modules
+frontend/dist
 frontend/tsconfig.tsbuildinfo
 server/.venv
 server/tests

@@ -36,30 +36,50 @@ async def test_data_status_requires_both_attachment_and_pdp_to_be_off():
     assert await modem.read_data_status() == (True, True)
 
 
-async def test_disabling_data_deactivates_contexts_before_detaching():
+async def test_disabling_data_deactivates_contexts_but_keeps_packet_attachment():
     modem, client = _modem({
         "AT+CGACT=0": ATResponse("AT+CGACT=0"),
-        "AT+CGATT=0": ATResponse("AT+CGATT=0"),
         "AT+CGATT?": ATResponse("AT+CGATT?", ["+CGATT: 0"]),
         "AT+CGACT?": ATResponse("AT+CGACT?", ["+CGACT: 1,0"]),
+        "AT+CGATT=1": ATResponse("AT+CGATT=1"),
     })
 
     assert await modem.set_data_enabled(False) == (False, False)
-    assert client.calls[:2] == ["AT+CGACT=0", "AT+CGATT=0"]
+    assert "AT+CGATT=0" not in client.calls
+    # A previously detached module is reattached for registration, then the
+    # context is deactivated again so a successful attach cannot leave a PDP up.
+    assert client.calls[:5] == [
+        "AT+CGATT?",
+        "AT+CGACT?",
+        "AT+CGATT=1",
+        "AT+CGACT=0",
+        "AT+CGATT?",
+    ]
+
+
+async def test_disabling_data_does_not_touch_an_already_attached_idle_modem():
+    modem, client = _modem({
+        "AT+CGATT?": ATResponse("AT+CGATT?", ["+CGATT: 1"]),
+        "AT+CGACT?": ATResponse("AT+CGACT?", ["+CGACT: 1,0"]),
+    })
+
+    assert await modem.set_data_enabled(False) == (True, False)
+    assert "AT+CGATT=0" not in client.calls
+    assert "AT+CGACT=0" not in client.calls
 
 
 async def test_disabling_data_fails_if_the_modem_does_not_confirm_both_states_off():
     modem, _ = _modem({
         "AT+CGACT=0": ATResponse("AT+CGACT=0"),
-        "AT+CGATT=0": ATResponse("AT+CGATT=0"),
         "AT+CGATT?": ATResponse("AT+CGATT?", ["+CGATT: 1"]),
-        "AT+CGACT?": ATResponse("AT+CGACT?", ["+CGACT: 1,0"]),
+        "AT+CGACT?": ATResponse("AT+CGACT?", ["+CGACT: 1,1"]),
     })
 
     try:
         await modem.set_data_enabled(False)
     except ATError as exc:
         assert "not confirmed" in str(exc)
+        assert exc.command == "AT+CGACT=0"
     else:
         raise AssertionError("a positive data state must not be reported as off")
 

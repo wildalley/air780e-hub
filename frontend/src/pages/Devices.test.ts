@@ -3,6 +3,7 @@ import {
   formatDiagnostics,
   imsRegistrationStatus,
   networkRegistrationStatus,
+  packetDataStatus,
   radioStatus,
 } from '../deviceStatus'
 
@@ -48,6 +49,23 @@ describe('imsRegistrationStatus', () => {
     expect(imsRegistrationStatus({ ims_registered: null })).toBe('IMS 状态未知')
     expect(imsRegistrationStatus({ ims_registered: 0 })).toBe('IMS 未注册')
     expect(imsRegistrationStatus({ ims_registered: 1 })).toBe('IMS 已注册')
+  })
+})
+
+describe('packetDataStatus', () => {
+  it('treats an attached but inactive PDP as data-off', () => {
+    expect(
+      packetDataStatus({ data_enabled: 0, data_attached: 1, pdp_active: 0 }),
+    ).toBe('已关闭 · 保留网络附着')
+  })
+
+  it('keeps policy and actual data session separate', () => {
+    expect(
+      packetDataStatus({ data_enabled: 1, data_attached: 1, pdp_active: 0 }),
+    ).toBe('已允许 · PDP 未激活')
+    expect(
+      packetDataStatus({ data_enabled: 1, data_attached: 1, pdp_active: 1 }),
+    ).toBe('PDP 已激活')
   })
 })
 

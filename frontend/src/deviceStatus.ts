@@ -24,10 +24,19 @@ export function imsRegistrationStatus(
 }
 
 export function packetDataStatus(
-  device: Pick<Device, 'data_attached' | 'pdp_active'>,
+  device: Pick<Device, 'data_enabled' | 'data_attached' | 'pdp_active'>,
 ): string {
-  if (device.data_attached === 0 && device.pdp_active === 0) return '已关闭'
-  if (device.pdp_active === 1) return 'PDP 已激活'
+  if (device.pdp_active === 1) {
+    return device.data_enabled === 0 ? '策略已关闭 · PDP 仍激活' : 'PDP 已激活'
+  }
+  if (device.pdp_active === 0 && device.data_enabled === 0) {
+    if (device.data_attached === 1) return '已关闭 · 保留网络附着'
+    if (device.data_attached === 0) return '已关闭 · 未附着'
+    return '已关闭 · PDP 未激活'
+  }
+  if (device.pdp_active === 0 && device.data_enabled === 1) {
+    return device.data_attached === 1 ? '已允许 · PDP 未激活' : '已允许 · 未激活 PDP'
+  }
   if (device.data_attached === 1) return '已附着 · 未激活 PDP'
   if (device.data_attached === 0 && device.pdp_active == null) return 'PDP 未激活 · 附着未知'
   if (device.data_attached == null && device.pdp_active === 0) return '未激活 · 附着未知'

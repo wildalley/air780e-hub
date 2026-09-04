@@ -254,6 +254,11 @@ class KeepAliveScheduler:
             return f'sent to {number}: "{body}" ({len(refs)} segment(s))'
 
         if action == "ping":
+            # A ping is deliberate user-plane traffic.  The Agent's default
+            # policy is off, so do not let a scheduled keep-alive bypass the
+            # same guard used by the manual worker method.
+            if getattr(worker, "data_enabled", True) is not True:
+                raise TaskSkipped("移动数据已关闭，已跳过 ping")
             host = str(task["content"] or "").strip() or DEFAULT_PING_HOST
             if not await worker.ping(host):
                 raise RuntimeError(f"ping {host} got no reply")

@@ -17,7 +17,7 @@ air780e-hub 分为两个独立进程：
 | Python | 3.11 – 3.14 | CI 对 Agent 与 Server 在四个版本上各跑全量测试 |
 | Server 运行时 | 镜像内固定 `python:3.12-slim` | 源码部署可用 3.11 – 3.14 任一 |
 | Agent 运行时 | 发行版自带 `python3` | 按 §2.1 用系统解释器建 venv，故上限跟随最新稳定版 |
-| Node | 24（active LTS，仅开发/CI 构建期） | 前端静态包已随版本提交，部署主机不需要 Node |
+| Node | 24（active LTS，仅镜像构建期） | 前端在镜像构建阶段生成，运行容器不需要 Node |
 | 架构 | amd64 / arm64 | GHCR 多架构镜像 |
 
 **实机验证状态（0.1.0）**：仅一套环境跑通端到端 —— Arch Linux、Python 3.14、
@@ -52,13 +52,22 @@ air780e-hub 分为两个独立进程：
 
 ### 1.2 构建并启动
 
-两条路径都受支持。**源码构建是参考路径** —— 前端静态包已经在仓库中，部署主机不需要
-Node/npm，也不会执行 `npm ci`；只需 Docker 拉取基础镜像和 Python 依赖：
+两条路径都受支持。**源码构建是参考路径** —— Docker 会在镜像构建阶段执行锁定的
+`npm ci` 与 `npm run build`，运行容器不需要 Node/npm：
 
 ```bash
 git clone https://github.com/wildalley/air780e-hub.git /opt/air780e-hub
 cd /opt/air780e-hub
 docker compose -f deploy/docker-compose.yml up -d --build
+```
+
+Docker 构建阶段的 npm 不会读取宿主机用户的 `.npmrc`。如果服务器使用 npm 镜像，必须
+把地址作为 Compose 构建参数传进去；例如：
+
+```bash
+NPM_REGISTRY=https://registry.npmmirror.com \
+  docker compose -f deploy/docker-compose.yml build --progress=plain hub
+docker compose -f deploy/docker-compose.yml up -d
 ```
 
 也可以用已发布的镜像（amd64 / arm64）。**按摘要固定，不要用 tag**：摘要唯一对应一份字节，而 `X.Y` 会随补丁版本移动，回滚时无法指明恢复到哪一版。摘要在对应 [Release](https://github.com/wildalley/air780e-hub/releases) 正文里：

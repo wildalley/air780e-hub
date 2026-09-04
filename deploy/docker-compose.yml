@@ -5,8 +5,9 @@
 
 services:
   hub:
-    # Source build is the reference path and the default here, so a clone
-    # deploys with no registry access at all.
+    # Source build is the reference path and the default here. It builds the
+    # frontend inside the image, so the host needs access to the configured
+    # Docker/npm/Python mirrors during `--build`.
     #
     # To run a published image instead, set HUB_IMAGE to a *digest* and drop
     # the build block — `docker compose` ignores build when image is pinned:
@@ -16,6 +17,10 @@ services:
     build:
       context: ..
       dockerfile: server/Dockerfile
+      args:
+        # Host npm settings do not enter an isolated Docker build. Override
+        # this in the environment when the server uses a regional mirror.
+        NPM_REGISTRY: "${NPM_REGISTRY:-https://registry.npmjs.org/}"
     image: "${HUB_IMAGE:-air780e-hub:local}"
     container_name: air780e-hub
     restart: unless-stopped

@@ -52,6 +52,7 @@ class FakeWorker:
         self.ping_ok = ping_ok
         self.call_reaches_network = call_reaches_network
         self.radio_enabled: bool | None = True
+        self.data_enabled = True
         self.gate: asyncio.Event | None = None
 
     async def send_sms(self, number: str, body: str) -> list[int]:
@@ -383,6 +384,21 @@ async def test_ping_that_gets_no_reply_is_a_failure(store):
     await scheduler.tick_once()
     await scheduler.drain()
     assert results(events)[0]["status"] == "failed"
+
+
+async def test_ping_is_skipped_when_packet_data_policy_is_off(store):
+    worker = FakeWorker()
+    worker.data_enabled = False
+    scheduler, events = build(store, worker, tasks=[make_task(action="ping")])
+    due_now(store)
+
+    await scheduler.tick_once()
+    await scheduler.drain()
+
+    assert worker.pings == []
+    receipt = results(events)[0]
+    assert receipt["status"] == "skipped"
+    assert "移动数据已关闭" in receipt["error"]
 
 
 async def test_raw_at_action(store):

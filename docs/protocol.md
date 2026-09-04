@@ -196,6 +196,7 @@ Agent 通过 `AT+CNMI=2,1,0,1,0` 接收 `+CDS`，解码 SMS-STATUS-REPORT 后持
   "eps_registered": true,
   "cs_registered": false,
   "ims_registered": false,
+  "data_enabled": false,
   "data_attached": false,
   "pdp_active": false,
   "roaming": false,
@@ -227,12 +228,15 @@ Agent 通过 `AT+CNMI=2,1,0,1,0` 接收 `+CDS`，解码 SMS-STATUS-REPORT 后持
 低于阈值开 `device_supply_voltage` 告警,低于 3300 mV 升为 critical —— 到那儿模块还能
 跑,但一次发送突发就可能掉电重启,现象是随机掉网而不像供电问题。
 
-`data_attached` 对应 `AT+CGATT?`,表示是否附着分组数据服务；`pdp_active` 表示
-`AT+CGACT?` 返回的上下文中是否至少有一个处于激活状态。只有两者都为 `false` 才能显示
-为“数据已关闭”；任一为 `null` 都表示固件没有给出足够证据。`roaming` 来自
-`+CEREG`/`+CREG` 的状态码 `5`，`roaming_data_allowed` 是 Agent 本地持久化的安全策略，
-默认 `false`；`data_blocked_by_roaming` 表示数据开关请求被该策略拦截。上述字段都是协议
-v1 的可选扩展，旧 Agent 缺失时 Server 与前端按未知处理。
+`data_enabled` 是 Agent 本地持久化的**有效数据策略**，默认 `false`，不是调制解调器
+是否附着，也不代表已经有流量；它只决定 Agent 是否允许可能产生用户面流量的操作。
+`data_attached` 对应 `AT+CGATT?`，表示是否附着分组数据服务；`pdp_active` 表示
+`AT+CGACT?` 返回的上下文中是否至少有一个处于激活状态。对费用来说，真正需要关闭的是
+`pdp_active`：`false` 表示当前没有激活的数据会话，即使 `data_attached` 为 `true` 也只是
+保留网络控制面附着。`roaming` 来自 `+CEREG`/`+CREG` 的状态码 `5`，
+`roaming_data_allowed` 是 Agent 本地持久化的安全策略，默认 `false`；
+`data_blocked_by_roaming` 表示数据策略请求被该策略拦截。上述字段都是协议 v1 的可选扩展，
+旧 Agent 缺失时 Server 与前端按未知处理。
 
 ### `call_event` —— 通话记录
 
@@ -455,10 +459,14 @@ Agent 通过 `AT+CFUN=0/1` 切换并在 `cmd_result.data` 返回当前
 {"type":"set_data","cmd_id":"c-9a10","device":"a","enabled":false}
 ```
 
-`enabled=false` 依次执行 `AT+CGACT=0` 与 `AT+CGATT=0`，再查询两个状态；只有确认
-PDP 上下文全部停用且分组数据服务已分离，回执才会显示关闭。`enabled=true` 只执行
-`AT+CGATT=1`，不会替调用者猜测 APN 或擅自激活 PDP。该偏好在 Agent 本地保存，重连后
-仍会执行；默认值为关闭。
+`enabled=false` 停用 PDP 上下文(`AT+CGACT=0`)并查询确认 `pdp_active=false`；**不会**
+发送 `AT+CGATT=0`，因为强制分离分组服务可能连带影响 EPS/IMS 注册。若模块之前已经被
+旧版本分离，Agent 会尽力执行 `AT+CGATT=1` 恢复附着，然后再次停用 PDP；这不会主动猜测
+APN 或激活用户数据。`enabled=true` 只允许 Agent 保留/恢复分组服务附着，仍不会替调用者
+猜测 APN 或擅自激活 PDP。该偏好在 Agent 本地保存，重连后仍会执行；默认值为关闭。
+
+`ping` 属于真实用户面流量，策略关闭时调度器会跳过，不会发送 `AT+CIPPING`。
+管理员执行 `raw_at` 仍可绕过这层保护，现场需要自行确认没有发送 `AT+CGACT=1` 等命令。
 
 ### `set_roaming_data` —— 漫游数据安全策略
 

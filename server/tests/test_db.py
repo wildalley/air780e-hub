@@ -105,6 +105,26 @@ def test_registration_domains_preserve_false_and_unknown(tmp_path):
         database.close()
 
 
+def test_data_policy_is_stored_separately_from_modem_data_state(tmp_path):
+    database = Database(tmp_path / "hub.db")
+    try:
+        database.upsert_device(
+            "agent-a",
+            {
+                "name": "modem-a",
+                "data_enabled": False,
+                "data_attached": True,
+                "pdp_active": False,
+            },
+        )
+        row = database.one(
+            "SELECT data_enabled, data_attached, pdp_active FROM devices"
+        )
+        assert row == {"data_enabled": 0, "data_attached": 1, "pdp_active": 0}
+    finally:
+        database.close()
+
+
 # -- schema versioning ----------------------------------------------------
 
 

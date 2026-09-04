@@ -89,6 +89,10 @@ class DeviceState:
     eps_registered: bool | None = None
     cs_registered: bool | None = None
     ims_registered: bool | None = None
+    # Effective local policy: whether the Agent may allow data operations.
+    # This is deliberately separate from ``data_attached`` and ``pdp_active``;
+    # an attached modem can still have no user-data session.
+    data_enabled: bool = False
     data_attached: bool | None = None
     pdp_active: bool | None = None
     roaming: bool | None = None
@@ -117,6 +121,7 @@ class DeviceState:
             "eps_registered": self.eps_registered,
             "cs_registered": self.cs_registered,
             "ims_registered": self.ims_registered,
+            "data_enabled": self.data_enabled,
             "data_attached": self.data_attached,
             "pdp_active": self.pdp_active,
             "roaming": self.roaming,
@@ -195,6 +200,7 @@ class DeviceWorker:
         self._last_recovery_attempt = 0
         self._recovery_limit_reported = False
         self._load_recovery_state()
+        self.state.data_enabled = self._desired_data_enabled()
         self.state.roaming_data_allowed = self._desired_roaming_data_allowed()
 
     @property
@@ -208,6 +214,11 @@ class DeviceWorker:
     @property
     def radio_enabled(self) -> bool | None:
         return self.state.radio_enabled
+
+    @property
+    def data_enabled(self) -> bool:
+        """Whether the local policy permits operations that may use data."""
+        return self.state.data_enabled
 
     def describe(self) -> dict[str, Any]:
         return {
@@ -367,6 +378,7 @@ class DeviceWorker:
         self.state.cs_registered = info.cs_registered
         self.state.ims_registered = info.ims_registered
         self.state.radio_enabled = info.radio_enabled
+        self.state.data_enabled = self._desired_data_enabled()
         self.state.data_attached = info.data_attached
         self.state.pdp_active = info.pdp_active
         self.state.roaming = info.roaming
@@ -380,8 +392,8 @@ class DeviceWorker:
         )
         self._settle_recovery_after_connect()
         # Enforce the persisted policy before the first status is advertised.
-        # The default is off, so a restart also turns off data that may have
-        # been left attached by an older Agent or by a manual AT command.
+        # The default is off, so a restart also deactivates any PDP context
+        # left active by an older Agent or by a manual AT command.
         await self._enforce_data_policy(modem, force=True)
         if not info.smsc:
             self._log_event("warning", "no SMSC configured; sending will fail")
@@ -454,6 +466,7 @@ class DeviceWorker:
         # positive reading on the page and accidentally call it current.
         self.state.data_attached = None
         self.state.pdp_active = None
+        self.state.data_enabled = False
         self.state.data_blocked_by_roaming = False
         self._ready.clear()
         if was_online:
@@ -800,6 +813,7 @@ class DeviceWorker:
             "eps_registered",
             "cs_registered",
             "ims_registered",
+            "data_enabled",
             "data_attached",
             "pdp_active",
             "roaming",
@@ -1040,6 +1054,8 @@ class DeviceWorker:
         return f"{network}, {ims}, firmware={firmware}"
 
     async def ping(self, host: str = "www.baidu.com") -> bool:
+        if not self.data_enabled:
+            raise DeviceOffline("移动数据已关闭，未发送 ping")
         return await self._require_radio().ping(host)
 
     async def call_keepalive(self, number: str) -> dict[str, Any]:
@@ -1147,13 +1163,21 @@ class DeviceWorker:
             and not self.state.roaming_data_allowed
         )
         self.state.data_blocked_by_roaming = blocked
-        needs_disable = not desired or blocked
-        data_is_on = self.state.data_attached is True or self.state.pdp_active is True
-        if needs_disable and (force or data_is_on):
+        effective = desired and not blocked
+        self.state.data_enabled = effective
+        needs_disable = not effective
+        # ``data_attached`` is only the packet-service control-plane state.  It
+        # is safe to keep it true while data is off; only an active PDP context
+        # represents a user-data session that must be torn down.
+        data_is_on = self.state.pdp_active is True
+        needs_attach = (
+            self.state.registered and self.state.data_attached is False
+        )
+        if needs_disable and (force or data_is_on or needs_attach):
             attached, active = await modem.set_data_enabled(False)
             self.state.data_attached = attached
             self.state.pdp_active = active
-            message = "移动数据已关闭（PDP 已停用并已分离）"
+            message = "移动数据已关闭（PDP 已停用，保留网络附着）"
             self._log_event("info", message)
             log.info("[%s] %s", self.name, message)
         elif (
@@ -1165,7 +1189,8 @@ class DeviceWorker:
             attached, active = await modem.set_data_enabled(True)
             self.state.data_attached = attached
             self.state.pdp_active = active
-            message = "移动数据已开启"
+            self.state.data_enabled = True
+            message = "已允许移动数据（不主动激活 PDP）"
             self._log_event("info", message)
             log.info("[%s] %s", self.name, message)
 

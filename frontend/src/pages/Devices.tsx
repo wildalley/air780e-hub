@@ -115,7 +115,17 @@ export function DevicesPage() {
   const setData = async (device: Device, enabled: boolean) => {
     if (
       !enabled &&
-      !window.confirm('关闭移动数据会断开蜂窝数据连接，但不会关闭短信和射频。继续？')
+      !window.confirm(
+        '关闭移动数据会停用 PDP 数据会话，但保留网络注册、短信和射频，不会执行 CGATT=0。继续？',
+      )
+    ) {
+      return
+    }
+    if (
+      enabled &&
+      !window.confirm(
+        '允许移动数据后，ping 或其他数据任务可能产生流量费用；当前只允许附着，不会主动激活 PDP。继续？',
+      )
     ) {
       return
     }
@@ -127,8 +137,8 @@ export function DevicesPage() {
         enabled
           ? result.data_blocked_by_roaming
             ? '当前策略禁止漫游数据，仍保持关闭'
-            : '移动数据已开启'
-          : '移动数据已关闭并已校验',
+            : '已允许移动数据（当前未激活 PDP）'
+          : '移动数据已关闭，PDP 已停用',
         enabled && result.data_blocked_by_roaming ? 'info' : 'success',
       )
     } catch (err) {
@@ -506,8 +516,8 @@ function DataControl({
   onChange: (enabled: boolean) => void
   compact?: boolean
 }) {
-  const known = device.data_attached != null && device.pdp_active != null
-  const enabled = device.data_attached === 1 || device.pdp_active === 1
+  const known = device.data_enabled != null && device.pdp_active != null
+  const enabled = device.data_enabled === 1
   return (
     <Stack
       direction="row"
@@ -519,7 +529,7 @@ function DataControl({
         <Box sx={{ minWidth: 0 }}>
           {!compact && (
             <Typography variant="body2" sx={{ fontWeight: 600 }}>
-              移动数据
+              允许移动数据
             </Typography>
           )}
           <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block' }}>
@@ -532,7 +542,7 @@ function DataControl({
         checked={enabled}
         onChange={(_, checked) => onChange(checked)}
         disabled={!device.online || !known || busy}
-        slotProps={{ input: { 'aria-label': `${device.name} 移动数据` } }}
+        slotProps={{ input: { 'aria-label': `${device.name} 允许移动数据` } }}
       />
     </Stack>
   )
@@ -701,6 +711,7 @@ function DeviceDrawer({
         ['固件版本', device.firmware || '—'],
         ['移动网络', networkRegistrationStatus(device)],
         ['IMS 注册', imsRegistrationStatus(device)],
+        ['数据策略', device.data_enabled == null ? '未知' : device.data_enabled ? '允许' : '关闭'],
         ['移动数据', packetDataStatus(device)],
         ['PDP 上下文', device.pdp_active == null ? '未知' : device.pdp_active ? '有激活' : '全部停用'],
         ['漫游状态', roamingStatus(device)],

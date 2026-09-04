@@ -43,6 +43,8 @@ log = logging.getLogger(__name__)
 # Version 10 keeps what was salvaged from a truncated message.
 # Version 11 records call attempts as rows rather than log text.
 # Version 12 records packet-data attachment, PDP state, and roaming policy.
+# Version 13 records the Agent's effective local data policy separately from
+# the modem's packet attachment and PDP state.
 #
 # To add a migration: append one entry to ``MIGRATIONS`` with the next integer
 # and bump this constant, and add the same columns/tables/indexes to SCHEMA so a brand
@@ -52,7 +54,7 @@ log = logging.getLogger(__name__)
 # Never renumber or edit a released entry — a database that already ran it will
 # not run it again, so an edit only affects databases that have not, and the two
 # then disagree about what version N means.
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 # Persisted (settings table) key for the SMS retention window, in days.  The
 # operator edits it on the Notify page; when unset the env default applies.
@@ -133,6 +135,7 @@ CREATE TABLE IF NOT EXISTS devices (
     eps_registered INTEGER,
     cs_registered INTEGER,
     ims_registered INTEGER,
+    data_enabled INTEGER NOT NULL DEFAULT 0,
     data_attached INTEGER,
     pdp_active INTEGER,
     roaming INTEGER,
@@ -610,6 +613,8 @@ class Database:
          "_migration_calls"),
         (12, "record packet-data and roaming policy state",
          "_migration_data_controls"),
+        (13, "record the effective local packet-data policy",
+         "_migration_data_policy"),
     )
 
     def _add_columns_if_missing(self, table: str, columns: dict[str, str]) -> None:
@@ -820,6 +825,13 @@ class Database:
                 "roaming_data_allowed": "INTEGER NOT NULL DEFAULT 0",
                 "data_blocked_by_roaming": "INTEGER NOT NULL DEFAULT 0",
             },
+        )
+
+    def _migration_data_policy(self) -> None:
+        """v12 -> v13: distinguish policy from modem attachment state."""
+        self._add_columns_if_missing(
+            "devices",
+            {"data_enabled": "INTEGER NOT NULL DEFAULT 0"},
         )
 
     def _snapshot_before_migration(self, from_version: int) -> Path | None:
@@ -1230,6 +1242,7 @@ class Database:
         "eps_registered",
         "cs_registered",
         "ims_registered",
+        "data_enabled",
         "data_attached",
         "pdp_active",
         "roaming",
@@ -1274,6 +1287,7 @@ class Database:
                     "eps_registered",
                     "cs_registered",
                     "ims_registered",
+                    "data_enabled",
                     "data_attached",
                     "pdp_active",
                     "roaming",

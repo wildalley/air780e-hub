@@ -104,6 +104,9 @@ export interface Device {
   eps_registered?: number | null
   cs_registered?: number | null
   ims_registered?: number | null
+  // Effective Agent policy; this is separate from the modem's attachment and
+  // PDP state. A device may remain attached for registration while this is 0.
+  data_enabled?: number | null
   data_attached?: number | null
   pdp_active?: number | null
   roaming?: number | null

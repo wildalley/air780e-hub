@@ -723,31 +723,68 @@ class Air780E:
         return attached, pdp_active
 
     async def set_data_enabled(self, enabled: bool) -> tuple[bool | None, bool | None]:
-        """Enable packet attachment, or fully tear down all data contexts.
+        """Allow packet data, or stop user data without dropping registration.
 
-        Disabling deactivates every PDP context before detaching packet service;
-        that makes the post-command query a meaningful guarantee rather than a
-        UI-only preference.  Enabling only attaches the packet service — it does
-        not invent an APN or activate a context that the host did not request.
+        ``CGATT`` and ``CGACT`` are different controls.  Detaching packet
+        service with ``AT+CGATT=0`` can also disturb EPS registration (and, on
+        some networks, IMS registration), while the thing that can carry user
+        traffic is an active PDP context.  Therefore the safe ``False`` path
+        deactivates PDP contexts but deliberately keeps packet attachment when
+        possible.  If an older Agent already detached the module, reattach it
+        first and deactivate again afterwards: this restores the normal
+        registration state without leaving a data context active.
+
+        Enabling only attaches packet service — it does not invent an APN or
+        activate a context that the host did not request.
         """
+        errors: list[ATError] = []
         if enabled:
             await self.client.execute("AT+CGATT=1", timeout=30.0)
         else:
-            first_error: ATError | None = None
-            for command in ("AT+CGACT=0", "AT+CGATT=0"):
+            attached, active = await self.read_data_status()
+
+            # Stop an already active context before changing attachment.  A
+            # detached module normally reports no active context, but keeping
+            # this branch makes the order safe for firmware that reports stale
+            # state during reconnect.
+            if active is not False:
                 try:
-                    await self.client.execute(command, timeout=30.0)
+                    await self.client.execute("AT+CGACT=0", timeout=30.0)
                 except ATError as exc:
-                    first_error = first_error or exc
-            if first_error is not None:
-                raise first_error
+                    errors.append(exc)
+
+            # Reattach only the packet-service control plane.  Some firmware
+            # may reject this while the modem is still searching; that is not a
+            # data-safety failure as long as the final PDP query is explicitly
+            # inactive.  If it succeeds, deactivate once more because a modem
+            # may create a default context while attaching.
+            if attached is not True:
+                try:
+                    await self.client.execute("AT+CGATT=1", timeout=30.0)
+                except ATError as exc:
+                    errors.append(exc)
+                else:
+                    try:
+                        await self.client.execute("AT+CGACT=0", timeout=30.0)
+                    except ATError as exc:
+                        errors.append(exc)
+
         state = await self.read_data_status()
-        if not enabled and state != (False, False):
+        if not enabled and state[1] is not False:
             attached, active = state
             raise ATError(
-                "packet-data disable was not confirmed "
+                "PDP deactivation was not confirmed "
                 f"(attached={attached!r}, pdp_active={active!r})",
-                command="AT+CGATT=0",
+                command="AT+CGACT=0",
+            )
+        if not enabled and errors:
+            # The post-command state is the safety guarantee.  Keep the
+            # non-fatal command failures visible for diagnostics, but do not
+            # take an otherwise healthy Agent offline merely because the card
+            # was temporarily unregistered and rejected CGATT=1.
+            log.warning(
+                "data disable command warning(s): %s",
+                "; ".join(str(error) for error in errors),
             )
         return state
 

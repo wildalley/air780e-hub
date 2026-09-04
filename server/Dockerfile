@@ -1,5 +1,22 @@
 # air780e-hub server image.
 #
+# Build from the repository root so both server/ and frontend/ are in context:
+#   docker build -t air780e-hub -f server/Dockerfile .
+
+# --- frontend ---------------------------------------------------------------
+# Must match `node-version` in .github/workflows/{ci,security}.yml: the image
+# performs the same locked npm install and production build as CI. This keeps
+# deployment independent of any generated frontend files being committed.
+FROM node:24-alpine AS frontend
+
+WORKDIR /build
+COPY frontend/package.json frontend/package-lock.json frontend/.npmrc ./
+ARG NPM_REGISTRY=https://registry.npmjs.org/
+RUN npm ci --registry="${NPM_REGISTRY}"
+COPY frontend/ ./
+RUN npm run build
+
+
 # --- Python environment ------------------------------------------------------
 FROM python:3.12-slim AS python-build
 
@@ -13,11 +30,10 @@ WORKDIR /app
 COPY server/pyproject.toml server/uv.lock ./
 COPY server/src ./src
 
-# The SPA is built and checked in by CI/local development. Copying the
-# versioned bundle keeps deployment hosts independent of Node/npm.
-COPY frontend/dist ./src/hub_server/www
-# Install exactly the versions in uv.lock. The runtime receives this
-# environment without a resolver or uv.
+# Include the SPA produced by the frontend stage, then install exactly the
+# versions in uv.lock. The runtime receives this environment without a
+# resolver or uv.
+COPY --from=frontend /build/dist ./src/hub_server/www
 RUN uv sync --frozen --no-dev --no-editable
 
 
