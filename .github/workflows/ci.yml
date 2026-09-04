@@ -117,6 +117,28 @@ jobs:
       - name: Typecheck and build
         run: npm run build
 
+  image:
+    name: Server image build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build server image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: server/Dockerfile
+          tags: air780e-hub:ci-${{ github.sha }}
+          push: false
+          progress: plain
+          provenance: false
+          sbom: false
+          # Keep npm/uv output visible in CI so a registry stall is diagnosable
+          # instead of looking like a silent RUN step.
+          outputs: type=cacheonly
+
   compose:
     name: Compose configuration
     runs-on: ubuntu-latest
