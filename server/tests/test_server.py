@@ -2582,6 +2582,7 @@ def test_ussd_query_returns_the_raw_response(admin):
             # Send back a mock response
             ws.send_json({
                 "type": "cmd_result",
+                "seq": 1,
                 "cmd_id": frame["cmd_id"],
                 "ok": True,
                 "data": {"response": "余额:50.00元"},
