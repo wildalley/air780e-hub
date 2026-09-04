@@ -55,6 +55,12 @@ REGISTRATION_RECOVERY_ACTIONS = (
     "module_reset",
 )
 
+# These policies live on the Agent because they must still be enforced while
+# the Server is unreachable.  New devices intentionally start with packet data
+# disabled; an operator has to opt in explicitly from the UI.
+DATA_POLICY_KEY_PREFIX = "device-data:"
+ROAMING_DATA_POLICY_KEY_PREFIX = "device-roaming-data:"
+
 
 class TransportFactory(Protocol):
     def __call__(self, config: DeviceConfig) -> Transport: ...
@@ -83,6 +89,11 @@ class DeviceState:
     eps_registered: bool | None = None
     cs_registered: bool | None = None
     ims_registered: bool | None = None
+    data_attached: bool | None = None
+    pdp_active: bool | None = None
+    roaming: bool | None = None
+    roaming_data_allowed: bool = False
+    data_blocked_by_roaming: bool = False
     signal: Signal = field(default_factory=Signal)
     storage_used: int = 0
     storage_capacity: int = 0
@@ -106,6 +117,11 @@ class DeviceState:
             "eps_registered": self.eps_registered,
             "cs_registered": self.cs_registered,
             "ims_registered": self.ims_registered,
+            "data_attached": self.data_attached,
+            "pdp_active": self.pdp_active,
+            "roaming": self.roaming,
+            "roaming_data_allowed": self.roaming_data_allowed,
+            "data_blocked_by_roaming": self.data_blocked_by_roaming,
             "rssi": self.signal.rssi,
             "dbm": self.signal.dbm,
             "bars": self.signal.bars,
@@ -179,6 +195,7 @@ class DeviceWorker:
         self._last_recovery_attempt = 0
         self._recovery_limit_reported = False
         self._load_recovery_state()
+        self.state.roaming_data_allowed = self._desired_roaming_data_allowed()
 
     @property
     def name(self) -> str:
@@ -261,6 +278,22 @@ class DeviceWorker:
             ),
         )
 
+    # -- packet-data policy ------------------------------------------------
+
+    @property
+    def _data_policy_store_key(self) -> str:
+        return f"{DATA_POLICY_KEY_PREFIX}{self.name}"
+
+    @property
+    def _roaming_data_policy_store_key(self) -> str:
+        return f"{ROAMING_DATA_POLICY_KEY_PREFIX}{self.name}"
+
+    def _desired_data_enabled(self) -> bool:
+        return self.store.get(self._data_policy_store_key, "0") == "1"
+
+    def _desired_roaming_data_allowed(self) -> bool:
+        return self.store.get(self._roaming_data_policy_store_key, "0") == "1"
+
     # -- supervision -------------------------------------------------------
 
     async def run(self) -> None:
@@ -334,6 +367,10 @@ class DeviceWorker:
         self.state.cs_registered = info.cs_registered
         self.state.ims_registered = info.ims_registered
         self.state.radio_enabled = info.radio_enabled
+        self.state.data_attached = info.data_attached
+        self.state.pdp_active = info.pdp_active
+        self.state.roaming = info.roaming
+        self.state.roaming_data_allowed = self._desired_roaming_data_allowed()
         self._ready.set()
         self._health_failures = 0
 
@@ -342,6 +379,10 @@ class DeviceWorker:
             self.name, info.model or "?", info.iccid or "?", info.operator or "?",
         )
         self._settle_recovery_after_connect()
+        # Enforce the persisted policy before the first status is advertised.
+        # The default is off, so a restart also turns off data that may have
+        # been left attached by an older Agent or by a manual AT command.
+        await self._enforce_data_policy(modem, force=True)
         if not info.smsc:
             self._log_event("warning", "no SMSC configured; sending will fail")
 
@@ -409,6 +450,11 @@ class DeviceWorker:
         was_online = self.state.online
         self.state.online = False
         self.state.last_error = reason
+        # An unplugged module cannot be inspected.  Do not leave the last
+        # positive reading on the page and accidentally call it current.
+        self.state.data_attached = None
+        self.state.pdp_active = None
+        self.state.data_blocked_by_roaming = False
         self._ready.clear()
         if was_online:
             self._emit_status(force=True)
@@ -695,8 +741,10 @@ class DeviceWorker:
         else:
             self.state.eps_registered = modem.info.eps_registered
             self.state.cs_registered = modem.info.cs_registered
+        self.state.roaming = getattr(modem.info, "roaming", None)
         self.state.ims_registered = await modem.read_ims_registration()
         modem.info.ims_registered = self.state.ims_registered
+        await self._enforce_data_policy(modem)
         await self._maybe_recover_registration(modem)
         self.state.signal = await modem.read_signal()
         self.state.voltage_mv = await modem.read_voltage()
@@ -752,6 +800,11 @@ class DeviceWorker:
             "eps_registered",
             "cs_registered",
             "ims_registered",
+            "data_attached",
+            "pdp_active",
+            "roaming",
+            "roaming_data_allowed",
+            "data_blocked_by_roaming",
             "operator",
             "storage_used",
             "port",
@@ -889,6 +942,26 @@ class DeviceWorker:
         keeping on its own; it also shows whether a card can be reached at all,
         which is the other half of the keep-alive question.
         """
+        # Emitted as its own frame, not just log text.  An inbound call is the
+        # only direct evidence that the card is reachable *from* the network,
+        # and a log line cannot be filtered, counted, or notified on — which is
+        # exactly what someone watching a keep-alive card needs to do with it.
+        self.emit(
+            "call_event",
+            {
+                "device": self.name,
+                "iccid": self.state.iccid,
+                "direction": "in",
+                "peer": call.number,
+                "ts": call.ts or _now(),
+                "outcome": "missed",
+                # An unanswered inbound call reached us by definition: the
+                # module could only ring because the network delivered it.
+                "reached_network": True,
+                "ring_seconds": 0.0,
+                "detail": "",
+            },
+        )
         self._log_event(
             "info",
             f"来电 {call.number or '未知号码'}（未接听，仅记录）",
@@ -989,9 +1062,24 @@ class DeviceWorker:
             self._log_event("error", f"保号呼叫 {number} 失败: {error}")
             raise ATError(error) from exc
 
-        # Reported through the log stream rather than a dedicated event kind:
-        # the scheduler's task_result already carries the outcome for a
-        # scheduled call, and this is the record for a manually placed one.
+        # Also emitted as a call record.  `task_result` carries the outcome of a
+        # scheduled call and this method's return value carries a manual one, but
+        # neither accumulates: the question a keep-alive card raises is "when did
+        # this last reach the network", and answering it needs a row per attempt.
+        self.emit(
+            "call_event",
+            {
+                "device": self.name,
+                "iccid": self.state.iccid,
+                "direction": "out",
+                "peer": number,
+                "ts": _now(),
+                "outcome": result.outcome,
+                "reached_network": result.reached_network,
+                "ring_seconds": result.ring_seconds,
+                "detail": result.detail,
+            },
+        )
         if result.reached_network:
             self._log_event("info", f"保号呼叫 {number}: {result.describe()}")
         else:
@@ -1018,11 +1106,96 @@ class DeviceWorker:
         self.state.ims_registered = modem.info.ims_registered
         if not radio_enabled:
             self.state.signal = Signal()
+            self.state.data_attached = False
+            self.state.pdp_active = False
+            self.state.data_blocked_by_roaming = False
             self._cancel_registration_recovery("radio was deliberately disabled")
         elif registered:
             self._registration_restored("network registration restored")
         else:
             self._unregistered_since = self._clock()
+        self._emit_status(force=True)
+        return self.describe()
+
+    async def _refresh_data_state(self, modem: Air780E) -> bool:
+        """Read the modem's packet-data states when the driver supports them."""
+        reader = getattr(modem, "read_data_status", None)
+        if reader is None:
+            # Keeps older test doubles and rolling Agent upgrades usable; a
+            # real Air780E always has this method.
+            return False
+        attached, active = await reader()
+        self.state.data_attached = attached
+        self.state.pdp_active = active
+        return True
+
+    async def _enforce_data_policy(self, modem: Air780E, *, force: bool = False) -> None:
+        """Apply local data and roaming policy, then retain actual state."""
+        self.state.roaming_data_allowed = self._desired_roaming_data_allowed()
+        supported = await self._refresh_data_state(modem)
+        if not supported:
+            return
+
+        desired = self._desired_data_enabled()
+        # Only an explicit home-network result (False) is safe when roaming
+        # data is not allowed.  Unknown is fail-closed so an unsupported or
+        # temporarily unavailable registration query cannot cause a surprise
+        # roaming charge.
+        blocked = (
+            desired
+            and self.state.roaming is not False
+            and not self.state.roaming_data_allowed
+        )
+        self.state.data_blocked_by_roaming = blocked
+        needs_disable = not desired or blocked
+        data_is_on = self.state.data_attached is True or self.state.pdp_active is True
+        if needs_disable and (force or data_is_on):
+            attached, active = await modem.set_data_enabled(False)
+            self.state.data_attached = attached
+            self.state.pdp_active = active
+            message = "移动数据已关闭（PDP 已停用并已分离）"
+            self._log_event("info", message)
+            log.info("[%s] %s", self.name, message)
+        elif (
+            desired
+            and not blocked
+            and self.state.registered
+            and self.state.data_attached is False
+        ):
+            attached, active = await modem.set_data_enabled(True)
+            self.state.data_attached = attached
+            self.state.pdp_active = active
+            message = "移动数据已开启"
+            self._log_event("info", message)
+            log.info("[%s] %s", self.name, message)
+
+    async def set_data_enabled(self, enabled: bool) -> dict[str, Any]:
+        """Persist and apply the packet-data preference for this device."""
+        modem = self._require_modem()
+        self.store.set(self._data_policy_store_key, "1" if enabled else "0")
+        # Refresh the registration code before deciding whether roaming blocks
+        # an enable request; a stale status sample must not bypass the guard.
+        if self.state.radio_enabled is not False:
+            self.state.registered = await modem.read_registration()
+            self.state.eps_registered = modem.info.eps_registered
+            self.state.cs_registered = modem.info.cs_registered
+            self.state.roaming = getattr(modem.info, "roaming", None)
+        await self._enforce_data_policy(modem, force=True)
+        self._emit_status(force=True)
+        return self.describe()
+
+    async def set_roaming_data_allowed(self, allowed: bool) -> dict[str, Any]:
+        """Persist whether packet data may remain attached while roaming."""
+        modem = self._require_modem()
+        self.store.set(
+            self._roaming_data_policy_store_key, "1" if allowed else "0"
+        )
+        if self.state.radio_enabled is not False:
+            self.state.registered = await modem.read_registration()
+            self.state.eps_registered = modem.info.eps_registered
+            self.state.cs_registered = modem.info.cs_registered
+            self.state.roaming = getattr(modem.info, "roaming", None)
+        await self._enforce_data_policy(modem, force=not allowed)
         self._emit_status(force=True)
         return self.describe()
 
@@ -1053,6 +1226,15 @@ class DeviceWorker:
     async def network_diagnostics(self) -> dict[str, Any]:
         """Return raw, read-only cell engineering diagnostics."""
         return {"diagnostics": await self._require_modem().read_network_diagnostics()}
+
+    async def ussd(self, code: str) -> dict[str, Any]:
+        """Send a USSD code and return the raw response."""
+        client = self._client
+        if client is None or not self.state.online:
+            raise DeviceOffline(f"device {self.name} is offline")
+        # AT+CUSD=1,<code>,15 — action=1 (send), dcs=15 (GSM-7 default alphabet)
+        response = await client.execute(f'AT+CUSD=1,"{code}",15', timeout=30.0)
+        return {"response": "\n".join(response.lines)}
 
     async def raw_at(self, command: str) -> list[str]:
         client = self._client

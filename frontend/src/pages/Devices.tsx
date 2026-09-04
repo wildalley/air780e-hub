@@ -10,6 +10,7 @@ import {
   CircularProgress,
   Divider,
   Drawer,
+  FormControlLabel,
   IconButton,
   MenuItem,
   Stack,
@@ -34,6 +35,8 @@ import CloseIcon from '@mui/icons-material/Close'
 import SearchIcon from '@mui/icons-material/SearchOutlined'
 import AutoModeIcon from '@mui/icons-material/AutorenewOutlined'
 import DiagnosticsIcon from '@mui/icons-material/TroubleshootOutlined'
+import DataUsageIcon from '@mui/icons-material/DataUsageOutlined'
+import RoamingIcon from '@mui/icons-material/PublicOutlined'
 import useSWR from 'swr'
 import {
   api,
@@ -52,7 +55,9 @@ import {
   formatDiagnostics,
   imsRegistrationStatus,
   networkRegistrationStatus,
+  packetDataStatus,
   radioStatus,
+  roamingStatus,
 } from '../deviceStatus'
 import { supplyVoltageStatus } from '../supplyVoltage'
 import { LIVE_MS } from '../swr'
@@ -66,6 +71,7 @@ export function DevicesPage() {
   const [busy, setBusy] = useState<string | null>(null)
   const [selected, setSelected] = useState<Device | null>(null)
   const [historyHours, setHistoryHours] = useState(24)
+  const [showOffline, setShowOffline] = useState(false)
 
   const { data: devices, mutate: load } = useSWR('/api/devices', () => api.devices.list())
   const { data: history = {} } = useSWR(
@@ -106,6 +112,51 @@ export function DevicesPage() {
     }
   }
 
+  const setData = async (device: Device, enabled: boolean) => {
+    if (
+      !enabled &&
+      !window.confirm('关闭移动数据会断开蜂窝数据连接，但不会关闭短信和射频。继续？')
+    ) {
+      return
+    }
+    setBusy(device.name)
+    try {
+      const result = await api.devices.setData(device.name, enabled)
+      await load()
+      toast.show(
+        enabled
+          ? result.data_blocked_by_roaming
+            ? '当前策略禁止漫游数据，仍保持关闭'
+            : '移动数据已开启'
+          : '移动数据已关闭并已校验',
+        enabled && result.data_blocked_by_roaming ? 'info' : 'success',
+      )
+    } catch (err) {
+      toast.show(err instanceof ApiError ? err.message : '移动数据切换失败', 'error')
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  const setRoamingData = async (device: Device, allowed: boolean) => {
+    if (
+      allowed &&
+      !window.confirm('允许这张 SIM 在漫游网络使用移动数据，可能产生额外费用。继续？')
+    ) {
+      return
+    }
+    setBusy(device.name)
+    try {
+      await api.devices.setRoamingData(device.name, allowed)
+      await load()
+      toast.show(allowed ? '已允许漫游数据' : '已禁止漫游数据', 'success')
+    } catch (err) {
+      toast.show(err instanceof ApiError ? err.message : '漫游数据策略更新失败', 'error')
+    } finally {
+      setBusy(null)
+    }
+  }
+
   const reloadSelected = async () => {
     const updated = await load()
     setSelected((current) => {
@@ -116,7 +167,10 @@ export function DevicesPage() {
 
   if (!devices) return <Loading />
 
-  const signalSeries: SignalSeries[] = devices.map((device, index) => ({
+  const visibleDevices = showOffline ? devices : devices.filter((device) => Boolean(device.online))
+  const onlineCount = devices.filter((device) => Boolean(device.online)).length
+
+  const signalSeries: SignalSeries[] = visibleDevices.map((device, index) => ({
     name: device.name,
     label: deviceLabel(device),
     index,
@@ -135,11 +189,25 @@ export function DevicesPage() {
     <Stack spacing={3}>
       <PageHeader
         title="设备"
-        subtitle="模块状态、信号、运营商与射频控制"
+        subtitle={`${onlineCount} 个在线 · ${devices.length} 个已知；数据默认关闭`}
         actions={
-          <Button component={RouterLink} to="/console" startIcon={<TerminalIcon />}>
-            AT 调试
-          </Button>
+          <Stack direction="row" spacing={1.5} sx={{ alignItems: 'center' }}>
+            <FormControlLabel
+              control={
+                <Switch
+                  size="small"
+                  checked={showOffline}
+                  onChange={(_, checked) => setShowOffline(checked)}
+                  slotProps={{ input: { 'aria-label': '显示离线设备' } }}
+                />
+              }
+              label="显示离线"
+              sx={{ mr: 0, whiteSpace: 'nowrap' }}
+            />
+            <Button component={RouterLink} to="/console" startIcon={<TerminalIcon />}>
+              AT 调试
+            </Button>
+          </Stack>
         }
       />
 
@@ -149,7 +217,13 @@ export function DevicesPage() {
         </Alert>
       )}
 
-      {devices.length > 0 && (
+      {devices.length > 0 && visibleDevices.length === 0 && (
+        <Alert severity="info">
+          当前没有在线设备。已隐藏 {devices.length} 个离线设备；打开“显示离线”可查看历史记录。
+        </Alert>
+      )}
+
+      {visibleDevices.length > 0 && (
         <>
           <Card sx={{ display: { xs: 'none', md: 'block' } }}>
             <TableContainer>
@@ -161,12 +235,13 @@ export function DevicesPage() {
                     <TableCell>信号</TableCell>
                     <TableCell sx={{ width: 190 }}>存储</TableCell>
                     <TableCell sx={{ width: 220 }}>移动网络射频</TableCell>
+                    <TableCell sx={{ width: 280 }}>数据策略</TableCell>
                     <TableCell>最后上报</TableCell>
                     <TableCell align="right" />
                   </TableRow>
                 </TableHead>
                 <TableBody>
-                  {devices.map((device) => (
+                  {visibleDevices.map((device) => (
                     <TableRow key={device.id} hover>
                       <TableCell>
                         <Typography variant="body2" sx={{ fontWeight: 650 }}>
@@ -210,6 +285,15 @@ export function DevicesPage() {
                           compact
                         />
                       </TableCell>
+                      <TableCell>
+                        <DataControls
+                          device={device}
+                          busy={busy === device.name}
+                          onDataChange={(enabled) => void setData(device, enabled)}
+                          onRoamingChange={(allowed) => void setRoamingData(device, allowed)}
+                          compact
+                        />
+                      </TableCell>
                       <TableCell sx={{ whiteSpace: 'nowrap' }}>
                         <Typography variant="body2">{relativeTs(device.last_seen_at)}</Typography>
                         <Typography variant="caption" sx={{ color: 'text.secondary' }}>
@@ -247,7 +331,7 @@ export function DevicesPage() {
           </Card>
 
           <Stack spacing={2} sx={{ display: { xs: 'flex', md: 'none' } }}>
-            {devices.map((device) => (
+            {visibleDevices.map((device) => (
               <Card key={device.id}>
                 <CardHeader
                   title={<Typography variant="h3">{deviceLabel(device)}</Typography>}
@@ -275,12 +359,20 @@ export function DevicesPage() {
                       />
                       <SummaryValue label="最后上报" value={relativeTs(device.last_seen_at)} />
                       <SummaryValue label="端口" value={device.port || '—'} />
+                      <SummaryValue label="移动数据" value={packetDataStatus(device)} />
+                      <SummaryValue label="漫游" value={roamingStatus(device)} />
                     </Box>
                     <StorageMeter used={device.storage_used} capacity={device.storage_cap} />
                     <RadioControl
                       device={device}
                       busy={busy === device.name}
                       onChange={(enabled) => void setRadio(device, enabled)}
+                    />
+                    <DataControls
+                      device={device}
+                      busy={busy === device.name}
+                      onDataChange={(enabled) => void setData(device, enabled)}
+                      onRoamingChange={(allowed) => void setRoamingData(device, allowed)}
                     />
                     <Stack direction="row" spacing={1} sx={{ justifyContent: 'space-between' }}>
                       <Button
@@ -372,6 +464,124 @@ function RadioControl({
   )
 }
 
+function DataControls({
+  device,
+  busy,
+  onDataChange,
+  onRoamingChange,
+  compact = false,
+}: {
+  device: Device
+  busy: boolean
+  onDataChange: (enabled: boolean) => void
+  onRoamingChange: (allowed: boolean) => void
+  compact?: boolean
+}) {
+  return (
+    <Stack spacing={compact ? 0.25 : 0.75}>
+      <DataControl
+        device={device}
+        busy={busy}
+        onChange={onDataChange}
+        compact={compact}
+      />
+      <RoamingDataControl
+        device={device}
+        busy={busy}
+        onChange={onRoamingChange}
+        compact={compact}
+      />
+    </Stack>
+  )
+}
+
+function DataControl({
+  device,
+  busy,
+  onChange,
+  compact = false,
+}: {
+  device: Device
+  busy: boolean
+  onChange: (enabled: boolean) => void
+  compact?: boolean
+}) {
+  const known = device.data_attached != null && device.pdp_active != null
+  const enabled = device.data_attached === 1 || device.pdp_active === 1
+  return (
+    <Stack
+      direction="row"
+      spacing={1}
+      sx={{ alignItems: 'center', justifyContent: 'space-between', minHeight: compact ? 34 : 42 }}
+    >
+      <Stack direction="row" spacing={1} sx={{ alignItems: 'center', minWidth: 0 }}>
+        <DataUsageIcon color="action" fontSize="small" />
+        <Box sx={{ minWidth: 0 }}>
+          {!compact && (
+            <Typography variant="body2" sx={{ fontWeight: 600 }}>
+              移动数据
+            </Typography>
+          )}
+          <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block' }}>
+            {busy ? '处理中' : packetDataStatus(device)}
+          </Typography>
+        </Box>
+      </Stack>
+      <Switch
+        size={compact ? 'small' : 'medium'}
+        checked={enabled}
+        onChange={(_, checked) => onChange(checked)}
+        disabled={!device.online || !known || busy}
+        slotProps={{ input: { 'aria-label': `${device.name} 移动数据` } }}
+      />
+    </Stack>
+  )
+}
+
+function RoamingDataControl({
+  device,
+  busy,
+  onChange,
+  compact = false,
+}: {
+  device: Device
+  busy: boolean
+  onChange: (allowed: boolean) => void
+  compact?: boolean
+}) {
+  const known = device.roaming_data_allowed != null
+  return (
+    <Stack
+      direction="row"
+      spacing={1}
+      sx={{ alignItems: 'center', justifyContent: 'space-between', minHeight: compact ? 34 : 42 }}
+    >
+      <Stack direction="row" spacing={1} sx={{ alignItems: 'center', minWidth: 0 }}>
+        <RoamingIcon color="action" fontSize="small" />
+        <Box sx={{ minWidth: 0 }}>
+          {!compact && (
+            <Typography variant="body2" sx={{ fontWeight: 600 }}>
+              允许漫游数据
+            </Typography>
+          )}
+          <Typography variant="caption" sx={{ color: 'text.secondary', display: 'block' }}>
+            {busy
+              ? '处理中'
+              : `${roamingStatus(device)} · ${device.roaming_data_allowed ? '允许' : '禁止'}`}
+          </Typography>
+        </Box>
+      </Stack>
+      <Switch
+        size={compact ? 'small' : 'medium'}
+        checked={Boolean(device.roaming_data_allowed)}
+        onChange={(_, checked) => onChange(checked)}
+        disabled={!device.online || !known || busy}
+        slotProps={{ input: { 'aria-label': `${device.name} 允许漫游数据` } }}
+      />
+    </Stack>
+  )
+}
+
 function SummaryValue({ label, value }: { label: string; value: string }) {
   return (
     <Box sx={{ minWidth: 0 }}>
@@ -404,6 +614,9 @@ function DeviceDrawer({
   const [selectBusy, setSelectBusy] = useState(false)
   const [diagnosticBusy, setDiagnosticBusy] = useState(false)
   const [diagnostics, setDiagnostics] = useState<NetworkDiagnostics | null>(null)
+  const [ussdCode, setUssdCode] = useState('')
+  const [ussdBusy, setUssdBusy] = useState(false)
+  const [ussdResponse, setUssdResponse] = useState('')
 
   const deviceName = device?.name
 
@@ -458,6 +671,21 @@ function DeviceDrawer({
     }
   }
 
+  const sendUssd = async () => {
+    if (!deviceName || !ussdCode.trim()) return
+    setUssdBusy(true)
+    setUssdResponse('')
+    try {
+      const result = await api.devices.ussd(deviceName, ussdCode.trim())
+      setUssdResponse(result.response || '无响应')
+      onSuccess('USSD 查询完成')
+    } catch (err) {
+      onError(err instanceof ApiError ? err.message : 'USSD 查询失败')
+    } finally {
+      setUssdBusy(false)
+    }
+  }
+
   // A healthy supply is just a number; an unhealthy one has to say so here,
   // because this drawer is where someone looks after a module has been
   // misbehaving and the reading alone would not explain why.
@@ -473,6 +701,10 @@ function DeviceDrawer({
         ['固件版本', device.firmware || '—'],
         ['移动网络', networkRegistrationStatus(device)],
         ['IMS 注册', imsRegistrationStatus(device)],
+        ['移动数据', packetDataStatus(device)],
+        ['PDP 上下文', device.pdp_active == null ? '未知' : device.pdp_active ? '有激活' : '全部停用'],
+        ['漫游状态', roamingStatus(device)],
+        ['漫游数据策略', device.roaming_data_allowed ? '允许' : '禁止'],
         ['IMEI', device.imei || '—'],
         ['ICCID', device.iccid || '无卡'],
         ['电话号码', device.phone_number || '—'],
@@ -582,6 +814,51 @@ function DeviceDrawer({
             >
               {selectBusy ? '切换中' : '选择运营商'}
             </Button>
+          </Stack>
+          <Divider sx={{ my: 2.5 }} />
+          <Stack spacing={1.5}>
+            <Typography variant="h3">USSD 查询</Typography>
+            <Stack direction="row" spacing={1}>
+              <TextField
+                size="small"
+                placeholder="*123# 或其他 USSD 码"
+                value={ussdCode}
+                onChange={(e) => setUssdCode(e.target.value)}
+                disabled={!device.online || ussdBusy}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') void sendUssd()
+                }}
+                sx={{ flex: 1 }}
+              />
+              <Button
+                variant="outlined"
+                size="small"
+                onClick={() => void sendUssd()}
+                disabled={!device.online || !ussdCode.trim() || ussdBusy}
+                startIcon={ussdBusy ? <CircularProgress size={16} /> : <TerminalIcon />}
+              >
+                {ussdBusy ? '查询中' : '发送'}
+              </Button>
+            </Stack>
+            {ussdResponse && (
+              <Box
+                component="pre"
+                sx={{
+                  m: 0,
+                  p: 1.5,
+                  maxHeight: 200,
+                  overflow: 'auto',
+                  whiteSpace: 'pre-wrap',
+                  overflowWrap: 'anywhere',
+                  bgcolor: 'action.hover',
+                  borderRadius: 1,
+                  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+                  fontSize: '0.75rem',
+                }}
+              >
+                {ussdResponse}
+              </Box>
+            )}
           </Stack>
           <Divider sx={{ my: 2.5 }} />
           <Stack spacing={1.5}>

@@ -75,6 +75,15 @@ SAMPLE_CONTEXT = {
 
 TASK_STATUS_LABEL = {"ok": "执行成功", "failed": "执行失败", "skipped": "已跳过"}
 
+CALL_OUTCOME_LABEL = {
+    "missed": "未接",
+    "answered": "已接通",
+    "rejected": "已拒接",
+    "no_answer": "无人接听",
+    "busy": "占线",
+    "failed": "呼叫失败",
+}
+
 
 class SendError(RuntimeError):
     """A channel refused the message.  ``detail`` is safe to store and show."""
@@ -604,6 +613,50 @@ class Notifier:
             self.notify_text(self._task_summary(task_id, task, frame), title="保号任务"),
             label=f"task {task_id}",
         )
+
+    async def on_call(self, call_id: int, frame: dict[str, Any]) -> None:
+        """Gateway hook for call attempts.
+
+        Only inbound calls push.  An outbound keep-alive dial is something the
+        operator scheduled and already hears about through the task receipt;
+        pushing it again would train them to ignore the channel.  An incoming
+        call is the opposite — nobody asked for it, and on a card kept alive for
+        one service it is the only sign someone is trying to reach the number.
+        """
+        if str(frame.get("direction") or "") != "in":
+            return
+        call = self.db.one(
+            "SELECT c.*, s.label AS sim_label FROM calls c "
+            "LEFT JOIN sims s ON s.id = c.sim_id WHERE c.id = ?",
+            (call_id,),
+        ) or {}
+        self._spawn(
+            self.notify_text(self._call_summary(call, frame), title="来电"),
+            label=f"call {call_id}",
+        )
+
+    def _call_summary(self, call: dict[str, Any], frame: dict[str, Any]) -> str:
+        """An incoming call as someone would want to read it on a phone."""
+        peer = call.get("peer") or frame.get("peer") or "未知号码"
+        outcome = str(call.get("outcome") or frame.get("outcome") or "")
+        lines = [f"【来电】{peer} {CALL_OUTCOME_LABEL.get(outcome, outcome or '来电')}"]
+        where = call.get("sim_label") or call.get("device") or frame.get("device")
+        if where:
+            lines.append(f"卡:{where}")
+        # The stored row wins outright, and `or` would not give it that: the
+        # gateway coerces a malformed duration to 0.0, which is falsy, so an
+        # `or` chain would fall through the coerced value and back to the raw
+        # frame field that needed coercing in the first place.
+        ring = call["ring_seconds"] if "ring_seconds" in call else frame.get("ring_seconds")
+        try:
+            ring = float(ring)
+        except (TypeError, ValueError):
+            ring = 0.0
+        # Worth a line only when it actually rang: "响铃 0 秒" reads like a bug
+        # rather than like a call that was rejected before it ever rang.
+        if ring:
+            lines.append(f"响铃:{round(ring)} 秒")
+        return "\n".join(lines)
 
     def _task_summary(
         self, task_id: int, task: dict[str, Any], frame: dict[str, Any]

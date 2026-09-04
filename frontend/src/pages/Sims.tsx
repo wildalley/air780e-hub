@@ -11,13 +11,14 @@ import {
   MenuItem,
   Stack,
   TextField,
+  Tooltip,
   Typography,
 } from '@mui/material'
 import SaveIcon from '@mui/icons-material/SaveOutlined'
 import SimIcon from '@mui/icons-material/SimCardOutlined'
 import useSWR, { mutate as mutateKey } from 'swr'
 import { api, ApiError, type Sim, type SimBillingType } from '../api'
-import { formatTs } from '../format'
+import { formatTs, relativeTs } from '../format'
 import { simBalanceStatus, type SimBalanceLevel } from '../simBalance'
 import { mostUrgentSimDeadline, type SimDeadlineLevel } from '../simExpiry'
 import { useToast } from '../toast'
@@ -221,6 +222,17 @@ export function SimsPage() {
                           label={balanceState.label}
                           sx={{ maxWidth: '100%' }}
                         />
+                      )}
+                      {sim.last_reached_network_at && (
+                        <Tooltip title={`通话触达运营商: ${formatTs(sim.last_reached_network_at)}`}>
+                          <Chip
+                            size="small"
+                            variant="outlined"
+                            color="success"
+                            label={`保号: ${relativeTs(sim.last_reached_network_at)}`}
+                            sx={{ maxWidth: '100%' }}
+                          />
+                        </Tooltip>
                       )}
                     </Box>
                     <Box

@@ -106,8 +106,11 @@ class MockAir780E:
     rsrp: int = 55  # +CESQ encoding
     rsrq: int = 20
     registered: bool = True
+    roaming: bool = False
     ims_registered: bool = False
     radio_enabled: bool = True
+    data_attached: bool = True
+    pdp_active: bool = False
     pin_ready: bool = True
 
     # Supply voltage in millivolts, reported by +CBC.  Set to None to model a
@@ -349,6 +352,23 @@ class MockAir780E:
             if not self.registered:
                 return self._reply(["+COPS: 0"])
             return self._reply([f'+COPS: 0,0,"{self.operator}",7'])
+        if upper == "AT+CGATT?":
+            return self._reply([f"+CGATT: {1 if self.data_attached else 0}"])
+        if upper == "AT+CGACT?":
+            return self._reply([f"+CGACT: 1,{1 if self.pdp_active else 0}"])
+        if upper == "AT+CGACT=0":
+            self.pdp_active = False
+            return self._reply()
+        if upper == "AT+CGACT=1":
+            self.pdp_active = self.data_attached and self.radio_enabled and self.registered
+            return self._reply()
+        if upper == "AT+CGATT=0":
+            self.data_attached = False
+            self.pdp_active = False
+            return self._reply()
+        if upper == "AT+CGATT=1":
+            self.data_attached = self.radio_enabled and self.registered
+            return self._reply()
         if upper == "AT+COPS=?":
             entries = ",".join(
                 f'({status},"{long_name}","{short_name}","{numeric}",{act})'
@@ -398,7 +418,8 @@ class MockAir780E:
             else:
                 name = "+CREG"
             attached = self.radio_enabled and self.registered
-            return self._reply([f"{name}: 0,{1 if attached else 2}"])
+            stat = 5 if attached and self.roaming else 1 if attached else 2
+            return self._reply([f"{name}: 0,{stat}"])
         if upper == "AT+CIREG?":
             attached = self.radio_enabled and self.ims_registered
             # AirM2M_780EPV_V1011 reports notification mode 2 here.
@@ -408,6 +429,9 @@ class MockAir780E:
         if upper in ("AT+CFUN=0", "AT+CFUN=1"):
             self.radio_enabled = upper.endswith("1")
             self.registered = self.radio_enabled and self.cfun_recovers_registration
+            if not self.radio_enabled:
+                self.data_attached = False
+                self.pdp_active = False
             return self._reply()
         if upper == "AT+RESET":
             self.reset_count += 1

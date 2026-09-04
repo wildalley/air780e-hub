@@ -49,6 +49,21 @@ class ProbeResult:
         return f"{self.port} ({self.model or '?'} imei={self.imei or '?'})"
 
 
+def _identity_key(result: ProbeResult) -> str | None:
+    """Return the strongest stable identity reported by a probe.
+
+    One Air780E exposes several ``ttyACM`` interfaces.  Most firmware only
+    answers AT on one of them, but some revisions answer on more than one, so
+    a port is not a hardware identity.  IMEI wins; ICCID is the fallback for a
+    module whose firmware does not expose ``AT+CGSN``.
+    """
+    imei = result.imei.strip().lower()
+    if imei:
+        return f"imei:{imei}"
+    iccid = result.iccid.strip().lower()
+    return f"iccid:{iccid}" if iccid else None
+
+
 class Prober(Protocol):
     def __call__(self, port: str, *, timeout: float) -> Awaitable[ProbeResult | None]:
         ...
@@ -214,6 +229,7 @@ class PortRegistry:
         }
         async with self._lock:
             found: list[ProbeResult] = []
+            seen_identities: set[str] = set()
             for port in sorted(globmodule.glob(self.port_glob)):
                 if port in self._claimed or port in pinned:
                     continue
@@ -225,6 +241,15 @@ class PortRegistry:
                         "survey: %s is spoken for by a configured device", port
                     )
                     continue
+                identity = _identity_key(result)
+                if identity is not None and identity in seen_identities:
+                    log.debug(
+                        "survey: %s is another AT port for %s; ignoring duplicate",
+                        port,
+                        identity,
+                    )
+                    continue
                 found.append(result)
+                if identity is not None:
+                    seen_identities.add(identity)
             return found
-

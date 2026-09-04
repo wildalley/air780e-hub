@@ -39,6 +39,10 @@ log = logging.getLogger(__name__)
 # Version 6 adds structured SIM billing and lifecycle dates used for reminders.
 # Version 7 adds the covering index used by conversation summaries and threads.
 # Version 8 records modem firmware and per-domain network/IMS registration.
+# Version 9 records module supply voltage and its low-voltage threshold.
+# Version 10 keeps what was salvaged from a truncated message.
+# Version 11 records call attempts as rows rather than log text.
+# Version 12 records packet-data attachment, PDP state, and roaming policy.
 #
 # To add a migration: append one entry to ``MIGRATIONS`` with the next integer
 # and bump this constant, and add the same columns/tables/indexes to SCHEMA so a brand
@@ -48,7 +52,7 @@ log = logging.getLogger(__name__)
 # Never renumber or edit a released entry — a database that already ran it will
 # not run it again, so an edit only affects databases that have not, and the two
 # then disagree about what version N means.
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 12
 
 # Persisted (settings table) key for the SMS retention window, in days.  The
 # operator edits it on the Notify page; when unset the env default applies.
@@ -129,6 +133,11 @@ CREATE TABLE IF NOT EXISTS devices (
     eps_registered INTEGER,
     cs_registered INTEGER,
     ims_registered INTEGER,
+    data_attached INTEGER,
+    pdp_active INTEGER,
+    roaming INTEGER,
+    roaming_data_allowed INTEGER NOT NULL DEFAULT 0,
+    data_blocked_by_roaming INTEGER NOT NULL DEFAULT 0,
     model        TEXT NOT NULL DEFAULT '',
     hardware_model TEXT NOT NULL DEFAULT '',
     firmware     TEXT NOT NULL DEFAULT '',
@@ -196,6 +205,35 @@ CREATE INDEX IF NOT EXISTS idx_messages_sim ON messages(sim_id, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_peer ON messages(peer, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_conversation
     ON messages(sim_id, peer, ts DESC, id DESC);
+
+-- One row per call attempt, inbound or outbound. Kept apart from `messages`
+-- rather than folded in as a direction: a call has no body to search, and its
+-- success is `reached_network`, not a delivery status. For a keep-alive card
+-- this is the strongest evidence there is -- an SMS proves the card can send,
+-- an inbound call proves the network can still reach it.
+CREATE TABLE IF NOT EXISTS calls (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id   TEXT NOT NULL,
+    device     TEXT NOT NULL,
+    sim_id     INTEGER REFERENCES sims(id) ON DELETE SET NULL,
+    direction  TEXT NOT NULL,
+    peer       TEXT NOT NULL DEFAULT '',
+    ts         TEXT NOT NULL,
+    -- The modem's own word for how the attempt ended (`alerting`, `busy`,
+    -- `no_answer`, `missed`, ...). Stored verbatim rather than collapsed to a
+    -- boolean so a carrier-side change shows up as a new outcome instead of
+    -- silently reading as failure.
+    outcome    TEXT NOT NULL DEFAULT '',
+    -- Judge success by this, not by `outcome`: a keep-alive counts the moment
+    -- the carrier saw the attempt, and `busy` / `no_answer` both prove that.
+    reached_network INTEGER NOT NULL DEFAULT 0,
+    ring_seconds    REAL NOT NULL DEFAULT 0,
+    detail     TEXT NOT NULL DEFAULT '',
+    seq        INTEGER,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_calls_ts ON calls(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_calls_sim ON calls(sim_id, ts DESC);
 
 -- One row per outbound segment. Rows with no message_id are status reports
 -- that beat their sms_out event to the Server and will be reconciled later.
@@ -568,6 +606,10 @@ class Database:
          "_migration_supply_voltage"),
         (10, "keep what was salvaged from a truncated message",
          "_migration_salvaged_messages"),
+        (11, "record call attempts as rows rather than log text",
+         "_migration_calls"),
+        (12, "record packet-data and roaming policy state",
+         "_migration_data_controls"),
     )
 
     def _add_columns_if_missing(self, table: str, columns: dict[str, str]) -> None:
@@ -729,6 +771,54 @@ class Database:
                 "truncated": "INTEGER NOT NULL DEFAULT 0",
                 "recovered_body": "TEXT",
                 "recovered_code": "TEXT",
+            },
+        )
+
+    def _migration_calls(self) -> None:
+        """v10 -> v11: give call attempts a table instead of a log line.
+
+        Nothing is backfilled.  The history exists only as free text in
+        ``logs``, and re-parsing Chinese log messages into structured rows would
+        invent a precision the source never had — a parsed row would look
+        exactly like a recorded one while resting on a regex over prose.  The
+        log stays as the record of what happened before this point.
+        """
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS calls (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id   TEXT NOT NULL,
+                device     TEXT NOT NULL,
+                sim_id     INTEGER REFERENCES sims(id) ON DELETE SET NULL,
+                direction  TEXT NOT NULL,
+                peer       TEXT NOT NULL DEFAULT '',
+                ts         TEXT NOT NULL,
+                outcome    TEXT NOT NULL DEFAULT '',
+                reached_network INTEGER NOT NULL DEFAULT 0,
+                ring_seconds    REAL NOT NULL DEFAULT 0,
+                detail     TEXT NOT NULL DEFAULT '',
+                seq        INTEGER,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_calls_ts ON calls(ts DESC)"
+        )
+        self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_calls_sim ON calls(sim_id, ts DESC)"
+        )
+
+    def _migration_data_controls(self) -> None:
+        """v11 -> v12: expose packet data and the roaming safety policy."""
+        self._add_columns_if_missing(
+            "devices",
+            {
+                "data_attached": "INTEGER",
+                "pdp_active": "INTEGER",
+                "roaming": "INTEGER",
+                "roaming_data_allowed": "INTEGER NOT NULL DEFAULT 0",
+                "data_blocked_by_roaming": "INTEGER NOT NULL DEFAULT 0",
             },
         )
 
@@ -1140,6 +1230,11 @@ class Database:
         "eps_registered",
         "cs_registered",
         "ims_registered",
+        "data_attached",
+        "pdp_active",
+        "roaming",
+        "roaming_data_allowed",
+        "data_blocked_by_roaming",
         "rssi",
         "dbm",
         "bars",
@@ -1179,6 +1274,11 @@ class Database:
                     "eps_registered",
                     "cs_registered",
                     "ims_registered",
+                    "data_attached",
+                    "pdp_active",
+                    "roaming",
+                    "roaming_data_allowed",
+                    "data_blocked_by_roaming",
                 ):
                     columns[field] = None if value is None else int(bool(value))
                 elif field in ("online", "registered"):
@@ -1302,6 +1402,88 @@ class Database:
              recovered_body or None, recovered_code or None, utcnow()),
         )
         return int(cursor.lastrowid)
+
+    def insert_call(
+        self,
+        *,
+        agent_id: str,
+        device: str,
+        direction: str,
+        ts: str,
+        peer: str = "",
+        iccid: str = "",
+        outcome: str = "",
+        reached_network: bool = False,
+        ring_seconds: float = 0.0,
+        detail: str = "",
+        seq: int | None = None,
+    ) -> int:
+        sim_id = self.upsert_sim(iccid)
+        cursor = self.execute(
+            "INSERT INTO calls "
+            "(agent_id, device, sim_id, direction, peer, ts, outcome, "
+            " reached_network, ring_seconds, detail, seq, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (agent_id, device, sim_id, direction, peer, to_utc_iso(ts), outcome,
+             int(reached_network), float(ring_seconds), detail, seq, utcnow()),
+        )
+        return int(cursor.lastrowid)
+
+    def _call_filter(
+        self, *, sim_id: int | None = None, direction: str | None = None
+    ) -> tuple[str, list[Any]]:
+        """Shared WHERE for the call log, so the list and its total agree."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if sim_id is not None:
+            clauses.append("c.sim_id = ?")
+            params.append(sim_id)
+        if direction:
+            clauses.append("c.direction = ?")
+            params.append(direction)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return where, params
+
+    def count_calls(
+        self, *, sim_id: int | None = None, direction: str | None = None
+    ) -> int:
+        where, params = self._call_filter(sim_id=sim_id, direction=direction)
+        row = self.one(f"SELECT COUNT(*) AS n FROM calls c {where}", tuple(params))
+        return int(row["n"]) if row else 0
+
+    def calls(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        sim_id: int | None = None,
+        direction: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Newest call attempts first, with the card label the UI shows."""
+        where, params = self._call_filter(sim_id=sim_id, direction=direction)
+        params.extend((limit, offset))
+        return self.query(
+            "SELECT c.*, s.label AS sim_label, s.phone_number, "
+            "s.iccid AS sim_iccid, d.label AS device_label FROM calls c "
+            "LEFT JOIN sims s ON s.id = c.sim_id "
+            "LEFT JOIN devices d ON d.agent_id = c.agent_id AND d.name = c.device "
+            f"{where} ORDER BY c.ts DESC, c.id DESC LIMIT ? OFFSET ?",
+            tuple(params),
+        )
+
+    def last_reached_network_at(self, sim_id: int) -> str | None:
+        """When this card last provably reached the carrier, by call.
+
+        The keep-alive question in one query.  ``reached_network`` rather than a
+        successful ``outcome``: a busy or unanswered call still proves the
+        carrier processed the attempt, which is what an activity window counts.
+        """
+        row = self.one(
+            "SELECT ts FROM calls WHERE sim_id = ? AND reached_network = 1 "
+            "ORDER BY ts DESC LIMIT 1",
+            (sim_id,),
+        )
+        return row["ts"] if row else None
 
     @staticmethod
     def _recipient_key(recipient: str) -> str:

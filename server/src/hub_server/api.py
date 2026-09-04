@@ -187,6 +187,10 @@ class RadioBody(BaseModel):
     enabled: bool
 
 
+class RoamingDataBody(BaseModel):
+    allowed: bool
+
+
 class OperatorSelectionBody(BaseModel):
     """A 3GPP numeric MCC/MNC, or null to restore automatic selection."""
 
@@ -472,6 +476,32 @@ def build_router(state: AppState) -> APIRouter:
             {"type": "set_radio", "device": name, "enabled": body.enabled},
         )
 
+    @router.post("/devices/{name}/data", dependencies=guard)
+    async def set_device_data(name: str, body: RadioBody) -> dict[str, Any]:
+        """Enable or fully disable packet data on the modem."""
+        agent_id = state.gateway.agent_for_device(name)
+        if agent_id is None:
+            raise HTTPException(status_code=404, detail="no such device")
+        return await _call(
+            agent_id,
+            {"type": "set_data", "device": name, "enabled": body.enabled},
+            timeout=60.0,
+        )
+
+    @router.post("/devices/{name}/roaming-data", dependencies=guard)
+    async def set_device_roaming_data(
+        name: str, body: RoamingDataBody
+    ) -> dict[str, Any]:
+        """Set the local safety policy for data while the SIM is roaming."""
+        agent_id = state.gateway.agent_for_device(name)
+        if agent_id is None:
+            raise HTTPException(status_code=404, detail="no such device")
+        return await _call(
+            agent_id,
+            {"type": "set_roaming_data", "device": name, "allowed": body.allowed},
+            timeout=60.0,
+        )
+
     @router.post("/devices/{name}/operators/scan", dependencies=guard)
     async def scan_device_operators(name: str) -> dict[str, Any]:
         agent_id = state.gateway.agent_for_device(name)
@@ -512,11 +542,28 @@ def build_router(state: AppState) -> APIRouter:
             timeout=165.0,
         )
 
+    @router.post("/devices/{name}/ussd", dependencies=guard)
+    async def send_ussd(name: str, body: dict[str, str]) -> dict[str, Any]:
+        """Send a USSD code and return the raw response."""
+        agent_id = state.gateway.agent_for_device(name)
+        if agent_id is None:
+            raise HTTPException(status_code=404, detail="no such device")
+        code = body.get("code", "")
+        if not code:
+            raise HTTPException(status_code=400, detail="code is required")
+        return await _call(
+            agent_id,
+            {"type": "ussd", "device": name, "code": code},
+            timeout=60.0,
+        )
+
     @router.get("/sims", dependencies=guard)
     def list_sims() -> list[dict[str, Any]]:
         return state.db.query(
             "SELECT s.*, "
-            "(SELECT COUNT(*) FROM messages m WHERE m.sim_id = s.id) AS message_count "
+            "(SELECT COUNT(*) FROM messages m WHERE m.sim_id = s.id) AS message_count, "
+            "(SELECT ts FROM calls WHERE sim_id = s.id AND reached_network = 1 "
+            "ORDER BY ts DESC LIMIT 1) AS last_reached_network_at "
             "FROM sims s ORDER BY s.id"
         )
 
@@ -594,6 +641,29 @@ def build_router(state: AppState) -> APIRouter:
         the history is longer than one page.
         """
         return state.db.conversations(limit=limit, content=content)
+
+    @router.get("/calls", dependencies=guard)
+    def list_calls(
+        limit: int = Query(100, ge=1, le=1000),
+        offset: int = Query(0, ge=0),
+        sim_id: int | None = None,
+        direction: Literal["in", "out"] | None = None,
+    ) -> dict[str, Any]:
+        """Call attempts, newest first.
+
+        Both directions in one list on purpose: for a keep-alive card the
+        question is when it last touched the network at all, and splitting
+        inbound from outbound buries half the answer.
+
+        Wrapped like ``/messages`` rather than returned bare: this log only
+        grows, so the UI needs a total it can show without reading every row.
+        """
+        return {
+            "items": state.db.calls(
+                limit=limit, offset=offset, sim_id=sim_id, direction=direction
+            ),
+            "total": state.db.count_calls(sim_id=sim_id, direction=direction),
+        }
 
     @router.post("/messages/send", dependencies=guard)
     async def send_message(body: SendSmsBody) -> dict[str, Any]:

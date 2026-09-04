@@ -1093,3 +1093,87 @@ def test_a_skipped_task_did_not_run(admin):
     stored = admin.get("/api/tasks").json()[0]
     assert stored["last_run_at"] is None
     assert stored["next_run_at"].startswith("2026-09-21"), "still re-planned"
+
+
+# --------------------------------------------------------------------------
+# calls (M6)
+# --------------------------------------------------------------------------
+
+
+def send_call(admin, **overrides) -> None:
+    frame = {
+        "type": "call_event", "seq": 1, "device": "a",
+        "ts": "2026-09-01T11:00:00+08:00", "direction": "in",
+        "peer": "13800138000", "iccid": "8986000000000000001",
+        "outcome": "missed", "reached_network": True, "ring_seconds": 4.0,
+        "detail": "RING", **overrides,
+    }
+    with admin.websocket_connect(
+        "/ws", headers={"Authorization": "Bearer test-token"}
+    ) as ws:
+        _greet(ws)
+        ws.send_json(frame)
+        assert ws.receive_json() == {"type": "ack", "seq": frame["seq"]}
+
+
+def _bark_channel(admin) -> dict:
+    return admin.post("/api/channels", json={
+        "name": "Bark", "type": "bark", "config": {"url": "https://api.day.app/k"},
+    }).json()
+
+
+def test_an_incoming_call_is_stored_and_pushed(admin):
+    recorder = Recorder()
+    install(admin, recorder)
+    _bark_channel(admin)
+
+    send_call(admin)
+
+    calls = admin.get("/api/calls").json()["items"]
+    assert len(calls) == 1
+    assert calls[0]["peer"] == "13800138000"
+    assert calls[0]["outcome"] == "missed"
+    assert calls[0]["direction"] == "in"
+
+    assert _wait_for(lambda: recorder.bodies)
+    body = json.dumps(recorder.bodies[0], ensure_ascii=False)
+    assert "13800138000" in body
+    assert "未接" in body
+
+
+def test_an_outbound_keepalive_call_is_stored_but_not_pushed(admin):
+    recorder = Recorder()
+    install(admin, recorder)
+    _bark_channel(admin)
+
+    send_call(admin, direction="out", peer="10086", outcome="no_answer")
+
+    calls = admin.get("/api/calls").json()["items"]
+    assert len(calls) == 1
+    assert calls[0]["direction"] == "out"
+    # The operator scheduled this dial and hears about it in the task receipt;
+    # a second push for the same event trains them to ignore the channel.
+    assert recorder.requests == []
+
+
+def test_a_replayed_call_event_is_stored_once(admin):
+    install(admin, Recorder())
+    send_call(admin)
+    send_call(admin)
+    assert len(admin.get("/api/calls").json()["items"]) == 1
+
+
+def test_a_call_that_never_reached_the_network_is_marked(admin):
+    install(admin, Recorder())
+    send_call(admin, direction="out", outcome="failed", reached_network=False,
+              detail="NO CARRIER")
+    call = admin.get("/api/calls").json()["items"][0]
+    assert call["reached_network"] == 0
+    assert call["detail"] == "NO CARRIER"
+
+
+def test_a_malformed_ring_duration_does_not_wedge_ingest(admin):
+    """A bad field must not raise: the agent would replay the frame forever."""
+    install(admin, Recorder())
+    send_call(admin, ring_seconds="not-a-number")
+    assert admin.get("/api/calls").json()["items"][0]["ring_seconds"] == 0.0

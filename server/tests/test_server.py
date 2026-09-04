@@ -2561,3 +2561,39 @@ def test_every_paged_log_endpoint_answers_with_items_and_total(admin):
         assert isinstance(body, dict), f"{path} did not return an object"
         assert isinstance(body["items"], list), f"{path} has no items list"
         assert isinstance(body["total"], int), f"{path} has no integer total"
+
+
+def test_ussd_query_returns_the_raw_response(admin):
+    """Manual USSD for foreign PAYG cards where automatic parsing would fail."""
+    import threading
+    import queue
+
+    result_queue = queue.Queue()
+
+    def agent_side():
+        with admin.websocket_connect(
+            "/ws", headers={"Authorization": "Bearer test-token"}
+        ) as ws:
+            _greet(ws)
+            # Wait for the USSD command
+            frame = ws.receive_json()
+            assert frame["type"] == "command"
+            assert "AT+CUSD=1," in frame["command"]
+            # Send back a mock response
+            ws.send_json({
+                "type": "cmd_result",
+                "cmd_id": frame["cmd_id"],
+                "result": {"response": "余额:50.00元"},
+            })
+            result_queue.put("done")
+
+    thread = threading.Thread(target=agent_side, daemon=True)
+    thread.start()
+
+    import time
+    time.sleep(0.1)  # Let the agent connect
+
+    result = admin.post("/api/devices/a/ussd", json={"code": "*101#"}).json()
+    assert result["response"] == "余额:50.00元"
+
+    assert result_queue.get(timeout=1) == "done"

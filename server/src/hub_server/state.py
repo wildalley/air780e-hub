@@ -46,6 +46,7 @@ class AppState:
             settings,
             on_message=notifier.on_message,
             on_task_result=notifier.on_task_result,
+            on_call=notifier.on_call,
             on_device_change=alerter.note,
         )
         state = cls(

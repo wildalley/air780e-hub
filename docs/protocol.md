@@ -101,14 +101,39 @@ Server 和前端按未知状态处理。
   "dcs": 0,
   "alphabet": "gsm7",
   "binary": false,
-  "pdu": "0891683108200105F0..."
+  "pdu": "0891683108200105F0...",
+  "truncated": false,
+  "recovered_text": "",
+  "code": ""
 }
 ```
 
 `ts` 取短信中心时间戳(SCTS);缺失时用 agent 收到的时间,并置 `"ts_source": "local"`。
 `binary=true` 表示 8-bit DCS、端口寻址数据、UDH 损坏且正文边界不可信，或无正文的
-短信中心专用 PID 控制消息。Server 保留其 PDU 用于诊断，但不会把内容当作可读文本
+短信中心专用 PID 控制消息。Server 保留其 PDU 用于诊断，但不会把内容当作可读文本。
+
+**协议 v1 可选扩展**(Agent 0.8.0+): `truncated`、`recovered_text`、`code` 用于处理
+模组固件丢帧导致的 PDU 损坏。`truncated=true` 表示帧在 OA 之后丢失了若干八位组,
+`body` 是按原始偏移解码的乱码。`recovered_text` 是相位重扫后救回的可读中段(首尾
+已丢失),`code` 是从中提取的 4–8 位数字验证码(可能为空,表示码未幸存)。Server 在
+通知和搜索中使用 `recovered_text` 和 `code`,并标记该消息为已损坏。
 发送到通知渠道。
+
+`truncated=true` 是另一回事：模组在原始地址与用户数据之间丢了若干八位组，帧到 Agent
+时就已经残缺。此时按规范偏移读出的 TP-DCS/TP-SCTS/TP-UDL 其实是正文，`body` 因此是
+乱码，`binary` 也会一并为 `true`——但它是人写给人的短信，不是运营商数据短信，不能按
+后者静默丢弃。
+
+`recovered_text` 是 Agent 重新对齐 7-bit 相位后救回的可读片段，`code` 是从其中提取的
+验证码。两者都只可能是**中段**：头尾在 Agent 看到帧之前就没了。所以
+
+- 绝不能把 `recovered_text` 当作完整正文渲染或转发，必须显式标注它是残片；
+- `truncated=true` 而 `code` 为空，意思是「验证码没救回来」，绝不是「本条没有验证码」——
+  验证码常在丢掉的头部里。
+
+`body` 保留规范解码结果不动：救回是绕行，不是修复，这样后续复查同一份 capture 才是
+同类可比。这三个字段是协议 v1 的可选扩展，旧 Agent 缺失时 Server 按 `false`/空串处理；
+Server 也会用 `pdu` 自行复核 `binary`，避免 Server 先升级时旧 Agent 把乱码当正文写库。
 
 ### `sms_out` —— 发送结果
 
@@ -171,6 +196,11 @@ Agent 通过 `AT+CNMI=2,1,0,1,0` 接收 `+CDS`，解码 SMS-STATUS-REPORT 后持
   "eps_registered": true,
   "cs_registered": false,
   "ims_registered": false,
+  "data_attached": false,
+  "pdp_active": false,
+  "roaming": false,
+  "roaming_data_allowed": false,
+  "data_blocked_by_roaming": false,
   "operator": "CHINA MOBILE",
   "rssi": 24,
   "dbm": -65,
@@ -196,6 +226,38 @@ Agent 通过 `AT+CNMI=2,1,0,1,0` 接收 `+CDS`，解码 SMS-STATUS-REPORT 后持
 配置知道。Server 只负责判定,不保存第二份默认值,免得两边对同一个电压有不同意见。
 低于阈值开 `device_supply_voltage` 告警,低于 3300 mV 升为 critical —— 到那儿模块还能
 跑,但一次发送突发就可能掉电重启,现象是随机掉网而不像供电问题。
+
+`data_attached` 对应 `AT+CGATT?`,表示是否附着分组数据服务；`pdp_active` 表示
+`AT+CGACT?` 返回的上下文中是否至少有一个处于激活状态。只有两者都为 `false` 才能显示
+为“数据已关闭”；任一为 `null` 都表示固件没有给出足够证据。`roaming` 来自
+`+CEREG`/`+CREG` 的状态码 `5`，`roaming_data_allowed` 是 Agent 本地持久化的安全策略，
+默认 `false`；`data_blocked_by_roaming` 表示数据开关请求被该策略拦截。上述字段都是协议
+v1 的可选扩展，旧 Agent 缺失时 Server 与前端按未知处理。
+
+### `call_event` —— 通话记录
+
+```json
+{
+  "type": "call_event",
+  "seq": 1423,
+  "device": "a",
+  "iccid": "8986...",
+  "ts": "2026-08-02T18:00:00+08:00",
+  "direction": "in",
+  "peer": "13800138000",
+  "outcome": "missed",
+  "reached_network": true,
+  "ring_seconds": 4.2,
+  "detail": "RING"
+}
+```
+
+`direction`: `in` | `out`。`outcome`: `answered` | `missed` | `no_answer` | `rejected` | `failed`。
+
+`reached_network` 为 `true` 表示运营商应答了本次呼叫,即使最终无人接听,这也证明号码
+仍然可达 —— 对保号卡是健康信号。`outcome` 为 `no_answer` 配合 `reached_network=true`
+是正常保号拨测,不是失败。`ring_seconds` 为振铃时长,可选。`detail` 为 URC 或
+错误文本,可选。
 
 ### `task_result` —— 保号任务执行结果
 
@@ -386,6 +448,27 @@ Agent 通过 `AT+CFUN=0/1` 切换并在 `cmd_result.data` 返回当前
 `radio_enabled` 与 `registered`。关闭射频不关闭 AT 串口，因此同一连接仍可重新开启。
 飞行模式是管理员主动状态，不产生“网络未注册”事件；期间到期的保号任务记为
 `skipped`，不消耗重试次数，也不推进 `last_run_at`。
+
+### `set_data` —— 移动数据开关
+
+```json
+{"type":"set_data","cmd_id":"c-9a10","device":"a","enabled":false}
+```
+
+`enabled=false` 依次执行 `AT+CGACT=0` 与 `AT+CGATT=0`，再查询两个状态；只有确认
+PDP 上下文全部停用且分组数据服务已分离，回执才会显示关闭。`enabled=true` 只执行
+`AT+CGATT=1`，不会替调用者猜测 APN 或擅自激活 PDP。该偏好在 Agent 本地保存，重连后
+仍会执行；默认值为关闭。
+
+### `set_roaming_data` —— 漫游数据安全策略
+
+```json
+{"type":"set_roaming_data","cmd_id":"c-9a11","device":"a","allowed":false}
+```
+
+`allowed=false` 时，当前网络明确为漫游或漫游状态未知，Agent 会保持移动数据关闭；
+设置只保存在 Agent 本地，不依赖 Server 在线。该开关不是 `AT+COPS` 运营商选择，也不
+会改变短信或射频状态。
 
 ### `scan_operators` —— 扫描可见运营商
 

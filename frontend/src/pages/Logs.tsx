@@ -2,6 +2,7 @@ import { useState } from 'react'
 import {
   Card,
   CardContent,
+  Chip,
   Stack,
   Tab,
   Table,
@@ -26,6 +27,14 @@ const LEVEL_COLOR: Record<string, string> = {
   warning: STATUS.warning,
 }
 
+const CALL_OUTCOME: Record<string, string> = {
+  answered: '已接听',
+  missed: '未接',
+  no_answer: '无应答',
+  rejected: '已拒接',
+  failed: '失败',
+}
+
 const REFRESH_MS = 20_000
 
 export function LogsPage() {
@@ -35,6 +44,7 @@ export function LogsPage() {
   // its position while the other is on screen.
   const agentPager = usePager()
   const notifyPager = usePager()
+  const callPager = usePager()
 
   // Two keys, not one composite fetch: the visible tab is the one that has to
   // be current, and a failure in either list leaves the other still rendering.
@@ -49,11 +59,17 @@ export function LogsPage() {
     () => api.notifyLogs(notifyPager.query),
     { refreshInterval: REFRESH_MS, keepPreviousData: true },
   )
+  const { data: callPage } = useSWR(
+    ['/api/calls', callPager.query],
+    () => api.calls.list({ limit: callPager.limit, offset: callPager.offset }),
+    { refreshInterval: REFRESH_MS, keepPreviousData: true },
+  )
 
   if (!agentPage) return <Loading />
 
   const agentLogs = agentPage.items
   const notifyLogs = notifyPage?.items ?? []
+  const calls = callPage?.items ?? []
 
   return (
     <Stack spacing={3}>
@@ -65,6 +81,7 @@ export function LogsPage() {
               otherwise read as "50 logs" no matter how many there are. */}
           <Tab label={`设备日志 (${agentPage.total})`} />
           <Tab label={`推送日志 (${notifyPage?.total ?? 0})`} />
+          <Tab label={`通话记录 (${callPage?.total ?? 0})`} />
         </Tabs>
         <CardContent sx={{ p: 0, '&:last-child': { pb: 0 } }}>
           {tab === 0 ? (
@@ -103,7 +120,49 @@ export function LogsPage() {
                 <Pager total={agentPage.total} pager={agentPager} />
               </TableContainer>
             )
-          ) : notifyLogs.length === 0 ? (
+          ) : tab === 1 ? (
+            notifyLogs.length === 0 ? (
+              <Typography
+                variant="body2"
+                sx={{
+                  color: 'text.secondary',
+                  p: 4,
+                  textAlign: 'center'
+                }}>
+                还没有推送记录
+              </Typography>
+            ) : (
+              <TableContainer>
+                <Table size="small" sx={{ minWidth: 560 }}>
+                  <TableHead>
+                    <TableRow>
+                      <TableCell>时间</TableCell>
+                      <TableCell>渠道</TableCell>
+                      <TableCell>结果</TableCell>
+                      <TableCell>尝试</TableCell>
+                      <TableCell>详情</TableCell>
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {notifyLogs.map((log) => (
+                      <TableRow key={log.id}>
+                        <TableCell sx={{ whiteSpace: 'nowrap' }}>{formatTs(log.ts)}</TableCell>
+                        <TableCell>{log.channel_name ?? log.channel_id}</TableCell>
+                        <TableCell
+                          sx={{ color: log.status === 'ok' ? STATUS.good : STATUS.critical }}
+                        >
+                          {log.status === 'ok' ? '成功' : '失败'}
+                        </TableCell>
+                        <TableCell>{log.attempts}</TableCell>
+                        <TableCell>{log.detail}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+                <Pager total={notifyPage?.total ?? 0} pager={notifyPager} />
+              </TableContainer>
+            )
+          ) : calls.length === 0 ? (
             <Typography
               variant="body2"
               sx={{
@@ -111,37 +170,61 @@ export function LogsPage() {
                 p: 4,
                 textAlign: 'center'
               }}>
-              还没有推送记录
+              还没有通话记录
             </Typography>
           ) : (
             <TableContainer>
-              <Table size="small" sx={{ minWidth: 560 }}>
+              <Table size="small" sx={{ minWidth: 640 }}>
                 <TableHead>
                   <TableRow>
                     <TableCell>时间</TableCell>
-                    <TableCell>渠道</TableCell>
+                    <TableCell>方向</TableCell>
+                    <TableCell>号码</TableCell>
+                    <TableCell>卡</TableCell>
                     <TableCell>结果</TableCell>
-                    <TableCell>尝试</TableCell>
-                    <TableCell>详情</TableCell>
+                    <TableCell>响铃</TableCell>
                   </TableRow>
                 </TableHead>
                 <TableBody>
-                  {notifyLogs.map((log) => (
-                    <TableRow key={log.id}>
-                      <TableCell sx={{ whiteSpace: 'nowrap' }}>{formatTs(log.ts)}</TableCell>
-                      <TableCell>{log.channel_name ?? log.channel_id}</TableCell>
-                      <TableCell
-                        sx={{ color: log.status === 'ok' ? STATUS.good : STATUS.critical }}
-                      >
-                        {log.status === 'ok' ? '成功' : '失败'}
+                  {calls.map((call) => (
+                    <TableRow key={call.id}>
+                      <TableCell sx={{ whiteSpace: 'nowrap' }}>{formatTs(call.ts)}</TableCell>
+                      <TableCell>
+                        <Chip
+                          size="small"
+                          label={call.direction === 'in' ? '来电' : '去电'}
+                          color={call.direction === 'in' ? 'primary' : 'default'}
+                          variant="outlined"
+                          sx={{ minWidth: 56 }}
+                        />
                       </TableCell>
-                      <TableCell>{log.attempts}</TableCell>
-                      <TableCell>{log.detail}</TableCell>
+                      <TableCell sx={{ fontVariantNumeric: 'tabular-nums' }}>
+                        {call.peer}
+                      </TableCell>
+                      <TableCell>
+                        {call.sim_label || call.sim_iccid?.slice(-6) || call.device}
+                      </TableCell>
+                      <TableCell>
+                        <Chip
+                          size="small"
+                          label={CALL_OUTCOME[call.outcome] || call.outcome}
+                          color={
+                            call.outcome === 'answered' ? 'success' :
+                            call.outcome === 'failed' ? 'error' :
+                            'default'
+                          }
+                          variant="outlined"
+                          sx={{ minWidth: 64 }}
+                        />
+                      </TableCell>
+                      <TableCell sx={{ color: 'text.secondary' }}>
+                        {call.ring_seconds > 0 ? `${Math.round(call.ring_seconds)}s` : '—'}
+                      </TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
               </Table>
-              <Pager total={notifyPage?.total ?? 0} pager={notifyPager} />
+              <Pager total={callPage?.total ?? 0} pager={callPager} />
             </TableContainer>
           )}
         </CardContent>

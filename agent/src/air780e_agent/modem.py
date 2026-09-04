@@ -186,6 +186,9 @@ class ModemInfo:
     cs_registered: bool | None = None
     ims_registered: bool | None = None
     radio_enabled: bool | None = None
+    data_attached: bool | None = None
+    pdp_active: bool | None = None
+    roaming: bool | None = None
 
 
 @dataclass
@@ -517,8 +520,16 @@ class Air780E:
         if info.radio_enabled is False:
             info.eps_registered = False
             info.cs_registered = False
+            info.roaming = False
+            info.data_attached = False
+            info.pdp_active = False
         else:
-            info.eps_registered, info.cs_registered = await self.read_registration_domains()
+            (
+                info.eps_registered,
+                info.cs_registered,
+                info.roaming,
+            ) = await self.read_registration_details()
+            info.data_attached, info.pdp_active = await self.read_data_status()
         info.registered = bool(info.eps_registered or info.cs_registered)
         info.ims_registered = await self.read_ims_registration()
 
@@ -668,9 +679,77 @@ class Air780E:
             self.info.registered = False
             self.info.eps_registered = False
             self.info.cs_registered = False
+            self.info.roaming = False
+            self.info.data_attached = False
+            self.info.pdp_active = False
             if self.info.ims_registered is not None:
                 self.info.ims_registered = False
         return enabled, self.info.registered
+
+    async def read_data_status(self) -> tuple[bool | None, bool | None]:
+        """Return ``(packet attached, any PDP context active)``.
+
+        ``CGATT`` and ``CGACT`` are separate states.  A module can be attached
+        without an active data context, so reporting only one of them would
+        make an apparently disabled data switch ambiguous.
+        """
+        attached: bool | None = None
+        try:
+            response = await self.client.execute("AT+CGATT?")
+        except ATError as exc:
+            log.debug("AT+CGATT? failed: %s", exc)
+        else:
+            value = response.first("+CGATT:") or ""
+            match = re.match(r"\s*(\d+)", value)
+            if match is not None:
+                attached = match.group(1) == "1"
+
+        pdp_active: bool | None = None
+        try:
+            response = await self.client.execute("AT+CGACT?")
+        except ATError as exc:
+            log.debug("AT+CGACT? failed: %s", exc)
+        else:
+            states: list[bool] = []
+            for value in response.all("+CGACT:"):
+                match = re.match(r"\s*\d+\s*,\s*(\d+)", value)
+                if match is not None:
+                    states.append(match.group(1) == "1")
+            if states:
+                pdp_active = any(states)
+
+        self.info.data_attached = attached
+        self.info.pdp_active = pdp_active
+        return attached, pdp_active
+
+    async def set_data_enabled(self, enabled: bool) -> tuple[bool | None, bool | None]:
+        """Enable packet attachment, or fully tear down all data contexts.
+
+        Disabling deactivates every PDP context before detaching packet service;
+        that makes the post-command query a meaningful guarantee rather than a
+        UI-only preference.  Enabling only attaches the packet service — it does
+        not invent an APN or activate a context that the host did not request.
+        """
+        if enabled:
+            await self.client.execute("AT+CGATT=1", timeout=30.0)
+        else:
+            first_error: ATError | None = None
+            for command in ("AT+CGACT=0", "AT+CGATT=0"):
+                try:
+                    await self.client.execute(command, timeout=30.0)
+                except ATError as exc:
+                    first_error = first_error or exc
+            if first_error is not None:
+                raise first_error
+        state = await self.read_data_status()
+        if not enabled and state != (False, False):
+            attached, active = state
+            raise ATError(
+                "packet-data disable was not confirmed "
+                f"(attached={attached!r}, pdp_active={active!r})",
+                command="AT+CGATT=0",
+            )
+        return state
 
     async def _read_registration_domain(
         self, command: str, *prefixes: str
@@ -682,11 +761,18 @@ class Air780E:
         with ``+CGREG: 0,5``.  Accepting the alias is what keeps the EPS domain
         from reading as "unknown" forever on that firmware.
         """
+        registered, _ = await self._read_registration_domain_state(command, *prefixes)
+        return registered
+
+    async def _read_registration_domain_state(
+        self, command: str, *prefixes: str
+    ) -> tuple[bool | None, bool | None]:
+        """Return ``(registered, roaming)`` while preserving unknown values."""
         try:
             response = await self.client.execute(command)
         except ATError as exc:
             log.debug("%s failed: %s", command, exc)
-            return None
+            return None, None
         for prefix in prefixes:
             value = response.first(f"+{prefix}:")
             if value is None:
@@ -694,19 +780,41 @@ class Air780E:
             # Query form is "<n>,<stat>[,...]"; the stat is the second field.
             match = re.match(r"\s*\d+\s*,\s*(\d+)", value)
             if match is not None:
-                return match.group(1) in REGISTERED_STATES
-        return None
+                state = match.group(1)
+                return state in REGISTERED_STATES, state == "5"
+        return None, None
 
     async def read_registration_domains(self) -> tuple[bool | None, bool | None]:
         """Return ``(EPS/LTE, CS)`` registration without collapsing the evidence."""
+        eps, cs, _ = await self.read_registration_details()
+        return eps, cs
+
+    async def read_registration_details(
+        self,
+    ) -> tuple[bool | None, bool | None, bool | None]:
+        """Return EPS, CS and roaming state from the registration domains."""
         # ``+CGREG`` is deliberately not a registered URC prefix: `_handle_line`
         # matches the in-flight command's expected prefix *before* the URC
         # router, so routing it as a URC would take this very reply out of the
         # response and put the domain back to unknown.  A pushed EPS change is
         # instead picked up by the next status poll.
-        eps = await self._read_registration_domain("AT+CEREG?", "CEREG", "CGREG")
-        cs = await self._read_registration_domain("AT+CREG?", "CREG")
-        return eps, cs
+        eps, eps_roaming = await self._read_registration_domain_state(
+            "AT+CEREG?", "CEREG", "CGREG"
+        )
+        cs, cs_roaming = await self._read_registration_domain_state(
+            "AT+CREG?", "CREG"
+        )
+        roaming_values = [
+            value for value in (eps_roaming, cs_roaming) if value is not None
+        ]
+        roaming = (
+            True
+            if any(roaming_values)
+            else False
+            if roaming_values
+            else None
+        )
+        return eps, cs, roaming
 
     async def read_registration(self) -> bool:
         """True if the module is registered on *either* the CS or EPS domain.
@@ -717,9 +825,10 @@ class Air780E:
         SIM like giffgaff lands here.  ``1`` is home, ``5`` is roaming; both
         mean "attached".
         """
-        eps, cs = await self.read_registration_domains()
+        eps, cs, roaming = await self.read_registration_details()
         self.info.eps_registered = eps
         self.info.cs_registered = cs
+        self.info.roaming = roaming
         self.info.registered = bool(eps or cs)
         return self.info.registered
 

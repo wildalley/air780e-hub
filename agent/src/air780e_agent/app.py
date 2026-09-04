@@ -13,7 +13,7 @@ from typing import Any
 
 from . import __version__
 from .config import AgentConfig, DeviceConfig
-from .discovery import PortRegistry, ProbeResult, ProbeResult
+from .discovery import PortRegistry, ProbeResult
 from .link import ServerLink
 from .scheduler import KeepAliveScheduler
 from .store import LocalStore
@@ -162,16 +162,31 @@ class AgentApp:
             return
 
         reserved = self.config.devices + self._adopted
+        seen_identities: set[str] = set()
         for found in await self.registry.survey(reserved):
-            if not found.imei:
+            identity = self._probe_identity(found)
+            if identity is None:
                 # Identity is the whole point: a module that will not say who
                 # it is cannot be given a name that survives a replug.
-                log.debug("autodetect: %s has no IMEI, leaving it alone", found.port)
+                log.debug("autodetect: %s has no IMEI/ICCID, leaving it alone", found.port)
                 continue
+            if identity in seen_identities:
+                log.debug("autodetect: %s is a duplicate probe for %s", found.port, identity)
+                continue
+            seen_identities.add(identity)
             self._adopt(found)
 
     def _adopt(self, found: ProbeResult) -> None:
-        name = self._name_for(found.imei)
+        identity = self._probe_identity(found)
+        if identity is None:
+            return
+        if any(
+            identity == self._device_identity(device)
+            for device in self.config.devices + self._adopted
+        ):
+            log.debug("autodetect: %s is already represented by a worker", identity)
+            return
+        name = self._name_for(found.imei, found.iccid)
         device = DeviceConfig(name=name, imei=found.imei, label=found.model)
         worker = self._build_worker(device)
 
@@ -191,15 +206,36 @@ class AgentApp:
             "iccid": found.iccid,
         })
 
-    def _name_for(self, imei: str) -> str:
-        """A stable device name for this IMEI, remembered across restarts.
+    @staticmethod
+    def _probe_identity(found: ProbeResult) -> str | None:
+        imei = found.imei.strip().lower()
+        if imei:
+            return f"imei:{imei}"
+        iccid = found.iccid.strip().lower()
+        return f"iccid:{iccid}" if iccid else None
+
+    @staticmethod
+    def _device_identity(device: DeviceConfig) -> str | None:
+        imei = (device.imei or "").strip().lower()
+        if imei:
+            return f"imei:{imei}"
+        iccid = (device.iccid or "").strip().lower()
+        return f"iccid:{iccid}" if iccid else None
+
+    def _name_for(self, imei: str, iccid: str = "") -> str:
+        """A stable device name for this module, remembered across restarts.
 
         The name ends up on every event the module produces, so it must not
         drift: the server would see the history split in two.  Hence the kv
         table rather than deriving it fresh each time — the derivation could
         change, or collide differently, and the stored answer cannot.
         """
-        key = f"autodetect:imei:{imei}"
+        identity = imei.strip() or iccid.strip()
+        key = (
+            f"autodetect:imei:{imei}"
+            if imei.strip()
+            else f"autodetect:iccid:{iccid}"
+        )
         remembered = self.store.get(key)
         if remembered and remembered not in self.workers:
             return remembered
@@ -207,7 +243,11 @@ class AgentApp:
         # Suffix rather than the full IMEI: short enough to type into the web
         # UI, and the last digits are what differs between two modules from
         # the same batch.
-        base = f"auto-{imei[-6:]}" if len(imei) > 6 else f"auto-{imei}"
+        base = (
+            f"auto-{identity[-6:]}"
+            if len(identity) > 6
+            else f"auto-{identity}"
+        )
         name = base
         suffix = 2
         while name in self.workers:
@@ -243,6 +283,8 @@ class AgentApp:
             "run_task": self._cmd_run_task,
             "query": self._cmd_query,
             "set_radio": self._cmd_set_radio,
+            "set_data": self._cmd_set_data,
+            "set_roaming_data": self._cmd_set_roaming_data,
             "scan_operators": self._cmd_scan_operators,
             "select_operator": self._cmd_select_operator,
             "network_diagnostics": self._cmd_network_diagnostics,
@@ -338,6 +380,20 @@ class AgentApp:
         if not isinstance(enabled, bool):
             raise ValueError("set_radio needs a boolean enabled value")
         return await worker.set_radio_enabled(enabled)
+
+    async def _cmd_set_data(self, frame: dict[str, Any]) -> dict[str, Any]:
+        worker = self._worker(frame)
+        enabled = frame.get("enabled")
+        if not isinstance(enabled, bool):
+            raise ValueError("set_data needs a boolean enabled value")
+        return await worker.set_data_enabled(enabled)
+
+    async def _cmd_set_roaming_data(self, frame: dict[str, Any]) -> dict[str, Any]:
+        worker = self._worker(frame)
+        allowed = frame.get("allowed")
+        if not isinstance(allowed, bool):
+            raise ValueError("set_roaming_data needs a boolean allowed value")
+        return await worker.set_roaming_data_allowed(allowed)
 
     async def _cmd_scan_operators(self, frame: dict[str, Any]) -> dict[str, Any]:
         return await self._worker(frame).scan_operators()

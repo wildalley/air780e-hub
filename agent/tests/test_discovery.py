@@ -201,6 +201,23 @@ async def test_survey_reports_a_module_nobody_configured(patched_glob):
     assert [r.imei for r in found] == ["862323088372050"]
 
 
+async def test_survey_deduplicates_multiple_at_ports_of_one_module(patched_glob):
+    """An Air780E may answer on more than one ACM interface."""
+    patched_glob("/dev/ttyACM3", "/dev/ttyACM5", "/dev/ttyACM7")
+    registry = PortRegistry(prober=fake_world({
+        "/dev/ttyACM3": ("862323088372043", "8964012207010569008F"),
+        "/dev/ttyACM5": ("862323088372043", "8964012207010569008F"),
+        "/dev/ttyACM7": ("862323088372050", "8944110068802881339F"),
+    }))
+
+    found = await registry.survey([])
+
+    assert [result.imei for result in found] == [
+        "862323088372043",
+        "862323088372050",
+    ]
+
+
 async def test_survey_leaves_a_configured_module_alone(patched_glob):
     """The module is present and its device block is waiting for it: adopting
     it would take the name that device is entitled to."""

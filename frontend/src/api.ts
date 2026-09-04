@@ -104,6 +104,11 @@ export interface Device {
   eps_registered?: number | null
   cs_registered?: number | null
   ims_registered?: number | null
+  data_attached?: number | null
+  pdp_active?: number | null
+  roaming?: number | null
+  roaming_data_allowed?: number | null
+  data_blocked_by_roaming?: number | null
   model: string
   hardware_model?: string
   firmware?: string
@@ -177,6 +182,7 @@ export interface Sim {
   first_seen_at: string
   last_seen_at: string
   message_count?: number
+  last_reached_network_at?: string | null
 }
 
 export interface Message {
@@ -486,6 +492,32 @@ export interface MessageStat {
   sim_label: string | null
 }
 
+/**
+ * One call attempt, either direction.
+ *
+ * `reached_network` is the field that matters for a keep-alive card: it says
+ * the carrier answered for this attempt, which is proof the number is still
+ * live even when nobody picked up. An `outcome` of `no_answer` with
+ * `reached_network` set is a healthy card, not a failure.
+ */
+export interface Call {
+  id: number
+  agent_id: string
+  device: string
+  sim_id: number | null
+  direction: 'in' | 'out'
+  peer: string
+  ts: string
+  outcome: 'answered' | 'missed' | 'no_answer' | 'rejected' | 'failed' | string
+  reached_network: number
+  ring_seconds: number
+  detail: string | null
+  sim_label?: string
+  sim_iccid?: string
+  phone_number?: string
+  device_label?: string
+}
+
 // -- endpoints ---------------------------------------------------------------
 
 export const api = {
@@ -511,6 +543,10 @@ export const api = {
         `/api/devices/${encodeURIComponent(name)}/radio`,
         { enabled },
       ),
+    setData: (name: string, enabled: boolean) =>
+      post<Device>(`/api/devices/${encodeURIComponent(name)}/data`, { enabled }),
+    setRoamingData: (name: string, allowed: boolean) =>
+      post<Device>(`/api/devices/${encodeURIComponent(name)}/roaming-data`, { allowed }),
     scanOperators: (name: string) =>
       post<{ operators: OperatorNetwork[] }>(
         `/api/devices/${encodeURIComponent(name)}/operators/scan`,
@@ -524,6 +560,8 @@ export const api = {
       post<{ diagnostics: NetworkDiagnostics }>(
         `/api/devices/${encodeURIComponent(name)}/network-diagnostics`,
       ),
+    ussd: (name: string, code: string) =>
+      post<{ response: string }>(`/api/devices/${encodeURIComponent(name)}/ussd`, { code }),
   },
   sims: {
     list: () => get<Sim[]>('/api/sims'),
@@ -575,6 +613,20 @@ export const api = {
     /** Download stored messages as a streamed CSV. */
     exportCsv: (content?: 'text' | 'data') =>
       downloadFile(`/api/messages/export${content ? `?content=${content}` : ''}`, 'messages.csv'),
+  },
+  calls: {
+    list: (params: {
+      limit?: number
+      offset?: number
+      sim_id?: number
+      direction?: 'in' | 'out'
+    } = {}) => {
+      const query = new URLSearchParams()
+      Object.entries(params).forEach(([key, value]) => {
+        if (value !== undefined && value !== null) query.set(key, String(value))
+      })
+      return get<{ items: Call[]; total: number }>(`/api/calls?${query}`)
+    },
   },
   at: (device: string, command: string) =>
     post<{ lines: string[] }>('/api/at', { device, command }),

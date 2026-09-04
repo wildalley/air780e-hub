@@ -41,6 +41,21 @@ def _optional_int(value: Any) -> int | None:
     except (TypeError, ValueError):
         return None
 
+
+def _float_or_zero(value: Any) -> float:
+    """Coerce a frame field to float, treating anything malformed as zero.
+
+    Same reasoning as ``_optional_int``, with a sharper consequence: a handler
+    that raises rolls its event back and closes the stream, so the agent
+    replays the identical frame and the pair loops on it forever.  A ring
+    duration is not worth wedging ingest over.
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 CLOSE_AUTH_FAILED = 4001
 CLOSE_PROTOCOL_ERROR = 4002
 CLOSE_AGENT_CONFLICT = 4003
@@ -68,6 +83,7 @@ RECOVERY_ACTION_NAMES = {
 
 MessageHook = Callable[[int, dict[str, Any]], Awaitable[None]]
 TaskResultHook = Callable[[int, dict[str, Any]], Awaitable[None]]
+CallHook = Callable[[int, dict[str, Any]], Awaitable[None]]
 # (agent_id, device, online) — fired on every module up/down state the gateway
 # learns, so the offline alerter can debounce and page.  Synchronous: it only
 # schedules work and returns, never awaits a push on the ingest path.
@@ -103,6 +119,7 @@ class AppliedEvent:
 
     message_id: int | None = None
     task_id: int | None = None
+    call_id: int | None = None
     device_change: tuple[str, bool] | None = None
     command_result: bool = False
 
@@ -115,6 +132,7 @@ class Gateway:
         *,
         on_message: MessageHook | None = None,
         on_task_result: TaskResultHook | None = None,
+        on_call: CallHook | None = None,
         on_device_change: DeviceChangeHook | None = None,
     ) -> None:
         self.db = db
@@ -123,6 +141,7 @@ class Gateway:
         # off this.  Both hooks must return promptly — the ack waits on them.
         self.on_message = on_message
         self.on_task_result = on_task_result
+        self.on_call = on_call
         # Called on each module up/down edge; the offline alerter hangs off it.
         self.on_device_change = on_device_change
         self.connections: dict[str, AgentConnection] = {}
@@ -333,6 +352,8 @@ class Gateway:
             self._apply_sms_delivery(agent_id, frame)
         elif kind == "status":
             applied.device_change = self._apply_status(agent_id, frame)
+        elif kind == "call_event":
+            applied.call_id = self._apply_call_event(agent_id, frame)
         elif kind == "log":
             self._apply_log(agent_id, frame)
         elif kind == "task_result":
@@ -361,6 +382,8 @@ class Gateway:
                 await self.on_message(applied.message_id, frame)
             if applied.task_id is not None and self.on_task_result is not None:
                 await self.on_task_result(applied.task_id, frame)
+            if applied.call_id is not None and self.on_call is not None:
+                await self.on_call(applied.call_id, frame)
         except Exception:
             # Persistence has committed and replaying it cannot repair an
             # in-process callback.  Keep the event durable and log the hook
@@ -567,6 +590,26 @@ class Gateway:
                     else "。USB 线材或供电可能供流不足，建议更换。"
                 )
             ),
+        )
+
+    def _apply_call_event(self, agent_id: str, frame: dict[str, Any]) -> int:
+        """Store one call attempt.
+
+        ``seq`` is carried through so the row can be traced back to the queued
+        event that produced it, the same way an SMS row can.
+        """
+        return self.db.insert_call(
+            agent_id=agent_id,
+            device=str(frame.get("device") or ""),
+            direction=str(frame.get("direction") or "out"),
+            ts=str(frame.get("ts") or utcnow()),
+            peer=str(frame.get("peer") or ""),
+            iccid=str(frame.get("iccid") or ""),
+            outcome=str(frame.get("outcome") or ""),
+            reached_network=bool(frame.get("reached_network")),
+            ring_seconds=_float_or_zero(frame.get("ring_seconds")),
+            detail=str(frame.get("detail") or ""),
+            seq=_optional_int(frame.get("seq")),
         )
 
     def _apply_log(self, agent_id: str, frame: dict[str, Any]) -> None:

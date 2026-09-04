@@ -23,6 +23,22 @@ export function imsRegistrationStatus(
   return device.ims_registered ? 'IMS 已注册' : 'IMS 未注册'
 }
 
+export function packetDataStatus(
+  device: Pick<Device, 'data_attached' | 'pdp_active'>,
+): string {
+  if (device.data_attached === 0 && device.pdp_active === 0) return '已关闭'
+  if (device.pdp_active === 1) return 'PDP 已激活'
+  if (device.data_attached === 1) return '已附着 · 未激活 PDP'
+  if (device.data_attached === 0 && device.pdp_active == null) return 'PDP 未激活 · 附着未知'
+  if (device.data_attached == null && device.pdp_active === 0) return '未激活 · 附着未知'
+  return '状态未知'
+}
+
+export function roamingStatus(device: Pick<Device, 'roaming'>): string {
+  if (device.roaming == null) return '漫游状态未知'
+  return device.roaming ? '当前为漫游网络' : '当前为本地网络'
+}
+
 // Labelled with the exact command sent, parameters included: AT+CCED has no
 // bare execute form, so a plain "AT+CCED" label would misdescribe the read and
 // send anyone reproducing it by hand straight into +CME ERROR: 3.
