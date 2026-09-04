@@ -2583,7 +2583,8 @@ def test_ussd_query_returns_the_raw_response(admin):
             ws.send_json({
                 "type": "cmd_result",
                 "cmd_id": frame["cmd_id"],
-                "result": {"response": "余额:50.00元"},
+                "ok": True,
+                "data": {"response": "余额:50.00元"},
             })
             result_queue.put("done")
 
