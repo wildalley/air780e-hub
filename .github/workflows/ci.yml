@@ -116,6 +116,11 @@ jobs:
         run: npm run test
       - name: Typecheck and build
         run: npm run build
+      - name: Verify committed bundle is current
+        working-directory: .
+        run: |
+          git diff --exit-code -- frontend/dist
+          test -z "$(git status --short --untracked-files=all --ignored=matching -- frontend/dist)"
 
   image:
     name: Server image build and publish
@@ -147,11 +152,8 @@ jobs:
           file: server/Dockerfile
           tags: ${{ steps.image.outputs.value }}:sha-${{ github.sha }}
           push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
-          progress: plain
           provenance: false
           sbom: false
-          # Keep npm/uv output visible in CI so a registry stall is diagnosable
-          # instead of looking like a silent RUN step.
       - name: Report published image
         if: github.event_name == 'push' && github.ref == 'refs/heads/master'
         run: |

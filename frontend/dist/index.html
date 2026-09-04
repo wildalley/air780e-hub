@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <!-- This UI shows SMS verification codes; keep it out of search engines
+         and out of referer headers. -->
+    <meta name="robots" content="noindex, nofollow" />
+    <link rel="icon" href="/icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="/icon.svg" />
+    <title>air780e-hub</title>
+    <script>
+      (function () {
+        try {
+          var mode = localStorage.getItem('hub.theme');
+          if (!mode) mode = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+          document.documentElement.style.backgroundColor = mode === 'dark' ? '#0d0d0d' : '#f9f9f7';
+        } catch (e) {}
+      })();
+    </script>
+    <script type="module" crossorigin src="/assets/index-BSW8Sppx.js"></script>
+    <link rel="modulepreload" crossorigin href="/assets/react-Vp-Z_cNX.js">
+    <link rel="modulepreload" crossorigin href="/assets/mui-DFD367rz.js">
+    <link rel="modulepreload" crossorigin href="/assets/charts-C1QE3R-b.js">
+  <link rel="manifest" href="/manifest.webmanifest"><script id="vite-plugin-pwa:register-sw" src="/registerSW.js"></script></head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>

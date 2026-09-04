@@ -17,7 +17,7 @@ air780e-hub 分为两个独立进程：
 | Python | 3.11 – 3.14 | CI 对 Agent 与 Server 在四个版本上各跑全量测试 |
 | Server 运行时 | 镜像内固定 `python:3.12-slim` | 源码部署可用 3.11 – 3.14 任一 |
 | Agent 运行时 | 发行版自带 `python3` | 按 §2.1 用系统解释器建 venv，故上限跟随最新稳定版 |
-| Node | 24（active LTS，仅构建期） | 前端运行时是静态文件，部署主机不需要 Node |
+| Node | 24（active LTS，仅开发/CI 构建期） | 前端静态包已随版本提交，部署主机不需要 Node |
 | 架构 | amd64 / arm64 | GHCR 多架构镜像 |
 
 **实机验证状态（0.1.0）**：仅一套环境跑通端到端 —— Arch Linux、Python 3.14、
@@ -52,7 +52,8 @@ air780e-hub 分为两个独立进程：
 
 ### 1.2 构建并启动
 
-两条路径都受支持。**源码构建是参考路径** —— 不需要访问任何 registry：
+两条路径都受支持。**源码构建是参考路径** —— 前端静态包已经在仓库中，部署主机不需要
+Node/npm，也不会执行 `npm ci`；只需 Docker 拉取基础镜像和 Python 依赖：
 
 ```bash
 git clone https://github.com/wildalley/air780e-hub.git /opt/air780e-hub
