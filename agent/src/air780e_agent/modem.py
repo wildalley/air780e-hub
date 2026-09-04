@@ -136,6 +136,20 @@ OPERATOR_SETTLE_INTERVAL = 3.0
 REGISTERED_STATES = ("1", "5")
 
 
+@dataclass(frozen=True)
+class PdpContextState:
+    """The activation state and APN of one defined PDP context."""
+
+    cid: int
+    active: bool
+    apn: str | None = None
+
+    @property
+    def is_ims(self) -> bool:
+        """Whether this is the carrier's IMS control-plane bearer."""
+        return (self.apn or "").strip().lower() == "ims"
+
+
 def _timestamp() -> str:
     # Same shape the worker stamps its events with, so an incoming call sorts
     # against messages without any conversion on the way through.
@@ -686,13 +700,68 @@ class Air780E:
                 self.info.ims_registered = False
         return enabled, self.info.registered
 
-    async def read_data_status(self) -> tuple[bool | None, bool | None]:
-        """Return ``(packet attached, any PDP context active)``.
+    async def _read_pdp_context_states(self) -> list[PdpContextState] | None:
+        """Read activation states together with their APN definitions.
 
-        ``CGATT`` and ``CGACT`` are separate states.  A module can be attached
-        without an active data context, so reporting only one of them would
-        make an apparently disabled data switch ambiguous.
+        Air780E modules can keep an active ``ims`` PDP context for VoLTE/IMS
+        signalling while user data is disabled.  ``AT+CGACT?`` only returns a
+        CID and a state, so pair it with ``AT+CGDCONT?`` before deciding which
+        contexts are safe to deactivate.  If the activation query fails, the
+        result is unknown and callers must fail closed.
         """
+        definitions: dict[int, str] | None = {}
+        try:
+            response = await self.client.execute("AT+CGDCONT?")
+        except ATError as exc:
+            log.debug("AT+CGDCONT? failed: %s", exc)
+            definitions = None
+        else:
+            for value in response.all("+CGDCONT:"):
+                fields = _csv_fields(value)
+                if len(fields) < 3:
+                    continue
+                try:
+                    cid = int(fields[0])
+                except ValueError:
+                    continue
+                definitions[cid] = fields[2].strip().strip('"')
+
+        try:
+            response = await self.client.execute("AT+CGACT?")
+        except ATError as exc:
+            log.debug("AT+CGACT? failed: %s", exc)
+            return None
+
+        states: list[PdpContextState] = []
+        for value in response.all("+CGACT:"):
+            fields = _csv_fields(value)
+            if len(fields) < 2:
+                continue
+            try:
+                cid = int(fields[0])
+                state = int(fields[1])
+            except ValueError:
+                continue
+            apn = None if definitions is None else definitions.get(cid)
+            states.append(PdpContextState(cid, state == 1, apn))
+        return states
+
+    @staticmethod
+    def _user_data_contexts(
+        contexts: list[PdpContextState] | None,
+    ) -> list[PdpContextState] | None:
+        """Return active non-IMS contexts, preserving unknown as unknown."""
+        if contexts is None:
+            return None
+        if any(context.active and context.apn is None for context in contexts):
+            # Without a usable APN definition, CID 15 could be the IMS bearer.
+            # Do not guess and risk dropping the registration/control plane.
+            return None
+        return [context for context in contexts if context.active and not context.is_ims]
+
+    async def _read_data_snapshot(
+        self,
+    ) -> tuple[bool | None, list[PdpContextState] | None]:
         attached: bool | None = None
         try:
             response = await self.client.execute("AT+CGATT?")
@@ -703,20 +772,20 @@ class Air780E:
             match = re.match(r"\s*(\d+)", value)
             if match is not None:
                 attached = match.group(1) == "1"
+        return attached, await self._read_pdp_context_states()
 
-        pdp_active: bool | None = None
-        try:
-            response = await self.client.execute("AT+CGACT?")
-        except ATError as exc:
-            log.debug("AT+CGACT? failed: %s", exc)
-        else:
-            states: list[bool] = []
-            for value in response.all("+CGACT:"):
-                match = re.match(r"\s*\d+\s*,\s*(\d+)", value)
-                if match is not None:
-                    states.append(match.group(1) == "1")
-            if states:
-                pdp_active = any(states)
+    async def read_data_status(self) -> tuple[bool | None, bool | None]:
+        """Return ``(packet attached, user-data PDP active)``.
+
+        ``CGATT`` and ``CGACT`` are separate states.  A module can be attached
+        without an active user-data context, and a registered Air780E can also
+        keep an ``ims`` context active for signalling.  IMS is therefore
+        deliberately excluded from ``pdp_active`` and is never touched by the
+        user-data switch.
+        """
+        attached, contexts = await self._read_data_snapshot()
+        user_contexts = self._user_data_contexts(contexts)
+        pdp_active = None if user_contexts is None else bool(user_contexts)
 
         self.info.data_attached = attached
         self.info.pdp_active = pdp_active
@@ -741,17 +810,17 @@ class Air780E:
         if enabled:
             await self.client.execute("AT+CGATT=1", timeout=30.0)
         else:
-            attached, active = await self.read_data_status()
+            attached, contexts = await self._read_data_snapshot()
+            active_contexts = self._user_data_contexts(contexts)
 
-            # Stop an already active context before changing attachment.  A
-            # detached module normally reports no active context, but keeping
-            # this branch makes the order safe for firmware that reports stale
-            # state during reconnect.
-            if active is not False:
-                try:
-                    await self.client.execute("AT+CGACT=0", timeout=30.0)
-                except ATError as exc:
-                    errors.append(exc)
+            # Stop only active non-IMS contexts.  The modem's `ims` bearer is
+            # a registration/control-plane context, not an Internet session;
+            # deactivating it is exactly what made the earlier implementation
+            # destabilize IMS and the registration state.
+            if active_contexts:
+                errors.extend(
+                    await self._deactivate_user_data_contexts(active_contexts)
+                )
 
             # Reattach only the packet-service control plane.  Some firmware
             # may reject this while the modem is still searching; that is not a
@@ -764,10 +833,12 @@ class Air780E:
                 except ATError as exc:
                     errors.append(exc)
                 else:
-                    try:
-                        await self.client.execute("AT+CGACT=0", timeout=30.0)
-                    except ATError as exc:
-                        errors.append(exc)
+                    _, contexts = await self._read_data_snapshot()
+                    active_contexts = self._user_data_contexts(contexts)
+                    if active_contexts:
+                        errors.extend(
+                            await self._deactivate_user_data_contexts(active_contexts)
+                        )
 
         state = await self.read_data_status()
         if not enabled and state[1] is not False:
@@ -787,6 +858,23 @@ class Air780E:
                 "; ".join(str(error) for error in errors),
             )
         return state
+
+    async def _deactivate_user_data_contexts(
+        self, contexts: list[PdpContextState]
+    ) -> list[ATError]:
+        """Deactivate each active non-IMS context and verify the result."""
+        errors: list[ATError] = []
+        for context in contexts:
+            command = f"AT+CGACT=0,{context.cid}"
+            try:
+                await self.client.execute(command, timeout=30.0)
+            except ATError as exc:
+                errors.append(exc)
+                continue
+            # CGACT can acknowledge before the bearer state settles.  Give the
+            # modem a short window before the final state read in the caller.
+            await asyncio.sleep(1.0)
+        return errors
 
     async def _read_registration_domain(
         self, command: str, *prefixes: str

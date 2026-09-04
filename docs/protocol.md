@@ -231,9 +231,11 @@ Agent 通过 `AT+CNMI=2,1,0,1,0` 接收 `+CDS`，解码 SMS-STATUS-REPORT 后持
 `data_enabled` 是 Agent 本地持久化的**有效数据策略**，默认 `false`，不是调制解调器
 是否附着，也不代表已经有流量；它只决定 Agent 是否允许可能产生用户面流量的操作。
 `data_attached` 对应 `AT+CGATT?`，表示是否附着分组数据服务；`pdp_active` 表示
-`AT+CGACT?` 返回的上下文中是否至少有一个处于激活状态。对费用来说，真正需要关闭的是
-`pdp_active`：`false` 表示当前没有激活的数据会话，即使 `data_attached` 为 `true` 也只是
-保留网络控制面附着。`roaming` 来自 `+CEREG`/`+CREG` 的状态码 `5`，
+`AT+CGACT?` 返回的非 IMS 上下文中是否至少有一个处于激活状态。模块可能为了 VoLTE/IMS
+信令保留 APN 为 `ims` 的控制面 PDP；它不计入 `pdp_active`，也不会被移动数据开关关闭。
+对费用来说，真正需要关闭的是 `pdp_active`：`false` 表示当前没有激活的用户数据会话，即使
+`data_attached` 为 `true` 或 IMS PDP 仍存在，也只是保留网络控制面能力。`roaming` 来自
+`+CEREG`/`+CREG` 的状态码 `5`，
 `roaming_data_allowed` 是 Agent 本地持久化的安全策略，默认 `false`；
 `data_blocked_by_roaming` 表示数据策略请求被该策略拦截。上述字段都是协议 v1 的可选扩展，
 旧 Agent 缺失时 Server 与前端按未知处理。
@@ -459,8 +461,9 @@ Agent 通过 `AT+CFUN=0/1` 切换并在 `cmd_result.data` 返回当前
 {"type":"set_data","cmd_id":"c-9a10","device":"a","enabled":false}
 ```
 
-`enabled=false` 停用 PDP 上下文(`AT+CGACT=0`)并查询确认 `pdp_active=false`；**不会**
-发送 `AT+CGATT=0`，因为强制分离分组服务可能连带影响 EPS/IMS 注册。若模块之前已经被
+`enabled=false` 停用非 IMS 用户数据 PDP 上下文(`AT+CGACT=0,<cid>`)并查询确认
+`pdp_active=false`；APN 为 `ims` 的控制面上下文会保留。**不会**发送 `AT+CGATT=0`，
+因为强制分离分组服务可能连带影响 EPS/IMS 注册。若模块之前已经被
 旧版本分离，Agent 会尽力执行 `AT+CGATT=1` 恢复附着，然后再次停用 PDP；这不会主动猜测
 APN 或激活用户数据。`enabled=true` 只允许 Agent 保留/恢复分组服务附着，仍不会替调用者
 猜测 APN 或擅自激活 PDP。该偏好在 Agent 本地保存，重连后仍会执行；默认值为关闭。

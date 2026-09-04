@@ -1173,7 +1173,11 @@ class DeviceWorker:
         needs_attach = (
             self.state.registered and self.state.data_attached is False
         )
-        if needs_disable and (force or data_is_on or needs_attach):
+        if needs_disable and (
+            data_is_on
+            or needs_attach
+            or (force and self.state.pdp_active is None)
+        ):
             attached, active = await modem.set_data_enabled(False)
             self.state.data_attached = attached
             self.state.pdp_active = active

@@ -354,12 +354,14 @@ class MockAir780E:
             return self._reply([f'+COPS: 0,0,"{self.operator}",7'])
         if upper == "AT+CGATT?":
             return self._reply([f"+CGATT: {1 if self.data_attached else 0}"])
+        if upper == "AT+CGDCONT?":
+            return self._reply(['+CGDCONT: 1,"IP","internet"'])
         if upper == "AT+CGACT?":
             return self._reply([f"+CGACT: 1,{1 if self.pdp_active else 0}"])
-        if upper == "AT+CGACT=0":
+        if upper in ("AT+CGACT=0", "AT+CGACT=0,1"):
             self.pdp_active = False
             return self._reply()
-        if upper == "AT+CGACT=1":
+        if upper in ("AT+CGACT=1", "AT+CGACT=1,1"):
             self.pdp_active = self.data_attached and self.radio_enabled and self.registered
             return self._reply()
         if upper == "AT+CGATT=0":
