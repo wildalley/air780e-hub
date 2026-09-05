@@ -16,7 +16,7 @@ from .config import AgentConfig, DeviceConfig
 from .discovery import PortRegistry, ProbeResult
 from .link import ServerLink
 from .scheduler import KeepAliveScheduler
-from .store import LocalStore
+from .store import TASK_REVISION_KEY, LocalStore, task_revision
 from .worker import DeviceOffline, DeviceWorker, TransportFactory, _default_transport
 
 log = logging.getLogger(__name__)
@@ -346,10 +346,32 @@ class AgentApp:
 
     async def _cmd_sync_tasks(self, frame: dict[str, Any]) -> dict[str, Any]:
         tasks = frame.get("tasks")
-        if not isinstance(tasks, list):
-            raise ValueError("sync_tasks needs a list of tasks")
-        # Full-replace semantics; see docs/protocol.md.
-        count = self.store.replace_tasks(tasks)
+        revision = frame.get("revision", "")
+        sync_id = frame.get("sync_id", "")
+        versioned = "revision" in frame or "sync_id" in frame
+        if versioned and not (
+            isinstance(revision, str) and len(revision) == 64
+            and isinstance(sync_id, str) and len(sync_id) == 32
+            and all(c in "0123456789abcdef" for c in revision + sync_id)
+        ):
+            raise ValueError("sync_tasks needs a valid revision and sync_id")
+        error = "invalid_tasks"
+        try:
+            if not isinstance(tasks, list):
+                raise ValueError("sync_tasks needs a list of tasks")
+            if versioned and task_revision(tasks) != revision:
+                error = "revision_mismatch"
+                raise ValueError("task revision does not match the payload")
+            error = "apply_failed"
+            count = self.store.replace_tasks(tasks, revision=revision, sync_id=sync_id)
+        except Exception:
+            if versioned:
+                self.emit("tasks_applied", {
+                    "sync_id": sync_id, "revision": revision, "ok": False, "error": error,
+                })
+            raise
+        if versioned:
+            self.link.wake()
         log.info("synced %d keep-alive task(s)", count)
         return {"count": count}
 
@@ -357,6 +379,8 @@ class AgentApp:
         task_id = frame.get("task_id")
         if not isinstance(task_id, int) or isinstance(task_id, bool):
             raise ValueError("run_task needs an integer task_id")
+        if "revision" in frame and frame["revision"] != self.store.get(TASK_REVISION_KEY):
+            raise ValueError("task configuration has not been applied")
         return self.scheduler.run_now(task_id)
 
     async def _cmd_query(self, frame: dict[str, Any]) -> dict[str, Any]:

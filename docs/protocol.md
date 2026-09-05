@@ -47,7 +47,8 @@ Agent 收帧循环立即处理 `ack` 和 `resend_from`,硬件命令交给独立�
 命令队列默认全局最多 200 条、每设备或控制队列最多 16 条,均包含正在执行的命令;
 最多同时存在 32 个执行队列。超限命令不会执行,带 `cmd_id` 时通过持久化的
 `cmd_result(ok=false)` 报告 `command queue is full; command was not started`。
-无 `cmd_id` 的任务同步无法回执,超限时 Agent 以 `1013` 关闭连接,通过重连重新获取全量配置。
+任务同步不带 `cmd_id`,其应用回执由 `tasks_applied` 单独上报;尚未入队的同步不会产生
+应用回执,超限时 Agent 以 `1013` 关闭连接,通过重连重新获取全量配置。
 
 普通断线不会取消已开始的硬件操作,其结果可随本地事件队列在新连接上补传。Agent 停机则
 先取消并等待命令任务退出,再关闭模块和 SQLite;未开始命令报告未执行,被中断的运行中命令
@@ -297,6 +298,32 @@ Agent 通过 `AT+CNMI=2,1,0,1,0` 接收 `+CDS`，解码 SMS-STATUS-REPORT 后持
 
 `status`:`ok` | `failed` | `skipped`(设备离线等)。
 
+### `tasks_applied`：任务配置应用回执
+
+```json
+{
+  "type": "tasks_applied",
+  "seq": 1425,
+  "sync_id": "0123456789abcdef0123456789abcdef",
+  "revision": "a551e79622e2bd5e342687be2bfd5f5183028af7b9771f2d3146ab6bc3a067f4",
+  "ok": true,
+  "count": 1
+}
+```
+
+`revision` 和 `sync_id` 原样对应本次 `sync_tasks`。Agent 将全量任务替换、已应用
+revision 和成功回执写入同一 SQLite 事务,提交后再上传。回执作为普通持久化事件参与
+`seq`、重放和累积 ACK,重启或丢 ACK 后仍可补传。
+
+失败回执使用 `ok=false` 和 `error`: `invalid_tasks` 表示任务列表格式无效,
+`revision_mismatch` 表示内容摘要不匹配,`apply_failed` 表示任务校验或本地保存失败。
+失败时保留原任务及 revision;本地库无法写入时可能连失败回执也无法持久化,Server
+继续按未确认状态重试。无效的 revision/sync_id 格式直接拒绝,不产生应用回执。
+
+Server 仅更新当前 Agent、revision、sync_id 均匹配的同步状态,旧配置或旧连接的迟到
+回执不能覆盖当前状态;已经 `applied` 的同步也不会被迟到失败回执降级。回执状态与
+入站去重记录同事务提交,提交后才 ACK。
+
 ### `cmd_result` —— 下行命令的回执
 
 ```json
@@ -379,6 +406,8 @@ agent 回 `sms_out`(带同一 `cmd_id`),再回 `cmd_result`。
 ```json
 {
   "type": "sync_tasks",
+  "revision": "a551e79622e2bd5e342687be2bfd5f5183028af7b9771f2d3146ab6bc3a067f4",
+  "sync_id": "0123456789abcdef0123456789abcdef",
   "tasks": [
     {
       "id": 3,
@@ -401,12 +430,25 @@ agent 回 `sms_out`(带同一 `cmd_id`),再回 `cmd_result`。
 
 **全量语义**:未出现在列表里的任务,agent 本地删除。空列表即清空。
 
+`revision` 是 `tasks` 数组的规范化 JSON 的 SHA-256,为 64 位小写十六进制字符串。
+规范化方式与 Python `json.dumps(tasks, sort_keys=True, separators=(",", ":"),
+ensure_ascii=True)` 一致:对象键排序、无额外空白、非 ASCII 字符转义,数组顺序保留。
+`sync_id` 为 Server 生成的 32 位小写十六进制标识;配置变化或连接重建时重新生成,
+同一连接上同一版本的重试保留原标识。任务 ID 必须是互不重复的正整数,不接受布尔值。
+
 **何时下发:**
 
 1. **agent `hello` 之后立即下发一次**,内容是该 agent 名下的全部任务。保号任务是 agent 本地持久化的(D3),断网期间在 server 上做的增删改它并不知道;不在连接时对齐,一条已删除的任务会在本地一直跑下去
-2. server 上任何任务增删改之后,下发给当前所有在线 agent
+2. server 上任何任务增删改之后,更新所有 agent 的期望版本,向在线且尚未确认当前版本的 agent 下发;离线 agent 在版本变化后显示待同步
+3. 后台每 15 秒检查在线 agent 的未确认配置,距上次检查至少 15 秒才重发;单次发送超时 5 秒。发送或应用失败仍保留失败状态和错误信息,后续成功回执将其更新为已同步
 
-**不带 `cmd_id`,agent 不回 `cmd_result`。** 连接时那次是在 server 自己的收帧循环里发出的 —— 回执要由同一个循环读取,等它就是死锁。任务的真相在 server 库里,这一帧是尽力而为:丢了,下次连接会再对齐一次,而全量替换让重复下发无副作用。
+**不带 `cmd_id`,agent 通过 `tasks_applied` 回执。** Server 发送时不等待应用回执,
+由收帧循环独立推进 `pending`、`applied`、`failed` 状态,运维中心展示待同步、已同步、
+同步失败。重复下发不会触发一次手动执行,也不会重置未改变计划的上次执行时间和下次
+执行时间;计划表达式或抖动发生变化时重新计算下次执行时间。
+
+Agent 仍接受不带 revision/sync_id 的旧格式,但不会产生 `tasks_applied`;当前 Server
+始终发送带版本的格式,部署仍遵循两端同步升级约束。
 
 任务按**归属的 agent** 路由:任务行带 `agent_id` 时按它,否则按 `device` 当前属于哪个 agent。别的 agent 的任务不会下发过来。
 
@@ -442,8 +484,13 @@ agent 回 `sms_out`(带同一 `cmd_id`),再回 `cmd_result`。
 ### `run_task` —— 手动执行保号任务
 
 ```json
-{"type":"run_task","cmd_id":"c-9a03","task_id":3}
+{"type":"run_task","cmd_id":"c-9a03","task_id":3,
+ "revision":"a551e79622e2bd5e342687be2bfd5f5183028af7b9771f2d3146ab6bc3a067f4"}
 ```
+
+Server 先推送当前任务配置,随后发出带同一 revision 的手动运行命令。Agent 在同一
+控制队列中按顺序处理,仅当 revision 等于本地已应用值时才启动;不匹配则返回失败
+`task configuration has not been applied`,避免在同步失败后执行旧配置。
 
 Agent 校验本地任务后立即启动异步执行，并返回
 `{"task_id":3,"status":"started"}`。任务停用只影响定时调度，管理员仍可手动执行；

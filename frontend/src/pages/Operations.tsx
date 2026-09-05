@@ -311,13 +311,14 @@ export function OperationsPage() {
                     <TableCell>状态</TableCell>
                     <TableCell>版本</TableCell>
                     <TableCell>设备</TableCell>
+                    <TableCell>任务配置</TableCell>
                     <TableCell>最后上报</TableCell>
                     <TableCell>已确认序号</TableCell>
                   </TableRow>
                 </TableHead>
                 <TableBody>
                   {diagnostics.agents.length === 0 ? (
-                    <EmptyRow colSpan={6}>尚无 Agent 记录</EmptyRow>
+                    <EmptyRow colSpan={7}>尚无 Agent 记录</EmptyRow>
                   ) : (
                     diagnostics.agents.map((agent) => (
                       <TableRow key={agent.id}>
@@ -347,6 +348,33 @@ export function OperationsPage() {
                           </Stack>
                         </TableCell>
                         <TableCell>{agent.device_count}</TableCell>
+                        <TableCell sx={{ minWidth: 112 }}>
+                          <Stack spacing={0.5}>
+                            <Chip
+                              size="small"
+                              variant="outlined"
+                              sx={{ alignSelf: 'flex-start' }}
+                              color={
+                                agent.tasks_sync_status === 'applied' ? 'success'
+                                  : agent.tasks_sync_status === 'failed' ? 'error' : 'warning'
+                              }
+                              label={
+                                agent.tasks_sync_status === 'applied' ? '已同步'
+                                  : agent.tasks_sync_status === 'failed' ? '同步失败' : '待同步'
+                              }
+                            />
+                            {agent.tasks_sync_error && (
+                              <Typography variant="caption" color="error.main">
+                                {agent.tasks_sync_error}
+                              </Typography>
+                            )}
+                            {agent.tasks_synced_at && (
+                              <Typography variant="caption" color="text.secondary">
+                                {formatTs(agent.tasks_synced_at)}
+                              </Typography>
+                            )}
+                          </Stack>
+                        </TableCell>
                         <TableCell sx={{ whiteSpace: 'nowrap' }}>{formatTs(agent.last_seen_at)}</TableCell>
                         <TableCell>{agent.last_seq}</TableCell>
                       </TableRow>

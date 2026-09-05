@@ -1246,8 +1246,11 @@ def build_router(state: AppState) -> APIRouter:
 
         # Re-send the authoritative definition first. This keeps an immediate
         # run correct even when it follows an edit before the agent reconnects.
-        await state.gateway.push_tasks(agent_id)
-        return await _call(agent_id, {"type": "run_task", "task_id": task_id})
+        revision = await state.gateway.push_tasks(agent_id)
+        frame: dict[str, Any] = {"type": "run_task", "task_id": task_id}
+        if revision is not None:
+            frame["revision"] = revision
+        return await _call(agent_id, frame)
 
     @router.get("/task-logs", dependencies=guard)
     def task_logs(
@@ -1532,16 +1535,9 @@ def build_router(state: AppState) -> APIRouter:
             raise HTTPException(status_code=502, detail=exc.error) from exc
 
     async def _sync_tasks() -> None:
-        """Push the full task list to every connected agent.
-
-        Fire-and-forget on purpose: the database is the source of truth for
-        what a task *is*, and the push is best-effort — an agent that misses
-        it gets the same list again on its next connect, and full-replace
-        makes a repeat harmless.  Waiting for each agent's receipt here would
-        stall the Web request behind a wedged agent for the command timeout.
-        """
-        for agent_id in list(state.gateway.connections):
-            await state.gateway.push_tasks(agent_id)
+        """Update desired versions, send online snapshots, and let receipts confirm them."""
+        for agent in state.db.query("SELECT id FROM agents"):
+            await state.gateway.push_tasks(agent["id"])
 
     router.sync_tasks = _sync_tasks  # type: ignore[attr-defined]
     return router

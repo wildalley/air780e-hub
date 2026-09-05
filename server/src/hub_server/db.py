@@ -50,6 +50,7 @@ log = logging.getLogger(__name__)
 # the modem's packet attachment and PDP state.
 # Version 16 makes a notification owed by a stored event durable, so a restart
 # resumes it instead of losing it with the process.
+# Version 17 records desired and acknowledged Agent task configurations.
 #
 # To add a migration: append one entry to ``MIGRATIONS`` with the next integer
 # and bump this constant, and add the same columns/tables/indexes to SCHEMA so a brand
@@ -59,7 +60,7 @@ log = logging.getLogger(__name__)
 # Never renumber or edit a released entry — a database that already ran it will
 # not run it again, so an edit only affects databases that have not, and the two
 # then disagree about what version N means.
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 # Persisted (settings table) key for the SMS retention window, in days.  The
 # operator edits it on the Notify page; when unset the env default applies.
@@ -100,7 +101,14 @@ CREATE TABLE IF NOT EXISTS agents (
     -- agent's data directory and numbering restarts at 1 while this server
     -- still holds the old numbers, so the two together are what identifies an
     -- event.  Empty for an agent old enough not to report one.
-    stream_id    TEXT NOT NULL DEFAULT ''
+    stream_id    TEXT NOT NULL DEFAULT '',
+    tasks_revision TEXT NOT NULL DEFAULT '',
+    tasks_applied_revision TEXT NOT NULL DEFAULT '',
+    tasks_sync_id TEXT NOT NULL DEFAULT '',
+    tasks_sync_status TEXT NOT NULL DEFAULT 'pending',
+    tasks_sync_error TEXT NOT NULL DEFAULT '',
+    tasks_sync_sent_at TEXT,
+    tasks_synced_at TEXT
 );
 
 -- Every event the agent sends is recorded in the same transaction that
@@ -855,6 +863,8 @@ class Database:
          "_migration_task_device_id"),
         (16, "persist the notifications a stored event owes",
          "_migration_notify_outbox"),
+        (17, "track Agent task configuration acknowledgements",
+         "_migration_task_sync"),
     )
 
     def _add_columns_if_missing(self, table: str, columns: dict[str, str]) -> None:
@@ -1237,6 +1247,17 @@ class Database:
             "ON notify_deliveries(status, next_attempt_at)"
         )
 
+    def _migration_task_sync(self) -> None:
+        self._add_columns_if_missing("agents", {
+            "tasks_revision": "TEXT NOT NULL DEFAULT ''",
+            "tasks_applied_revision": "TEXT NOT NULL DEFAULT ''",
+            "tasks_sync_id": "TEXT NOT NULL DEFAULT ''",
+            "tasks_sync_status": "TEXT NOT NULL DEFAULT 'pending'",
+            "tasks_sync_error": "TEXT NOT NULL DEFAULT ''",
+            "tasks_sync_sent_at": "TEXT",
+            "tasks_synced_at": "TEXT",
+        })
+
     def _snapshot_before_migration(self, from_version: int) -> Path | None:
         """Copy the database aside before migrating it.
 
@@ -1439,6 +1460,29 @@ class Database:
         self.execute(
             "UPDATE agents SET connected = ?, last_seen_at = ? WHERE id = ?",
             (int(connected), utcnow(), agent_id),
+        )
+
+    def begin_task_sync(
+        self, agent_id: str, revision: str, sync_id: str, *, sent_at: str | None = None
+    ) -> None:
+        self.execute(
+            "UPDATE agents SET tasks_revision = ?, tasks_sync_id = ?, "
+            "tasks_sync_status = 'pending', tasks_sync_error = '', tasks_sync_sent_at = ? "
+            "WHERE id = ?",
+            (revision, sync_id, sent_at, agent_id),
+        )
+
+    def finish_task_sync(
+        self, agent_id: str, revision: str, sync_id: str, *, ok: bool, error: str = ""
+    ) -> None:
+        self.execute(
+            "UPDATE agents SET tasks_sync_status = ?, tasks_sync_error = ?, "
+            "tasks_applied_revision = CASE WHEN ? THEN ? ELSE tasks_applied_revision END, "
+            "tasks_synced_at = CASE WHEN ? THEN ? ELSE tasks_synced_at END "
+            "WHERE id = ? AND tasks_revision = ? AND tasks_sync_id = ? "
+            "AND tasks_sync_status != 'applied'",
+            ("applied" if ok else "failed", "" if ok else error,
+             ok, revision, ok, utcnow(), agent_id, revision, sync_id),
         )
 
     def mark_all_agents_disconnected(self) -> None:

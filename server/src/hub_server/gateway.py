@@ -12,6 +12,7 @@ symmetric — events flow up, commands flow down.  Two invariants matter:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import itertools
 import json
 import logging
@@ -27,6 +28,11 @@ from .config import Settings
 from .db import Database, _pdu_is_data, utcnow
 
 log = logging.getLogger(__name__)
+
+
+def task_revision(tasks: list[dict[str, Any]]) -> str:
+    encoded = json.dumps(tasks, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _optional_int(value: Any) -> int | None:
@@ -75,6 +81,8 @@ MAX_ID_CHARS = 128  # agent_id, stream_id: identifiers, not free text
 MAX_SEQ = 2**62
 
 COMMAND_TIMEOUT = 30.0
+TASK_SYNC_RETRY_SECONDS = 15.0
+TASK_SYNC_SEND_TIMEOUT = 5.0
 SETTING_PREVIOUS_AGENT_TOKEN_HASH = "previous_agent_token_hash"
 SETTING_PREVIOUS_AGENT_TOKEN_EXPIRES_AT = "previous_agent_token_expires_at"
 
@@ -161,6 +169,9 @@ class AgentConnection:
     stream_id: str = ""
     devices: list[dict[str, Any]] = field(default_factory=list)
     connected_at: str = field(default_factory=utcnow)
+    tasks_sync_id: str = ""
+    tasks_next_check: float = 0.0
+    tasks_sync_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def send(self, frame: dict[str, Any]) -> None:
         await self.websocket.send_text(json.dumps(frame, ensure_ascii=False))
@@ -577,6 +588,8 @@ class Gateway:
             applied.task_id = self._apply_task_result(agent_id, frame)
         elif kind == "cmd_result":
             applied.command_result = True
+        elif kind == "tasks_applied":
+            self._apply_tasks_applied(agent_id, frame)
         else:
             log.debug("ignoring unknown event kind %r", kind)
         self._queue_notification(applied, frame)
@@ -1103,21 +1116,85 @@ class Gateway:
             })
         return tasks
 
-    async def push_tasks(self, agent_id: str) -> None:
-        """Send the full task list without waiting for a receipt.
+    def _apply_tasks_applied(self, agent_id: str, frame: dict[str, Any]) -> None:
+        revision = frame.get("revision")
+        sync_id = frame.get("sync_id")
+        ok = frame.get("ok")
+        if not isinstance(revision, str) or not isinstance(sync_id, str) or type(ok) is not bool:
+            return
+        if not revision or not sync_id:
+            return
+        errors = {
+            "invalid_tasks": "任务配置格式无效",
+            "revision_mismatch": "任务配置版本校验失败",
+            "apply_failed": "Agent 未能保存任务配置",
+        }
+        error_code = frame.get("error")
+        error = errors.get(error_code, "Agent 未能应用任务配置") if isinstance(
+            error_code, str
+        ) else "Agent 未能应用任务配置"
+        self.db.finish_task_sync(agent_id, revision, sync_id, ok=ok, error=error)
 
-        Deliberately not ``call()``: this runs inside the connection's own
-        receive loop at hello time, and that loop is what would have to read
-        the ``cmd_result`` — waiting for it here would deadlock until the
-        command timed out.
-        """
+    async def push_tasks(self, agent_id: str) -> str | None:
+        """Send a versioned snapshot; its durable receipt arrives through ingest."""
         connection = self.connections.get(agent_id)
         if connection is None:
-            return
-        tasks = self.tasks_for(agent_id)
-        try:
-            await connection.send({"type": "sync_tasks", "tasks": tasks})
-        except Exception:
-            log.warning("failed to push tasks to agent %s", agent_id)
-            return
-        log.info("pushed %d keep-alive task(s) to %s", len(tasks), agent_id)
+            revision = task_revision(self.tasks_for(agent_id))
+            state = self.db.one("SELECT tasks_revision FROM agents WHERE id = ?", (agent_id,))
+            if state is not None and revision != state["tasks_revision"]:
+                self.db.begin_task_sync(agent_id, revision, secrets.token_hex(16))
+            return revision
+        async with connection.tasks_sync_lock:
+            if self.connections.get(agent_id) is not connection:
+                return
+            connection.tasks_next_check = (
+                asyncio.get_running_loop().time() + TASK_SYNC_RETRY_SECONDS
+            )
+            tasks = self.tasks_for(agent_id)
+            revision = task_revision(tasks)
+            state = self.db.one("SELECT * FROM agents WHERE id = ?", (agent_id,)) or {}
+            if (
+                revision != state.get("tasks_revision")
+                or not connection.tasks_sync_id
+                or connection.tasks_sync_id != state.get("tasks_sync_id")
+            ):
+                connection.tasks_sync_id = secrets.token_hex(16)
+                self.db.begin_task_sync(
+                    agent_id, revision, connection.tasks_sync_id, sent_at=utcnow()
+                )
+            elif state.get("tasks_sync_status") == "applied":
+                return revision
+            else:
+                self.db.execute(
+                    "UPDATE agents SET tasks_sync_sent_at = ? WHERE id = ?",
+                    (utcnow(), agent_id),
+                )
+            try:
+                async with asyncio.timeout(TASK_SYNC_SEND_TIMEOUT):
+                    await connection.send({
+                        "type": "sync_tasks", "tasks": tasks, "revision": revision,
+                        "sync_id": connection.tasks_sync_id,
+                    })
+            except Exception:
+                self.db.finish_task_sync(
+                    agent_id, revision, connection.tasks_sync_id,
+                    ok=False, error="任务配置下发失败",
+                )
+                log.warning("failed to push tasks to agent %s", agent_id)
+                return revision
+            log.info("pushed %d keep-alive task(s) to %s", len(tasks), agent_id)
+            return revision
+
+    async def retry_task_sync(self) -> None:
+        now = asyncio.get_running_loop().time()
+        for connection in list(self.connections.values()):
+            if connection.tasks_next_check <= now:
+                await self.push_tasks(connection.agent_id)
+
+    async def run_task_sync(self) -> None:
+        while True:
+            await asyncio.sleep(TASK_SYNC_RETRY_SECONDS)
+            try:
+                await self.retry_task_sync()
+            except Exception:
+                log.exception("task configuration retry failed")

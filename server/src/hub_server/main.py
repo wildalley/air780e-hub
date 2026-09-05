@@ -128,6 +128,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except Exception:
             log.exception("initial SIM incident reconciliation failed")
         task = asyncio.create_task(_housekeeping(state), name="housekeeping")
+        task_sync = asyncio.create_task(state.gateway.run_task_sync(), name="task-sync")
         # Anything the last run left owed in the outbox goes out now: the queue
         # is what makes a push survive a restart, and nothing else drains it.
         state.notifier.start()
@@ -135,7 +136,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             yield
         finally:
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            task_sync.cancel()
+            await asyncio.gather(task, task_sync, return_exceptions=True)
             # Cancel any armed offline timers, then let pushes already on the
             # wire finish before the HTTP client closes — AppState.close() is
             # synchronous and cannot await them.

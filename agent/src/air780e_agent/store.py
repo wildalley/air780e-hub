@@ -15,6 +15,7 @@ restart or a network outage:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import secrets
@@ -92,6 +93,12 @@ TASK_FIELDS = (
 
 # kv key holding the label for this store's sequence-number space.
 STREAM_ID_KEY = "stream_id"
+TASK_REVISION_KEY = "tasks_revision"
+
+
+def task_revision(tasks: list[dict[str, Any]]) -> str:
+    encoded = json.dumps(tasks, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def utcnow() -> str:
@@ -256,7 +263,13 @@ class LocalStore:
 
     # -- tasks -------------------------------------------------------------
 
-    def replace_tasks(self, tasks: Iterable[dict[str, Any]]) -> int:
+    def replace_tasks(
+        self,
+        tasks: Iterable[dict[str, Any]],
+        *,
+        revision: str = "",
+        sync_id: str = "",
+    ) -> int:
         """Apply a full ``sync_tasks`` payload.
 
         Full-replace semantics: anything absent from the payload is deleted.
@@ -266,8 +279,16 @@ class LocalStore:
         from the new expression.
         """
         incoming = list(tasks)
-        keep = {int(task["id"]) for task in incoming if "id" in task}
+        keep: set[int] = set()
+        for task in incoming:
+            task_id = task.get("id") if isinstance(task, dict) else None
+            if type(task_id) is not int or task_id <= 0 or task_id in keep:
+                raise ValueError("tasks need distinct positive integer ids")
+            keep.add(task_id)
 
+        # This connection uses autocommit; the context manager alone does not
+        # start a transaction. The replacement and its receipt must commit together.
+        self._db.execute("BEGIN IMMEDIATE")
         with self._db:
             if keep:
                 placeholders = ",".join("?" * len(keep))
@@ -295,6 +316,12 @@ class LocalStore:
                     f"ON CONFLICT(id) DO UPDATE SET {updates}",
                     values,
                 )
+            self.set(TASK_REVISION_KEY, revision)
+            if sync_id:
+                self.append_event("tasks_applied", {
+                    "sync_id": sync_id, "revision": revision,
+                    "ok": True, "count": len(incoming),
+                })
         return len(incoming)
 
     def _schedule_changed(self, values: dict[str, Any]) -> bool:

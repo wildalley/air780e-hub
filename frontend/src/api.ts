@@ -537,6 +537,9 @@ export interface DiagnosticAgent {
   last_seen_at: string | null
   last_seq: number
   device_count: number
+  tasks_sync_status: 'pending' | 'applied' | 'failed'
+  tasks_sync_error: string
+  tasks_synced_at: string | null
 }
 
 export interface Diagnostics {

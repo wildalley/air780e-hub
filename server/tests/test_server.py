@@ -2292,6 +2292,46 @@ def test_each_agent_is_only_given_its_own_tasks(admin):
             assert [t["name"] for t in _greet(mine)] == ["给 test-agent"]
 
 
+def test_task_sync_confirmation_is_visible_and_offline_edits_become_pending(admin):
+    with _connect(admin) as ws:
+        ws.send_json(HELLO)
+        frame = ws.receive_json()
+        agent = admin.get("/api/operations/diagnostics").json()["agents"][0]
+        assert agent["tasks_sync_status"] == "pending"
+        ws.send_json({
+            "type": "tasks_applied", "seq": 1, "revision": frame["revision"],
+            "sync_id": frame["sync_id"], "ok": True, "count": 0,
+        })
+        assert ws.receive_json() == {"type": "ack", "seq": 1}
+        agent = admin.get("/api/operations/diagnostics").json()["agents"][0]
+        assert agent["tasks_sync_status"] == "applied"
+        assert agent["tasks_synced_at"]
+    response = admin.post("/api/tasks", json={"device": "a", "name": "offline edit"})
+    assert response.status_code == 200
+    agent = admin.get("/api/operations/diagnostics").json()["agents"][0]
+    assert agent["tasks_sync_status"] == "pending"
+    assert agent["tasks_revision"] != agent["tasks_applied_revision"]
+    assert agent["tasks_sync_sent_at"] is None
+
+
+def test_manual_run_carries_the_configuration_revision(admin, monkeypatch):
+    with _connect(admin) as ws:
+        _greet(ws)
+        task = admin.post("/api/tasks", json={"device": "a", "name": "manual"}).json()
+        frame = ws.receive_json()
+        seen = []
+
+        async def call(agent_id, command, **_kwargs):
+            seen.append((agent_id, command))
+            return {"task_id": task["id"], "status": "started"}
+
+        monkeypatch.setattr(admin.app.state.hub.gateway, "call", call)
+        assert admin.post(f"/api/tasks/{task['id']}/run").status_code == 200
+        assert seen == [("test-agent", {
+            "type": "run_task", "task_id": task["id"], "revision": frame["revision"],
+        })]
+
+
 def test_an_edit_reaches_the_connected_agent(admin):
     with _connect(admin) as ws:
         assert _greet(ws) == []
