@@ -1,13 +1,15 @@
 import {
   deliveryStatusLabel,
   detectOtp,
-  hasOlderMessages,
+  mergeThreadPages,
   messagePreview,
   resolveThread,
+  resolveThreadDevice,
   threadPreview,
+  threadScope,
 } from '../messages'
 import { describe, expect, it } from 'vitest'
-import type { Conversation } from '../api'
+import type { Conversation, Message } from '../api'
 
 /**
  * `detectOtp` drives the copy-code button on every received message, so its
@@ -126,33 +128,96 @@ describe('resolveThread', () => {
 })
 
 /**
- * `hasOlderMessages` decides whether the thread view offers "加载更早的消息".
+ * `threadScope` is the whole null-SIM fix in one line.
  *
- * The thread grows its window instead of paging, so this is the only thing
- * standing between the operator and a button that either never appears on a
- * long history or never goes away on a short one.
+ * A card-less thread and "every card" used to be spelled the same way, so
+ * opening the former listed the latter — another card's messages from the same
+ * number, and a read count that disagreed with them.
  */
-describe('hasOlderMessages', () => {
-  it('offers more when the window is full and the thread is longer', () => {
-    expect(hasOlderMessages(640, 200)).toBe(true)
+describe('threadScope', () => {
+  it('names the card-less thread instead of omitting the filter', () => {
+    expect(threadScope(null)).toBe('unassigned')
   })
 
-  it('stops offering once every message has been fetched', () => {
-    // The exact-fit case: a thread of precisely one window. Comparing the total
-    // against the *requested* limit instead of the fetched count would leave
-    // the button up with nothing behind it.
-    expect(hasOlderMessages(200, 200)).toBe(false)
-    expect(hasOlderMessages(37, 37)).toBe(false)
+  it('passes a real card through as itself', () => {
+    expect(threadScope(7)).toBe(7)
+  })
+})
+
+/**
+ * `mergeThreadPages` assembles the cursor pages of one transcript.
+ *
+ * The window it replaced re-read the whole conversation every five seconds and
+ * hit a 422 wall past 2,000 rows. What has to hold now is that pages which
+ * overlap (the tail grows while you read history) and messages that share a
+ * timestamp (every segment of a multipart SMS carries one SCTS) still produce
+ * each message exactly once, in the order the operator reads.
+ */
+describe('mergeThreadPages', () => {
+  const at = (id: number, ts: string, over: Partial<Message> = {}): Message => ({
+    id,
+    agent_id: 'home-arch',
+    device: 'modem-1',
+    sim_id: 1,
+    direction: 'in',
+    peer: '10086',
+    body: `msg-${id}`,
+    ts,
+    status: 'received',
+    segments: 1,
+    error: null,
+    ...over,
   })
 
-  it('says no for an empty thread', () => {
-    expect(hasOlderMessages(0, 0)).toBe(false)
+  it('reads oldest first, newest last', () => {
+    // The API answers newest first; a conversation is read the other way round.
+    const merged = mergeThreadPages([
+      { items: [at(3, '2026-09-05T12:00:00+00:00'), at(2, '2026-09-05T11:00:00+00:00')] },
+      { items: [at(1, '2026-09-05T10:00:00+00:00')] },
+    ])
+    expect(merged.map((m) => m.id)).toEqual([1, 2, 3])
   })
 
-  it('does not offer more when the count somehow trails the rows', () => {
-    // A total that lags the page (a delete landing between the two queries)
-    // must not render a button that would fetch nothing.
-    expect(hasOlderMessages(5, 10)).toBe(false)
+  it('keeps one copy of a message two pages both returned', () => {
+    // While the operator reads history the tail keeps growing, so a re-read of
+    // page 0 covers rows the next page already carried. Rendering both would
+    // duplicate a bubble — and duplicate its verification code.
+    const merged = mergeThreadPages([
+      { items: [at(9, '2026-09-05T12:00:00+00:00'), at(8, '2026-09-05T11:00:00+00:00')] },
+      { items: [at(8, '2026-09-05T11:00:00+00:00'), at(7, '2026-09-05T10:00:00+00:00')] },
+    ])
+    expect(merged.map((m) => m.id)).toEqual([7, 8, 9])
+  })
+
+  it('prefers the live tail copy of a message it also has from history', () => {
+    // Page 0 is the one being revalidated, so it holds the settled delivery
+    // report; the cached older page still says pending.
+    const merged = mergeThreadPages([
+      { items: [at(8, '2026-09-05T11:00:00+00:00', { status: 'delivered' })] },
+      { items: [at(8, '2026-09-05T11:00:00+00:00', { status: 'pending' })] },
+    ])
+    expect(merged).toHaveLength(1)
+    expect(merged[0].status).toBe('delivered')
+  })
+
+  it('breaks a shared timestamp by id, as the server does', () => {
+    // Every segment of a multipart SMS carries one SCTS. Without the tie-break
+    // the bubbles reorder between renders.
+    const stamp = '2026-09-05T12:00:00+00:00'
+    const merged = mergeThreadPages([{ items: [at(12, stamp), at(10, stamp), at(11, stamp)] }])
+    expect(merged.map((m) => m.id)).toEqual([10, 11, 12])
+  })
+
+  it('survives a timestamp it cannot parse', () => {
+    // A row written by an older agent, or a clock that produced nonsense: order
+    // by id rather than dropping the message out of the transcript.
+    const merged = mergeThreadPages([{ items: [at(2, 'not a date'), at(1, 'not a date')] }])
+    expect(merged.map((m) => m.id)).toEqual([1, 2])
+  })
+
+  it('has nothing to merge before the first page arrives', () => {
+    expect(mergeThreadPages(undefined)).toEqual([])
+    expect(mergeThreadPages([])).toEqual([])
   })
 })
 
@@ -252,5 +317,46 @@ describe('deliveryStatusLabel', () => {
   it('does not invent a receipt for legacy sent messages', () => {
     expect(deliveryStatusLabel('sent')).toBeNull()
     expect(deliveryStatusLabel('received')).toBeNull()
+  })
+})
+
+/**
+ * Which module a reply goes out through.  Getting this wrong sends from the
+ * wrong SIM — a different number, a different bill, and a reply the recipient
+ * cannot tie to the conversation they started.
+ */
+describe('resolveThreadDevice', () => {
+  const modules = [
+    { id: 1, name: 'modem-1', iccid: '8986000000000000001' },
+    { id: 2, name: 'modem-1', iccid: '8986000000000000002' },
+    { id: 3, name: 'modem-2', iccid: '8986000000000000003' },
+  ]
+
+  it('follows the card, not the module name', () => {
+    const picked = resolveThreadDevice(modules, {
+      device: 'modem-1',
+      sim_iccid: '8986000000000000002',
+    })
+    expect(picked?.id).toBe(2)
+  })
+
+  it('falls back to a module name only when one module answers to it', () => {
+    expect(
+      resolveThreadDevice(modules, { device: 'modem-2', sim_iccid: undefined })?.id,
+    ).toBe(3)
+  })
+
+  it('refuses to guess between two agents that share a module name', () => {
+    // Two hosts can each call their first module modem-1.  Picking the first
+    // match would reply from whichever one the list happened to return first.
+    expect(
+      resolveThreadDevice(modules, { device: 'modem-1', sim_iccid: undefined }),
+    ).toBeUndefined()
+  })
+
+  it('is undefined when nothing matches, so the composer stays disabled', () => {
+    expect(
+      resolveThreadDevice(modules, { device: 'modem-9', sim_iccid: '8986000000000000009' }),
+    ).toBeUndefined()
   })
 })

@@ -5,7 +5,7 @@
  * component, and so these stay directly testable — each one has edge cases
  * that are user-visible if they regress.
  */
-import type { Conversation, Message } from './api'
+import type { Conversation, Message, ThreadScope } from './api'
 
 /**
  * The last 4–8 digit run in the body, if any.  This is the whole point of the
@@ -25,15 +25,45 @@ export function detectOtp(body: string): string | null {
 }
 
 /**
- * Whether a thread has messages older than the ones already fetched.
+ * The scope of one thread, named rather than left as a null.
  *
- * Compares against how many actually came back, not against the requested
- * window: the two differ on the last window, and comparing to the request
- * would leave "加载更早的消息" showing forever at the top of a fully-read
- * conversation.
+ * A card-less thread is `unassigned`; omitting the card would mean *every*
+ * card, which is what used to fold another card's messages from the same number
+ * into a card-less conversation. See `ThreadScope` in `./api`.
  */
-export function hasOlderMessages(total: number, fetched: number): boolean {
-  return total > fetched
+export function threadScope(sim_id: number | null): ThreadScope {
+  return sim_id === null ? 'unassigned' : sim_id
+}
+
+/**
+ * Cursor pages merged into one transcript, oldest first.
+ *
+ * Pages are fetched newest-first — page 0 is the live tail, each further page
+ * continues from the previous one's cursor. Two things make the merge
+ * non-trivial, and both are why this is a function with tests rather than a
+ * `flat()` at the call site:
+ *
+ * - Pages overlap. While the operator reads history the tail keeps growing, so
+ *   a re-read of page 0 covers rows a later page already returned. The first
+ *   copy wins — page 0 is the one being revalidated, so it holds the newest
+ *   delivery status.
+ * - Timestamps tie. Every segment of a multipart SMS carries one SCTS, so the
+ *   id has to break the tie exactly as the server's `ts DESC, id DESC` does,
+ *   or a bubble jumps between renders.
+ */
+export function mergeThreadPages(
+  pages: readonly { items: Message[] }[] | undefined,
+): Message[] {
+  const byId = new Map<number, Message>()
+  for (const page of pages ?? []) {
+    for (const message of page.items) {
+      if (!byId.has(message.id)) byId.set(message.id, message)
+    }
+  }
+  return [...byId.values()].sort((a, b) => {
+    const at = Date.parse(a.ts) - Date.parse(b.ts)
+    return Number.isNaN(at) || at === 0 ? a.id - b.id : at
+  })
 }
 
 /**
@@ -106,4 +136,27 @@ export function resolveThread(
   if (!open) return null
   const fresh = threads?.find((t) => t.peer === open.peer && t.sim_id === open.sim_id)
   return fresh ?? fallback
+}
+
+/**
+ * The module a reply should go out through.
+ *
+ * The card decides it: a thread belongs to an ICCID, and that ICCID sits in
+ * exactly one module.  The module *name* is only a fallback for a thread with
+ * no card recorded, and only when one module answers to it — a name is unique
+ * within an agent, not across the fleet, so with two hosts each owning a
+ * `modem-1` the first match could be the wrong site's card.  Returning nothing
+ * disables the composer, which is the honest outcome: the operator picks the
+ * card explicitly instead of the UI sending from whichever one it found first.
+ */
+export function resolveThreadDevice<T extends { id: number; name: string; iccid?: string }>(
+  devices: readonly T[],
+  thread: Pick<Conversation, 'device' | 'sim_iccid'>,
+): T | undefined {
+  if (thread.sim_iccid) {
+    const byCard = devices.find((device) => device.iccid === thread.sim_iccid)
+    if (byCard) return byCard
+  }
+  const named = devices.filter((device) => device.name === thread.device)
+  return named.length === 1 ? named[0] : undefined
 }

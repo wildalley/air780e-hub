@@ -29,13 +29,13 @@ import IncidentIcon from '@mui/icons-material/ErrorOutlineOutlined'
 import ResolveIcon from '@mui/icons-material/CheckCircleOutlineOutlined'
 import ExpandMoreIcon from '@mui/icons-material/ExpandMore'
 import StorageIcon from '@mui/icons-material/StorageOutlined'
-import useSWR, { mutate as mutateKey } from 'swr'
+import useSWR, { useSWRConfig } from 'swr'
 import { successRate } from '../opsStats'
 import { api, ApiError, type ActivityWindow, type Incident } from '../api'
 import { formatTs } from '../format'
 import { usePager } from '../swr'
 import { useToast } from '../toast'
-import { EmptyRow, Loading, OnlineChip, Pager } from '../components/common'
+import { EmptyRow, OnlineChip, Pager, QueryState, RefreshNotice } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
 import { StatTile } from '../components/StatTile'
 import { LIVE_MS } from '../swr'
@@ -123,8 +123,16 @@ export function OperationsPage() {
   const [tab, setTab] = useState(0)
   const [scope, setScope] = useState<'open' | 'all'>('open')
   const [busyId, setBusyId] = useState<number | null>(null)
+  // From the config, not the module: `mutate` imported from 'swr' addresses the
+  // default cache, and this subtree reads from a per-login one.
+  const { mutate: mutateKey } = useSWRConfig()
 
-  const { data: diagnostics, mutate: mutateDiagnostics } = useSWR(
+  const {
+    data: diagnostics,
+    error: diagnosticsError,
+    isLoading: diagnosticsLoading,
+    mutate: mutateDiagnostics,
+  } = useSWR(
     '/api/operations/diagnostics',
     () => api.operations.diagnostics(),
     { refreshInterval: LIVE_MS },
@@ -134,12 +142,22 @@ export function OperationsPage() {
   const incidentPager = usePager()
   const auditPager = usePager()
 
-  const { data: incidentPage, mutate: mutateIncidents } = useSWR(
+  const {
+    data: incidentPage,
+    error: incidentError,
+    isLoading: incidentLoading,
+    mutate: mutateIncidents,
+  } = useSWR(
     ['/api/operations/incidents', scope, incidentPager.query],
     () => api.operations.incidents(scope, incidentPager.query),
     { refreshInterval: LIVE_MS, keepPreviousData: true },
   )
-  const { data: auditPage } = useSWR(
+  const {
+    data: auditPage,
+    error: auditError,
+    isLoading: auditLoading,
+    mutate: mutateAudit,
+  } = useSWR(
     ['/api/operations/audit', auditPager.query],
     () => api.operations.audit(auditPager.query),
     { refreshInterval: LIVE_MS, keepPreviousData: true },
@@ -158,7 +176,7 @@ export function OperationsPage() {
         // badge clears with the row instead of lingering for up to 15 s.
         mutateKey('/api/operations/incidents/count'),
       ]),
-    [mutateIncidents, mutateDiagnostics],
+    [mutateIncidents, mutateDiagnostics, mutateKey],
   )
 
   const updateIncident = async (id: number, status: Incident['status']) => {
@@ -174,7 +192,16 @@ export function OperationsPage() {
     }
   }
 
-  if (!diagnostics) return <Loading />
+  if (!diagnostics) {
+    return (
+      <QueryState
+        page="运维中心"
+        error={diagnosticsError}
+        onRetry={mutateDiagnostics}
+        busy={diagnosticsLoading}
+      />
+    )
+  }
 
   const diskUsed = diagnostics.storage.disk_total_bytes - diagnostics.storage.disk_free_bytes
   const diskPercent = diagnostics.storage.disk_total_bytes
@@ -199,6 +226,13 @@ export function OperationsPage() {
   return (
     <Stack spacing={3}>
       <PageHeader title="运维中心" subtitle="运行状态、事件与管理审计" />
+
+      <RefreshNotice
+        data={diagnostics}
+        error={diagnosticsError}
+        onRetry={mutateDiagnostics}
+        busy={diagnosticsLoading}
+      />
 
       <Box
         sx={{
@@ -501,6 +535,15 @@ export function OperationsPage() {
                   <ToggleButton value="all">全部</ToggleButton>
                 </ToggleButtonGroup>
               </Box>
+              {/* "当前没有事件" is the good news on this page; it must not be
+                  what a failed read looks like. */}
+              <RefreshNotice
+                data={incidentPage}
+                error={incidentError}
+                loading={incidentLoading}
+                onRetry={mutateIncidents}
+                sx={{ mx: 2, mt: 2 }}
+              />
               <TableContainer>
                 <Table size="small" sx={{ minWidth: 860 }}>
                   <TableHead>
@@ -580,7 +623,15 @@ export function OperationsPage() {
               </TableContainer>
             </>
           ) : (
-            <TableContainer>
+            <>
+              <RefreshNotice
+                data={auditPage}
+                error={auditError}
+                loading={auditLoading}
+                onRetry={mutateAudit}
+                sx={{ mx: 2, mt: 2 }}
+              />
+              <TableContainer>
               <Table size="small" sx={{ minWidth: 780 }}>
                 <TableHead>
                   <TableRow>
@@ -613,6 +664,7 @@ export function OperationsPage() {
               </Table>
               <Pager total={auditPage?.total ?? 0} pager={auditPager} />
             </TableContainer>
+            </>
           )}
         </CardContent>
       </Card>

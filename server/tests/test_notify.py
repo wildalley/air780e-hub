@@ -24,10 +24,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from hub_server.config import Settings
-from hub_server.db import Database
+from hub_server.db import Database, _shift, utcnow
+from hub_server.gateway import AgentConnection, Gateway
 from hub_server.main import create_app
 from hub_server.notify import (
+    CLAIM_BATCH,
     DEFAULT_TEMPLATE,
+    LEASE_SECONDS,
+    POLL_SECONDS,
     Notifier,
     Payload,
     _feishu_card,
@@ -1177,3 +1181,459 @@ def test_a_malformed_ring_duration_does_not_wedge_ingest(admin):
     install(admin, Recorder())
     send_call(admin, ring_seconds="not-a-number")
     assert admin.get("/api/calls").json()["items"][0]["ring_seconds"] == 0.0
+
+
+# --------------------------------------------------------------------------
+# the durable queue (B05)
+# --------------------------------------------------------------------------
+#
+# Before this, a push existed only as an in-memory task: a restart between the
+# COMMIT that stored an SMS and the moment the provider answered lost the
+# notification for good, and a replay could not repair it because a duplicate
+# event skips the post-commit hooks entirely.  The intent is now written inside
+# the ingest transaction, so what these tests are really about is the four
+# windows a process can die in, and what the queue owes afterwards.
+
+
+SMS_FRAME = {
+    "type": "sms_in", "seq": 1, "device": "a", "iccid": ICCID,
+    "peer": "10086", "body": "验证码 123456",
+    "ts": "2026-08-02T18:00:00+08:00", "segments": 1,
+}
+
+
+def queued(db) -> list[dict]:
+    return db.query("SELECT * FROM notify_deliveries ORDER BY id")
+
+
+def enqueue(db, *, ref_id, kind="message", frame=None, event_key=None) -> int | None:
+    """What the gateway writes inside the ingest transaction."""
+    return db.enqueue_notification(
+        kind, ref_id=ref_id, frame=frame or {}, event_key=event_key
+    )
+
+
+def seconds_out(moment: str) -> float:
+    """How far into the future a stored timestamp points."""
+    from datetime import UTC, datetime
+
+    return (
+        datetime.fromisoformat(moment) - datetime.now(UTC)
+    ).total_seconds()
+
+
+async def test_a_committed_intent_is_delivered_by_the_next_process(db, settings):
+    """The process that received the SMS never sent the push; its replacement does.
+
+    This is the whole reason the intent is written in the ingest transaction:
+    nothing in memory survived, and the queue alone is enough to finish the job.
+    """
+    add_rule(db, channel_id=add_channel(db))
+    enqueue(db, ref_id=add_message(db), event_key="home-arch|s1|7")
+
+    recorder = Recorder()
+    notifier = make_notifier(db, settings, recorder)  # the process that replaces it
+    assert await notifier.pump() == 1
+
+    assert len(recorder.requests) == 1
+    assert [row["status"] for row in queued(db)] == ["ok"]
+    assert [row["status"] for row in notify_logs(db)] == ["ok"]
+
+
+async def test_the_transaction_owes_the_push_even_if_the_hook_dies(db, settings):
+    """Post-COMMIT, pre-ACK: an in-memory callback is no longer what sends.
+
+    The hook here fails the way a process going down does.  The event is stored
+    and acked — the agent will not replay it — and the push still goes out,
+    which is exactly what the old in-memory dispatch could not promise.
+    """
+    add_rule(db, channel_id=add_channel(db))
+    db.upsert_agent("home-arch", "0.1.0", 1, connected=True)
+    gateway = Gateway(db, settings)
+    connection = AgentConnection(
+        agent_id="home-arch", websocket=_Socket(), generation=1
+    )
+
+    async def die(ref_id, frame, *, event_key=None) -> None:
+        raise RuntimeError("the process is going down")
+
+    gateway.on_message = die
+    await gateway._ingest(connection, SMS_FRAME)
+    assert connection.websocket.frames == [{"type": "ack", "seq": 1}]
+
+    recorder = Recorder()
+    await make_notifier(db, settings, recorder).drain()
+    assert len(recorder.requests) == 1
+    assert "验证码 123456" in recorder.bodies[0]["text"]
+
+
+class _Socket:
+    """Enough of a websocket to collect the gateway's acks."""
+
+    def __init__(self) -> None:
+        self.frames: list[dict] = []
+
+    async def send_text(self, raw: str) -> None:
+        self.frames.append(json.loads(raw))
+
+
+async def test_a_replayed_event_is_not_pushed_twice(db, settings):
+    """A lost ack makes the agent resend; the event key keeps the push single."""
+    add_rule(db, channel_id=add_channel(db))
+    message_id = add_message(db)
+
+    recorder = Recorder()
+    notifier = make_notifier(db, settings, recorder)
+    await notifier.on_message(message_id, {}, event_key="home-arch|s1|7")
+    await notifier.on_message(message_id, {}, event_key="home-arch|s1|7")
+    await notifier.drain()
+
+    assert len(db.query("SELECT id FROM notify_outbox")) == 1
+    assert len(recorder.requests) == 1
+
+
+async def test_a_worker_that_died_holding_a_lease_frees_the_row_itself(db, settings):
+    """The lease is a deadline, not a state, so recovery needs no cleanup pass."""
+    add_rule(db, channel_id=add_channel(db))
+    enqueue(db, ref_id=add_message(db))
+    make_notifier(db, settings, Recorder())._expand_intents()
+
+    mine = db.claim_deliveries(owner="dead:1", lease_seconds=LEASE_SECONDS, limit=10)
+    assert len(mine) == 1
+    # Nobody else may send a push that is on the wire right now.
+    assert db.claim_deliveries(owner="live:2", lease_seconds=LEASE_SECONDS, limit=10) == []
+
+    later = _shift(utcnow(), LEASE_SECONDS + 1)
+    again = db.claim_deliveries(
+        owner="live:2", lease_seconds=LEASE_SECONDS, limit=10, now=later
+    )
+    assert [row["id"] for row in again] == [mine[0]["id"]]
+
+
+async def test_a_send_that_never_recorded_its_outcome_is_tried_again(db, settings):
+    """The last crash window: the provider took it, the row never learned.
+
+    At-least-once is the deliberate choice — a duplicate push is the price of
+    never losing one, and marking a row sent *before* the send loses them
+    instead.  What matters is that the row comes back rather than sitting in
+    limbo, and that the second attempt settles it.
+    """
+    add_rule(db, channel_id=add_channel(db))
+    enqueue(db, ref_id=add_message(db))
+    recorder = Recorder()
+    notifier = make_notifier(db, settings, recorder)
+    notifier._expand_intents()
+
+    original = db.settle_delivery
+    crashes = []
+
+    def crash_once(*args, **kwargs):
+        if not crashes:
+            crashes.append(args)
+            raise RuntimeError("process died before the outcome was written")
+        return original(*args, **kwargs)
+
+    db.settle_delivery = crash_once  # type: ignore[method-assign]
+    try:
+        assert await notifier.pump() == 1
+        assert len(recorder.requests) == 1
+        assert queued(db)[0]["status"] == "pending", "the row still owes a push"
+    finally:
+        db.settle_delivery = original  # type: ignore[method-assign]
+
+    later = _shift(utcnow(), LEASE_SECONDS + 1)
+    for row in db.claim_deliveries(
+        owner=notifier._owner, lease_seconds=LEASE_SECONDS, limit=5, now=later
+    ):
+        await notifier._attempt_claimed(row)
+
+    assert len(recorder.requests) == 2, "the same push goes out twice, not zero times"
+    assert queued(db)[0]["status"] == "ok"
+
+
+async def test_a_named_retry_window_is_obeyed(db, settings):
+    """429 with Retry-After: coming back sooner earns the same refusal."""
+    add_rule(db, channel_id=add_channel(db))
+    enqueue(db, ref_id=add_message(db))
+    recorder = Recorder(httpx.Response(429, headers={"Retry-After": "30"}, text="slow"))
+    notifier = make_notifier(db, settings, recorder)
+
+    assert await notifier.pump() == 1
+    row = queued(db)[0]
+    assert (row["status"], row["error_code"]) == ("pending", "http_429")
+    assert seconds_out(row["next_attempt_at"]) >= 30
+    assert notify_logs(db) == [], "a scheduled retry is not an outcome yet"
+    assert await notifier.pump() == 0, "and nothing touches it until the window opens"
+
+
+async def test_background_worker_waits_for_retry_and_keeps_delivering(db, settings, monkeypatch):
+    add_rule(db, channel_id=add_channel(db))
+    enqueue(db, ref_id=add_message(db))
+    recorder = Recorder(httpx.Response(503, text="try later"))
+    notifier = make_notifier(db, settings, recorder)
+    monkeypatch.setattr(notifier, "_retry_delay", lambda *_args: 60.0)
+    waiting = asyncio.Event()
+    delivered = asyncio.Event()
+    idle_seconds = notifier._idle_seconds
+    attempt = notifier._attempt_claimed
+    delays = []
+
+    def observe_wait():
+        delay = idle_seconds()
+        delays.append(delay)
+        waiting.set()
+        return delay
+
+    async def observe_attempt(row):
+        await attempt(row)
+        if queued(db)[0]["status"] == "ok":
+            delivered.set()
+
+    monkeypatch.setattr(notifier, "_idle_seconds", observe_wait)
+    monkeypatch.setattr(notifier, "_attempt_claimed", observe_attempt)
+    notifier.start()
+    try:
+        async with asyncio.timeout(3):
+            await waiting.wait()
+            assert len(recorder.requests) == 1
+            assert queued(db)[0]["status"] == "pending"
+            assert delays == [POLL_SECONDS]
+            # Move the retry into the past instead of sleeping for its backoff.
+            db.execute(
+                "UPDATE notify_deliveries SET next_attempt_at = ?", (_shift(utcnow(), -1),)
+            )
+            notifier.kick()
+            await delivered.wait()
+        assert len(recorder.requests) == 2
+        assert queued(db)[0]["attempts"] == 2
+        assert not notifier._worker.done()
+    finally:
+        await notifier.aclose()
+
+
+async def test_worker_waits_for_a_claimed_delivery_lease_instead_of_spinning(db, settings):
+    add_rule(db, channel_id=add_channel(db))
+    enqueue(db, ref_id=add_message(db))
+    notifier = make_notifier(db, settings, Recorder())
+    notifier._expand_intents()
+    claimed = db.claim_deliveries(owner="previous-process", lease_seconds=60, limit=1)
+    assert len(claimed) == 1
+    try:
+        assert db.next_delivery_due_at() == queued(db)[0]["lease_until"]
+        assert notifier._idle_seconds() == POLL_SECONDS
+        assert await notifier.pump() == 0
+        db.execute(
+            "UPDATE notify_deliveries SET lease_until = ?", (_shift(utcnow(), -1),)
+        )
+        assert notifier._idle_seconds() == 0
+        assert await notifier.pump() == 1
+        assert db.next_delivery_due_at() is None
+        assert notifier._idle_seconds() == POLL_SECONDS
+    finally:
+        await notifier.aclose()
+
+
+async def test_a_misconfigured_channel_gives_up_without_calling_out(db, settings):
+    """A missing url will not fix itself; retrying only delays the report."""
+    channel = add_channel(db, type="post", config={})
+    add_rule(db, channel_id=channel)
+    enqueue(db, ref_id=add_message(db))
+    recorder = Recorder()
+    notifier = make_notifier(db, settings, recorder)
+
+    await notifier.drain()
+    assert recorder.requests == [], "there was nothing to send it to"
+    row = queued(db)[0]
+    assert (row["status"], row["error_code"], row["attempts"]) == (
+        "failed", "channel_config", 1,
+    )
+    assert [entry["status"] for entry in notify_logs(db)] == ["failed"]
+
+
+async def test_a_server_error_retries_to_the_budget_then_reports_once(db, settings):
+    """Transient means try again; the log still gets one row, with the history."""
+    add_rule(db, channel_id=add_channel(db))
+    enqueue(db, ref_id=add_message(db))
+    recorder = Recorder(*[httpx.Response(503, text="down") for _ in range(4)])
+    notifier = make_notifier(db, settings, recorder, retries=2)
+
+    await notifier.drain()
+    assert len(recorder.requests) == 3, "retries + 1 attempts, one per pass"
+    row = queued(db)[0]
+    assert (row["status"], row["error_code"], row["attempts"]) == (
+        "failed", "http_503", 3,
+    )
+    entries = notify_logs(db)
+    assert [entry["status"] for entry in entries] == ["failed"]
+    assert entries[0]["attempts"] == 3, "cumulative, not the last attempt alone"
+
+
+async def test_a_delivery_past_its_deadline_stops_retrying(db, settings):
+    """Hours after the SMS arrived the code in it is stale; retrying is noise."""
+    add_rule(db, channel_id=add_channel(db))
+    enqueue(db, ref_id=add_message(db))
+    notifier = make_notifier(db, settings, Recorder(httpx.Response(503, text="down")))
+    notifier._expand_intents()
+    db.execute(
+        "UPDATE notify_deliveries SET expires_at = ?", (_shift(utcnow(), -60),)
+    )
+
+    await notifier.pump()
+    row = queued(db)[0]
+    assert (row["status"], row["error_code"]) == ("expired", "expired")
+    assert [entry["status"] for entry in notify_logs(db)] == ["failed"]
+
+
+def test_a_verification_code_is_worth_more_retries_than_a_missed_call(db, settings):
+    """Per-kind deadlines: an SMS code stays useful far longer than a ring."""
+    add_rule(db, channel_id=add_channel(db))
+    enqueue(db, ref_id=add_message(db), event_key="k|1")
+    enqueue(
+        db, kind="call", ref_id=None, event_key="k|2",
+        frame={"direction": "in", "peer": "13800138000"},
+    )
+    make_notifier(db, settings, Recorder())._expand_intents()
+
+    message_row, call_row = queued(db)
+    assert message_row["expires_at"] > call_row["expires_at"]
+    assert seconds_out(message_row["expires_at"]) > 3600
+
+
+async def test_a_channel_turned_off_after_queueing_is_not_a_delivery_failure(
+    db, settings
+):
+    """Nothing was attempted, so nothing belongs in the log or in an incident."""
+    channel = add_channel(db)
+    add_rule(db, channel_id=channel)
+    enqueue(db, ref_id=add_message(db))
+    recorder = Recorder()
+    notifier = make_notifier(db, settings, recorder)
+    notifier._expand_intents()
+    db.execute("UPDATE channels SET enabled = 0 WHERE id = ?", (channel,))
+
+    await notifier.pump()
+    assert recorder.requests == []
+    row = queued(db)[0]
+    assert (row["status"], row["error_code"], row["attempts"]) == (
+        "failed", "channel_disabled", 0,
+    )
+    assert notify_logs(db) == []
+
+
+async def test_a_message_deleted_before_its_push_does_not_wedge_the_queue(db, settings):
+    """Retention can outrun the queue; that is not an error to retry forever."""
+    channel = add_channel(db)
+    add_rule(db, channel_id=channel)
+    message_id = add_message(db)
+    enqueue(db, ref_id=message_id)
+    recorder = Recorder()
+    notifier = make_notifier(db, settings, recorder)
+    notifier._expand_intents()
+    db.execute("DELETE FROM messages WHERE id = ?", (message_id,))
+
+    await notifier.pump()
+    assert recorder.requests == []
+    assert queued(db)[0]["error_code"] == "source_gone"
+
+
+async def test_the_queue_claims_a_bounded_batch_instead_of_dropping(db, settings):
+    """Backpressure replaces "queue full, drop it": the work waits in the table."""
+    for index in range(CLAIM_BATCH + 5):
+        add_rule(db, channel_id=add_channel(db, name=f"渠道{index}"))
+    enqueue(db, ref_id=add_message(db))
+    recorder = Recorder()
+    notifier = make_notifier(db, settings, recorder)
+
+    assert await notifier.pump() == CLAIM_BATCH, "one pass takes a bounded batch"
+    assert await notifier.pump() == 5, "the rest waited rather than being discarded"
+    assert len(recorder.requests) == CLAIM_BATCH + 5
+    assert {row["status"] for row in queued(db)} == {"ok"}
+
+
+async def test_an_operator_retry_puts_a_given_up_push_back(db, settings):
+    """The button an operator reaches for after fixing the channel."""
+    add_rule(db, channel_id=add_channel(db))
+    enqueue(db, ref_id=add_message(db))
+    notifier = make_notifier(
+        db, settings, Recorder(httpx.Response(500, text="down")), retries=0
+    )
+    await notifier.drain()
+    row = queued(db)[0]
+    assert row["status"] == "failed"
+
+    assert db.retry_delivery(row["id"]) is True
+    assert db.retry_delivery(row["id"]) is False, "queued now, not given up"
+    await notifier.drain()
+
+    settled = queued(db)[0]
+    assert settled["status"] == "ok"
+    assert settled["attempts"] == 2, "the count is history, not a fresh budget"
+
+
+def test_the_queue_page_shows_what_is_stuck_and_why(admin):
+    """An operator needs to see the pushes that did *not* happen."""
+    install(admin, Recorder(*[httpx.Response(500, text="down") for _ in range(6)]))
+    channel = _bark_channel(admin)
+    admin.post("/api/rules", json={"channel_id": channel["id"]})
+
+    with admin.websocket_connect(
+        "/ws", headers={"Authorization": "Bearer test-token"}
+    ) as ws:
+        _greet(ws)
+        ws.send_json(SMS_FRAME)
+        assert ws.receive_json() == {"type": "ack", "seq": 1}
+
+    assert _wait_for(lambda: admin.get("/api/notify-queue").json()["stuck"])
+    body = admin.get("/api/notify-queue").json()
+    assert body["backlog"]["failed"] == 1
+    assert body["backlog"]["failures_by_reason"] == {"http_500": 1}
+    stuck = body["stuck"][0]
+    assert (stuck["channel_name"], stuck["kind"]) == ("Bark", "message")
+    assert stuck["error_code"] == "http_500"
+    assert "验证码" not in json.dumps(body, ensure_ascii=False), (
+        "the queue view is an audit surface; SMS bodies stay out of it"
+    )
+
+
+def test_retrying_from_the_queue_page_is_audited(admin):
+    """Re-sending someone's SMS to a third party is a decision worth recording."""
+    recorder = Recorder(httpx.Response(500, text="down"))
+    # Leave the first failure for the operator instead of recovering automatically.
+    install(admin, recorder).retries = 0
+    channel = _bark_channel(admin)
+    admin.post("/api/rules", json={"channel_id": channel["id"]})
+
+    with admin.websocket_connect(
+        "/ws", headers={"Authorization": "Bearer test-token"}
+    ) as ws:
+        _greet(ws)
+        ws.send_json(SMS_FRAME)
+        ws.receive_json()
+
+    assert _wait_for(lambda: admin.get("/api/notify-queue").json()["stuck"])
+    delivery_id = admin.get("/api/notify-queue").json()["stuck"][0]["id"]
+
+    assert admin.post(f"/api/notify-queue/{delivery_id}/retry").status_code == 200
+    assert _wait_for(
+        lambda: admin.get("/api/notify-queue").json()["backlog"]["ok"] == 1
+    )
+    assert len(recorder.requests) == 2
+
+    actions = [row["action"] for row in admin.get("/api/operations/audit").json()["items"]]
+    assert "retry notification" in actions
+
+
+def test_retrying_something_that_is_not_stuck_is_404(admin):
+    assert admin.post("/api/notify-queue/999/retry").status_code == 404
+
+
+def test_the_queue_surface_rejects_anonymous(client_without_setup):
+    client = client_without_setup
+    assert client.get("/api/notify-queue").status_code == 401
+    assert client.post("/api/notify-queue/1/retry").status_code == 401
+
+
+def test_diagnostics_reports_the_queue_a_restart_would_inherit(admin):
+    runtime = admin.get("/api/operations/diagnostics").json()["runtime"]
+    assert runtime["notify_queue"]["pending"] == 0
+    assert runtime["notify_queue"]["unexpanded_intents"] == 0

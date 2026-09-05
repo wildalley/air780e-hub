@@ -18,7 +18,7 @@ import useSWR from 'swr'
 import { api } from '../api'
 import { formatTs } from '../format'
 import { usePager } from '../swr'
-import { Loading, Pager } from '../components/common'
+import { Pager, QueryState, RefreshNotice } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
 import { STATUS } from '../tokens'
 
@@ -49,27 +49,52 @@ export function LogsPage() {
   // Two keys, not one composite fetch: the visible tab is the one that has to
   // be current, and a failure in either list leaves the other still rendering.
   // The paging params are in the key, so a page already visited is cached.
-  const { data: agentPage } = useSWR(
+  const {
+    data: agentPage,
+    error: agentError,
+    isLoading: agentLoading,
+    mutate: reloadAgent,
+  } = useSWR(
     ['/api/logs', agentPager.query],
     () => api.logs(agentPager.query),
     { refreshInterval: REFRESH_MS, keepPreviousData: true },
   )
-  const { data: notifyPage } = useSWR(
+  const {
+    data: notifyPage,
+    error: notifyError,
+    isLoading: notifyLoading,
+    mutate: reloadNotify,
+  } = useSWR(
     ['/api/notify-logs', notifyPager.query],
     () => api.notifyLogs(notifyPager.query),
     { refreshInterval: REFRESH_MS, keepPreviousData: true },
   )
-  const { data: callPage } = useSWR(
+  const {
+    data: callPage,
+    error: callError,
+    isLoading: callLoading,
+    mutate: reloadCalls,
+  } = useSWR(
     ['/api/calls', callPager.query],
     () => api.calls.list({ limit: callPager.limit, offset: callPager.offset }),
     { refreshInterval: REFRESH_MS, keepPreviousData: true },
   )
 
-  if (!agentPage) return <Loading />
+  if (!agentPage) {
+    return <QueryState page="日志" error={agentError} onRetry={reloadAgent} busy={agentLoading} />
+  }
 
   const agentLogs = agentPage.items
   const notifyLogs = notifyPage?.items ?? []
   const calls = callPage?.items ?? []
+
+  // One row per tab, so the staleness notice always describes the list that is
+  // actually on screen instead of the first one.
+  const reads = [
+    { data: agentPage, error: agentError, loading: agentLoading, onRetry: reloadAgent },
+    { data: notifyPage, error: notifyError, loading: notifyLoading, onRetry: reloadNotify },
+    { data: callPage, error: callError, loading: callLoading, onRetry: reloadCalls },
+  ]
 
   return (
     <Stack spacing={3}>
@@ -84,6 +109,7 @@ export function LogsPage() {
           <Tab label={`通话记录 (${callPage?.total ?? 0})`} />
         </Tabs>
         <CardContent sx={{ p: 0, '&:last-child': { pb: 0 } }}>
+          <RefreshNotice {...reads[tab]} sx={{ mx: 2, mt: 2 }} />
           {tab === 0 ? (
             agentLogs.length === 0 ? (
               <Typography

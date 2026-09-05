@@ -47,7 +47,7 @@ import {
 } from '../api'
 import { formatTs, relativeTs } from '../format'
 import { useToast } from '../toast'
-import { Loading, OnlineChip } from '../components/common'
+import { OnlineChip, QueryState, RefreshNotice } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
 import { StorageMeter } from '../components/StorageMeter'
 import { SignalChart, type SignalSeries } from '../components/SignalChart'
@@ -68,22 +68,34 @@ function deviceLabel(device: Device): string {
 
 export function DevicesPage() {
   const toast = useToast()
-  const [busy, setBusy] = useState<string | null>(null)
+  // Keyed by module row id: two agents may each have a module named the
+  // same thing, and a name-keyed flag showed both as busy.
+  const [busy, setBusy] = useState<number | null>(null)
   const [selected, setSelected] = useState<Device | null>(null)
   const [historyHours, setHistoryHours] = useState(24)
   const [showOffline, setShowOffline] = useState(false)
 
-  const { data: devices, mutate: load } = useSWR('/api/devices', () => api.devices.list())
-  const { data: history = {} } = useSWR(
+  const {
+    data: devices,
+    error: devicesError,
+    isLoading: devicesLoading,
+    mutate: load,
+  } = useSWR('/api/devices', () => api.devices.list())
+  const {
+    data: history,
+    error: historyError,
+    isLoading: historyLoading,
+    mutate: reloadHistory,
+  } = useSWR(
     ['/api/devices/history', historyHours],
     () => api.devices.histories(historyHours),
     { refreshInterval: LIVE_MS, keepPreviousData: true },
   )
 
   const refresh = async (device: Device) => {
-    setBusy(device.name)
+    setBusy(device.id)
     try {
-      await api.devices.refresh(device.name)
+      await api.devices.refresh(device.id)
       await load()
       toast.show('已刷新', 'success')
     } catch (err) {
@@ -100,9 +112,9 @@ export function DevicesPage() {
     ) {
       return
     }
-    setBusy(device.name)
+    setBusy(device.id)
     try {
-      await api.devices.setRadio(device.name, enabled)
+      await api.devices.setRadio(device.id, enabled)
       await load()
       toast.show(enabled ? '射频已开启' : '已进入飞行模式', 'success')
     } catch (err) {
@@ -129,9 +141,9 @@ export function DevicesPage() {
     ) {
       return
     }
-    setBusy(device.name)
+    setBusy(device.id)
     try {
-      const result = await api.devices.setData(device.name, enabled)
+      const result = await api.devices.setData(device.id, enabled)
       await load()
       toast.show(
         enabled
@@ -155,9 +167,9 @@ export function DevicesPage() {
     ) {
       return
     }
-    setBusy(device.name)
+    setBusy(device.id)
     try {
-      await api.devices.setRoamingData(device.name, allowed)
+      await api.devices.setRoamingData(device.id, allowed)
       await load()
       toast.show(allowed ? '已允许漫游数据' : '已禁止漫游数据', 'success')
     } catch (err) {
@@ -171,20 +183,22 @@ export function DevicesPage() {
     const updated = await load()
     setSelected((current) => {
       if (!current || !updated) return current
-      return updated.find((device) => device.name === current.name) ?? current
+      return updated.find((device) => device.id === current.id) ?? current
     })
   }
 
-  if (!devices) return <Loading />
+  if (!devices) {
+    return <QueryState page="设备" error={devicesError} onRetry={load} busy={devicesLoading} />
+  }
 
   const visibleDevices = showOffline ? devices : devices.filter((device) => Boolean(device.online))
   const onlineCount = devices.filter((device) => Boolean(device.online)).length
 
   const signalSeries: SignalSeries[] = visibleDevices.map((device, index) => ({
-    name: device.name,
+    id: String(device.id),
     label: deviceLabel(device),
     index,
-    points: history[device.name] ?? [],
+    points: history?.[String(device.id)] ?? [],
     current: device.last_seen_at
       ? {
           ts: device.last_seen_at,
@@ -220,6 +234,8 @@ export function DevicesPage() {
           </Stack>
         }
       />
+
+      <RefreshNotice data={devices} error={devicesError} onRetry={load} busy={devicesLoading} />
 
       {devices.length === 0 && (
         <Alert severity="info">
@@ -290,7 +306,7 @@ export function DevicesPage() {
                       <TableCell>
                         <RadioControl
                           device={device}
-                          busy={busy === device.name}
+                          busy={busy === device.id}
                           onChange={(enabled) => void setRadio(device, enabled)}
                           compact
                         />
@@ -298,7 +314,7 @@ export function DevicesPage() {
                       <TableCell>
                         <DataControls
                           device={device}
-                          busy={busy === device.name}
+                          busy={busy === device.id}
                           onDataChange={(enabled) => void setData(device, enabled)}
                           onRoamingChange={(allowed) => void setRoamingData(device, allowed)}
                           compact
@@ -316,7 +332,7 @@ export function DevicesPage() {
                             <IconButton
                               size="small"
                               onClick={() => void refresh(device)}
-                              disabled={!device.online || busy === device.name}
+                              disabled={!device.online || busy === device.id}
                               aria-label={`刷新 ${deviceLabel(device)}`}
                             >
                               <RefreshIcon fontSize="small" />
@@ -375,12 +391,12 @@ export function DevicesPage() {
                     <StorageMeter used={device.storage_used} capacity={device.storage_cap} />
                     <RadioControl
                       device={device}
-                      busy={busy === device.name}
+                      busy={busy === device.id}
                       onChange={(enabled) => void setRadio(device, enabled)}
                     />
                     <DataControls
                       device={device}
-                      busy={busy === device.name}
+                      busy={busy === device.id}
                       onDataChange={(enabled) => void setData(device, enabled)}
                       onRoamingChange={(allowed) => void setRoamingData(device, allowed)}
                     />
@@ -389,7 +405,7 @@ export function DevicesPage() {
                         size="small"
                         startIcon={<RefreshIcon />}
                         onClick={() => void refresh(device)}
-                        disabled={!device.online || busy === device.name}
+                        disabled={!device.online || busy === device.id}
                       >
                         刷新
                       </Button>
@@ -403,6 +419,12 @@ export function DevicesPage() {
             ))}
           </Stack>
 
+          <RefreshNotice
+            data={history}
+            error={historyError}
+            loading={historyLoading}
+            onRetry={reloadHistory}
+          />
           <SignalChart
             series={signalSeries}
             hours={historyHours}
@@ -412,7 +434,7 @@ export function DevicesPage() {
       )}
 
       <DeviceDrawer
-        key={selected?.name ?? 'closed'}
+        key={selected?.id ?? 'closed'}
         device={selected}
         onClose={() => setSelected(null)}
         onUpdated={reloadSelected}
@@ -628,13 +650,13 @@ function DeviceDrawer({
   const [ussdBusy, setUssdBusy] = useState(false)
   const [ussdResponse, setUssdResponse] = useState('')
 
-  const deviceName = device?.name
+  const deviceId = device?.id
 
   const scan = async () => {
-    if (!deviceName) return
+    if (!deviceId) return
     setScanBusy(true)
     try {
-      const result = await api.devices.scanOperators(deviceName)
+      const result = await api.devices.scanOperators(deviceId)
       setOperators(result.operators)
       setOperator(
         (current) =>
@@ -652,13 +674,13 @@ function DeviceDrawer({
   }
 
   const select = async (numeric: string | null) => {
-    if (!deviceName) return
+    if (!deviceId) return
     if (!window.confirm(numeric ? '切换运营商会暂时断开网络，继续？' : '恢复自动选网会重新注册网络，继续？')) {
       return
     }
     setSelectBusy(true)
     try {
-      await api.devices.selectOperator(deviceName, numeric)
+      await api.devices.selectOperator(deviceId, numeric)
       await onUpdated()
       onSuccess(numeric ? '运营商选择命令已完成' : '已恢复自动选网')
     } catch (err) {
@@ -669,10 +691,10 @@ function DeviceDrawer({
   }
 
   const readDiagnostics = async () => {
-    if (!deviceName) return
+    if (!deviceId) return
     setDiagnosticBusy(true)
     try {
-      const result = await api.devices.networkDiagnostics(deviceName)
+      const result = await api.devices.networkDiagnostics(deviceId)
       setDiagnostics(result.diagnostics)
     } catch (err) {
       onError(err instanceof ApiError ? err.message : '网络诊断失败')
@@ -682,11 +704,11 @@ function DeviceDrawer({
   }
 
   const sendUssd = async () => {
-    if (!deviceName || !ussdCode.trim()) return
+    if (!deviceId || !ussdCode.trim()) return
     setUssdBusy(true)
     setUssdResponse('')
     try {
-      const result = await api.devices.ussd(deviceName, ussdCode.trim())
+      const result = await api.devices.ussd(deviceId, ussdCode.trim())
       setUssdResponse(result.response || '无响应')
       onSuccess('USSD 查询完成')
     } catch (err) {

@@ -47,7 +47,7 @@ import {
 } from '../api'
 import { formatTs } from '../format'
 import { useToast } from '../toast'
-import { Loading } from '../components/common'
+import { QueryState, RefreshNotice } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
 import { LIVE_MS } from '../swr'
 import { STATUS } from '../tokens'
@@ -147,14 +147,26 @@ export function NotifyPage() {
   const [testing, setTesting] = useState<number | null>(null)
   const [tab, setTab] = useState(0)
 
-  const { data: channels, mutate: mutateChannels } = useSWR('/api/channels', () =>
-    api.channels.list(),
-  )
-  const { data: rules = [], mutate: mutateRules } = useSWR('/api/rules', () => api.rules.list())
+  const {
+    data: channels,
+    error: channelsError,
+    isLoading: channelsLoading,
+    mutate: mutateChannels,
+  } = useSWR('/api/channels', () => api.channels.list())
+  const {
+    data: ruleList,
+    error: rulesError,
+    mutate: mutateRules,
+  } = useSWR('/api/rules', () => api.rules.list())
+  const rules = ruleList ?? []
   const { data: sims = [] } = useSWR('/api/sims', () => api.sims.list())
   // "最近投递" is a summary card, not a log browser — the Logs page carries the
   // full paged view. Ask for exactly the 50 rows it renders.
-  const { data: notifyPage } = useSWR(
+  const {
+    data: notifyPage,
+    error: notifyError,
+    mutate: reloadNotify,
+  } = useSWR(
     '/api/notify-logs?recent',
     () => api.notifyLogs('limit=50&offset=0'),
     { refreshInterval: LIVE_MS },
@@ -197,11 +209,30 @@ export function NotifyPage() {
     await load()
   }
 
-  if (!channels) return <Loading />
+  if (!channels) {
+    return (
+      <QueryState
+        page="通知"
+        error={channelsError}
+        onRetry={mutateChannels}
+        busy={channelsLoading}
+      />
+    )
+  }
 
   return (
     <Stack spacing={3}>
       <PageHeader title="通知" subtitle="把短信路由到 Bark、Telegram、飞书等渠道" />
+
+      <RefreshNotice
+        data={channels}
+        error={channelsError}
+        onRetry={mutateChannels}
+        busy={channelsLoading}
+      />
+      {/* A rule list that failed to load must not read as "没有规则" — that
+          sentence means every incoming message is being dropped on purpose. */}
+      <RefreshNotice data={ruleList} error={rulesError} onRetry={mutateRules} />
 
       <Alert severity="info">
         推送由 <strong>服务器</strong> 发出,走机房网络 —— 不消耗 SIM 卡流量,所以纯保号卡也能用。
@@ -418,6 +449,7 @@ export function NotifyPage() {
 
       {tab === 3 && (
         <Stack spacing={2}>
+          <RefreshNotice data={notifyPage} error={notifyError} onRetry={reloadNotify} sx={{ mb: 0 }} />
           <DeliveryLogCard logs={notifyPage?.items ?? []} />
           <SettingsCard
             onError={(m) => toast.show(m, 'error')}

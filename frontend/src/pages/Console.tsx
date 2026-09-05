@@ -21,7 +21,7 @@ import SendIcon from '@mui/icons-material/SendOutlined'
 import ClearIcon from '@mui/icons-material/DeleteSweepOutlined'
 import useSWR from 'swr'
 import { api, ApiError } from '../api'
-import { Loading } from '../components/common'
+import { QueryState, RefreshNotice } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
 import { STATUS, VIZ } from '../tokens'
 
@@ -72,7 +72,8 @@ const DESTRUCTIVE = /^AT\+(RESET|CPOWD|CFUN=0|CRESET)\b/i
 
 interface Entry {
   id: number
-  device: string
+  /** Module row id — the transcript records which module answered. */
+  device: number
   command: string
   ts: number
   status: 'pending' | 'ok' | 'error'
@@ -94,7 +95,9 @@ export function ConsolePage() {
   const theme = useTheme()
   const viz = VIZ[theme.palette.mode]
 
-  const [device, setDevice] = useState('')
+  // The module row id, not its name: a name is unique within one agent, so
+  // two hosts each with a `modem-1` would share one select value.
+  const [device, setDevice] = useState(0)
   const [entries, setEntries] = useState<Entry[]>([])
   const [draft, setDraft] = useState('')
   const [busy, setBusy] = useState(false)
@@ -108,11 +111,16 @@ export function ConsolePage() {
   const bottom = useRef<HTMLDivElement | null>(null)
   const inputRef = useRef<HTMLInputElement | null>(null)
 
-  const { data: devices } = useSWR('/api/devices', () => api.devices.list(), {
+  const {
+    data: devices,
+    error: devicesError,
+    isLoading: devicesLoading,
+    mutate: reloadDevices,
+  } = useSWR('/api/devices', () => api.devices.list(), {
     // 默认选中第一个在线模块;都不在线就退回列表第一个,让用户至少能看清选了谁.
     // 只在还没选过时落一次 —— 后台重新校验不该把用户选中的模块换掉.
     onSuccess: (rows) => {
-      setDevice((current) => current || (rows.find((d) => d.online) ?? rows[0])?.name || '')
+      setDevice((current) => current || (rows.find((d) => d.online) ?? rows[0])?.id || 0)
     },
   })
 
@@ -208,12 +216,21 @@ export function ConsolePage() {
   }
 
   const selected = useMemo(
-    () => devices?.find((d) => d.name === device),
+    () => devices?.find((d) => d.id === device),
     [devices, device],
   )
   const online = Boolean(selected?.online)
 
-  if (!devices) return <Loading />
+  if (!devices) {
+    return (
+      <QueryState
+        page="AT 调试"
+        error={devicesError}
+        onRetry={reloadDevices}
+        busy={devicesLoading}
+      />
+    )
+  }
 
   const tooShort = draft.trim().length > 0 && draft.trim().length < CMD_MIN
 
@@ -228,13 +245,13 @@ export function ConsolePage() {
               select
               size="small"
               label="模块"
-              value={device}
-              onChange={(e) => setDevice(e.target.value)}
+              value={device ? String(device) : ''}
+              onChange={(e) => setDevice(Number(e.target.value))}
               sx={{ minWidth: 200 }}
               disabled={devices.length === 0}
             >
               {devices.map((d) => (
-                <MenuItem key={d.name} value={d.name}>
+                <MenuItem key={d.id} value={String(d.id)}>
                   {d.sim_label || d.label || d.name}
                   {d.online ? '' : '(离线)'}
                 </MenuItem>
@@ -253,6 +270,13 @@ export function ConsolePage() {
             </Tooltip>
           </>
         }
+      />
+
+      <RefreshNotice
+        data={devices}
+        error={devicesError}
+        onRetry={reloadDevices}
+        busy={devicesLoading}
       />
 
       {devices.length === 0 ? (

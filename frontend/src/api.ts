@@ -16,6 +16,14 @@ export class ApiError extends Error {
   constructor(
     public status: number,
     message: string,
+    /**
+     * How long the server asked us to wait, from its `Retry-After` header.
+     *
+     * Only ever set when the server said so. A 429 from a rate limiter in front
+     * of the hub knows its own window; guessing a backoff instead of reading it
+     * is how a polling page keeps arriving early and stays throttled.
+     */
+    public retryAfterMs?: number,
   ) {
     super(message)
   }
@@ -26,25 +34,102 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+/**
+ * `Retry-After` in milliseconds, or `undefined` if there was nothing usable.
+ *
+ * The header comes in two shapes (RFC 9110): delta-seconds, or an HTTP-date.
+ * A date already in the past means "now", not a negative wait.
+ */
+function retryAfterMs(header: string | null): number | undefined {
+  if (!header) return undefined
+  const seconds = Number(header.trim())
+  if (Number.isFinite(seconds)) return seconds > 0 ? seconds * 1000 : 0
+  const at = Date.parse(header)
+  if (Number.isNaN(at)) return undefined
+  return Math.max(0, at - Date.now())
+}
+
+/**
+ * A short Chinese summary of anything a request can reject with.
+ *
+ * `fetch` rejects with a bare `TypeError` when the network is down, which is a
+ * different thing from a server that answered with an error, and neither is a
+ * wrong password. Telling them apart is the difference between "retry" and
+ * "check your password" for the person reading the message.
+ */
+export function errorText(error: unknown, fallback = '请求失败'): string {
+  if (error instanceof ApiError) return error.message || fallback
+  if (error instanceof DOMException && error.name === 'AbortError') return '请求已取消'
+  // Not a status: the request never reached a server, or was blocked before it
+  // could. Anything else is a genuine exception from our own code.
+  if (error instanceof TypeError) return '无法连接服务器,请检查网络或服务状态'
+  if (error instanceof Error) return error.message || fallback
+  return fallback
+}
+
+/**
+ * The requests that *are* the authentication exchange.
+ *
+ * A 401 from these is an answer, not a lapse. A wrong password belongs in the
+ * login form; announcing a lost session for it would clear the field the
+ * operator is still typing in. Everything else under `/api/auth` — changing the
+ * password, for instance — is a normal guarded call and does report a lapse.
+ */
+const AUTH_PATHS = new Set([
+  '/api/auth/status',
+  '/api/auth/login',
+  '/api/auth/setup',
+  '/api/auth/logout',
+])
+
+type LapseHandler = () => void
+const lapseHandlers = new Set<LapseHandler>()
+
+/**
+ * Be told when the server refuses a request for want of a session.
+ *
+ * The auth container subscribes; the request layer calls this *before* it
+ * throws, so a page that catches its own save failure cannot leave the app
+ * sitting there logged in with a cookie the server has already forgotten. That
+ * silence was the bug: only unhandled rejections used to reach the container,
+ * and every write in the app handles its own errors.
+ */
+export function onSessionLapse(handler: LapseHandler): () => void {
+  lapseHandlers.add(handler)
+  return () => lapseHandlers.delete(handler)
+}
+
+/** Fetch with the session cookie, turning any non-success into an `ApiError`. */
+async function send(path: string, init?: RequestInit): Promise<Response> {
   const response = await fetch(path, {
     credentials: 'same-origin',
     headers: init?.body ? { 'Content-Type': 'application/json' } : undefined,
     ...init,
   })
+  if (response.ok) return response
 
-  if (!response.ok) {
-    let detail = response.statusText
-    try {
-      const body = await response.json()
-      // FastAPI puts the useful text — a +CMS code, "device offline" — here.
-      if (typeof body?.detail === 'string') detail = body.detail
-      else if (Array.isArray(body?.detail)) detail = body.detail[0]?.msg ?? detail
-    } catch {
-      /* not JSON; the status text will have to do */
-    }
-    throw new ApiError(response.status, detail)
+  let detail = response.statusText
+  try {
+    const body = await response.json()
+    // FastAPI puts the useful text — a +CMS code, "device offline" — here.
+    if (typeof body?.detail === 'string') detail = body.detail
+    else if (Array.isArray(body?.detail)) detail = body.detail[0]?.msg ?? detail
+  } catch {
+    /* not JSON; the status text will have to do */
   }
+  const error = new ApiError(
+    response.status,
+    detail,
+    retryAfterMs(response.headers.get('Retry-After')),
+  )
+  if (error.isUnauthenticated && !AUTH_PATHS.has(path.split('?', 1)[0])) {
+    for (const handler of lapseHandlers) handler()
+  }
+  throw error
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await send(path, init)
   if (response.status === 204) return undefined as T
   return response.json() as Promise<T>
 }
@@ -58,19 +143,15 @@ const patch = <T,>(path: string, body: unknown) =>
   request<T>(path, { method: 'PATCH', body: JSON.stringify(body) })
 const del = <T,>(path: string) => request<T>(path, { method: 'DELETE' })
 
-/** Fetch a file with the session cookie and hand it to the browser to save. */
+/**
+ * Fetch a file with the session cookie and hand it to the browser to save.
+ *
+ * Same error path as every JSON call — a download that 401s has to bounce the
+ * app to login exactly like a save does, and it used to parse status codes with
+ * its own private copy of the logic.
+ */
 async function downloadFile(path: string, fallbackName: string): Promise<void> {
-  const response = await fetch(path, { credentials: 'same-origin' })
-  if (!response.ok) {
-    let detail = response.statusText
-    try {
-      const body = await response.json()
-      if (typeof body?.detail === 'string') detail = body.detail
-    } catch {
-      /* not JSON; the status text will have to do */
-    }
-    throw new ApiError(response.status, detail)
-  }
+  const response = await send(path)
   const blob = await response.blob()
   const disposition = response.headers.get('Content-Disposition') ?? ''
   const match = /filename="?([^"]+)"?/.exec(disposition)
@@ -218,6 +299,61 @@ export interface Message {
   recovered_code?: string | null
 }
 
+/**
+ * Which card a thread belongs to.
+ *
+ * A thread is one number reached through one card, or through no card at all —
+ * a module with no SIM records the latter. `null` used to stand for both "no
+ * card" and "every card" depending on which request carried it, which is how
+ * opening a card-less thread listed another card's messages from the same
+ * number while marking only the card-less ones read. Two names, no null.
+ */
+export type ThreadScope = number | 'unassigned'
+
+/** A message query's card scope: one card, no card, or deliberately every card. */
+export type SimScope = ThreadScope | 'all'
+
+/** Everything a message read is filtered by, in the shape the API takes. */
+export interface MessageQuery {
+  scope?: SimScope
+  direction?: 'in' | 'out'
+  peer?: string
+  search?: string
+  content?: 'text' | 'data'
+  limit?: number
+  offset?: number
+  /** Cursor from a previous page; returns messages older than it. */
+  before?: string
+  /** Ask for the filtered total. `false` leaves `total` null. */
+  count?: boolean
+}
+
+/**
+ * One page of messages.
+ *
+ * `total` is null when the caller passed `count: false` — a live transcript
+ * asks "is there more" every few seconds and has no use for a count over the
+ * whole history. `has_more` answers that question without one.
+ */
+export interface MessagePage {
+  items: Message[]
+  total: number | null
+  has_more: boolean
+  next_cursor: string | null
+}
+
+/** Turn a scope and filters into the query string the API expects. */
+function messageQuery({ scope = 'all', count, ...rest }: MessageQuery): string {
+  const query = new URLSearchParams()
+  if (scope === 'unassigned') query.set('sim_scope', 'unassigned')
+  else if (scope !== 'all') query.set('sim_id', String(scope))
+  Object.entries(rest).forEach(([key, value]) => {
+    if (value !== undefined && value !== '') query.set(key, String(value))
+  })
+  if (count === false) query.set('count', 'false')
+  return String(query)
+}
+
 /** One thread: everything exchanged with one number through one card. */
 export interface Conversation {
   sim_id: number | null
@@ -312,6 +448,12 @@ export interface Task {
   id: number
   name: string
   sim_id: number | null
+  /**
+   * The module this task runs on, by row identity.  `device`/`agent_id` remain
+   * for display and for the wire frame; null on a row created before ids, or
+   * one whose module has since been removed.
+   */
+  device_id: number | null
   device: string
   agent_id: string
   enabled: number
@@ -332,6 +474,8 @@ export interface Task {
 
 export interface TaskInput {
   name: string
+  /** Preferred addressing.  A name is only unique within one agent. */
+  device_id?: number | null
   device: string
   sim_id?: number | null
   enabled?: boolean
@@ -535,36 +679,39 @@ export const api = {
   overview: () => get<Overview>('/api/overview'),
   devices: {
     list: () => get<Device[]>('/api/devices'),
+    /**
+     * Every module's series in one request, keyed by `Device.id` as a string.
+     *
+     * Not by name: a name is only unique within one agent, so two hosts each
+     * with a `modem-1` used to share — and overwrite — one entry here.
+     */
     histories: (hours: number) =>
       get<Record<string, StatusPoint[]>>(`/api/devices/history?hours=${hours}`),
-    history: (name: string, hours: number) =>
-      get<StatusPoint[]>(`/api/devices/${encodeURIComponent(name)}/history?hours=${hours}`),
-    refresh: (name: string) =>
-      post<Device>(`/api/devices/${encodeURIComponent(name)}/refresh`),
-    setRadio: (name: string, enabled: boolean) =>
+    history: (id: number, hours: number) =>
+      get<StatusPoint[]>(`/api/devices/by-id/${id}/history?hours=${hours}`),
+    refresh: (id: number) => post<Device>(`/api/devices/by-id/${id}/refresh`),
+    setRadio: (id: number, enabled: boolean) =>
       post<{ radio_enabled: boolean; registered: boolean }>(
-        `/api/devices/${encodeURIComponent(name)}/radio`,
+        `/api/devices/by-id/${id}/radio`,
         { enabled },
       ),
-    setData: (name: string, enabled: boolean) =>
-      post<Device>(`/api/devices/${encodeURIComponent(name)}/data`, { enabled }),
-    setRoamingData: (name: string, allowed: boolean) =>
-      post<Device>(`/api/devices/${encodeURIComponent(name)}/roaming-data`, { allowed }),
-    scanOperators: (name: string) =>
-      post<{ operators: OperatorNetwork[] }>(
-        `/api/devices/${encodeURIComponent(name)}/operators/scan`,
-      ),
-    selectOperator: (name: string, numeric: string | null) =>
+    setData: (id: number, enabled: boolean) =>
+      post<Device>(`/api/devices/by-id/${id}/data`, { enabled }),
+    setRoamingData: (id: number, allowed: boolean) =>
+      post<Device>(`/api/devices/by-id/${id}/roaming-data`, { allowed }),
+    scanOperators: (id: number) =>
+      post<{ operators: OperatorNetwork[] }>(`/api/devices/by-id/${id}/operators/scan`),
+    selectOperator: (id: number, numeric: string | null) =>
       post<{ operator: CurrentOperator; device: Device }>(
-        `/api/devices/${encodeURIComponent(name)}/operator`,
+        `/api/devices/by-id/${id}/operator`,
         { numeric },
       ),
-    networkDiagnostics: (name: string) =>
+    networkDiagnostics: (id: number) =>
       post<{ diagnostics: NetworkDiagnostics }>(
-        `/api/devices/${encodeURIComponent(name)}/network-diagnostics`,
+        `/api/devices/by-id/${id}/network-diagnostics`,
       ),
-    ussd: (name: string, code: string) =>
-      post<{ response: string }>(`/api/devices/${encodeURIComponent(name)}/ussd`, { code }),
+    ussd: (id: number, code: string) =>
+      post<{ response: string }>(`/api/devices/by-id/${id}/ussd`, { code }),
   },
   sims: {
     list: () => get<Sim[]>('/api/sims'),
@@ -589,33 +736,42 @@ export const api = {
       patch<Sim>(`/api/sims/${id}`, body),
   },
   messages: {
-    list: (params: {
-      limit?: number
-      offset?: number
-      sim_id?: number
-      direction?: 'in' | 'out'
-      peer?: string
-      search?: string
-      content?: 'text' | 'data'
-    }) => {
-      const query = new URLSearchParams()
-      Object.entries(params).forEach(([key, value]) => {
-        if (value !== undefined && value !== '') query.set(key, String(value))
-      })
-      return get<{ items: Message[]; total: number }>(`/api/messages?${query}`)
-    },
+    list: (params: MessageQuery) =>
+      get<MessagePage>(`/api/messages?${messageQuery(params)}`),
     conversations: (content?: 'text' | 'data') =>
       get<Conversation[]>(`/api/conversations${content ? `?content=${content}` : ''}`),
-    send: (device: string, number: string, body: string) =>
-      post<{ refs: number[] }>('/api/messages/send', { device, number, body }),
-    /** Mark one conversation's incoming messages as read. */
-    markRead: (sim_id: number | null, peer: string) =>
-      post<{ ok: boolean; marked: number }>('/api/messages/read', { sim_id, peer }),
+    /** Send from one module, addressed by `Device.id`. */
+    send: (deviceId: number, number: string, body: string) =>
+      post<{ refs: number[] }>('/api/messages/send', {
+        device_id: deviceId, number, body,
+      }),
+    /**
+     * Mark one thread's incoming messages read, up to what was on screen.
+     *
+     * No `'all'` scope by design: marking read is a write, and "this number on
+     * every card" would read a number's history across the whole fleet.
+     * `through` is the newest message the operator actually saw — anything that
+     * arrived after it stays unread. `content` keeps a filtered transcript from
+     * reading the category it was hiding.
+     */
+    markRead: (
+      scope: ThreadScope,
+      peer: string,
+      through?: number,
+      content?: 'text' | 'data',
+    ) =>
+      post<{ ok: boolean; marked: number }>('/api/messages/read', {
+        sim_id: scope === 'unassigned' ? null : scope,
+        sim_scope: scope === 'unassigned' ? 'unassigned' : undefined,
+        peer,
+        through_id: through,
+        content,
+      }),
     /** Total unread across all conversations (nav badge). */
     unread: () => get<{ total: number }>('/api/messages/unread'),
-    /** Download stored messages as a streamed CSV. */
-    exportCsv: (content?: 'text' | 'data') =>
-      downloadFile(`/api/messages/export${content ? `?content=${content}` : ''}`, 'messages.csv'),
+    /** Download stored messages as a streamed CSV, under the same scope. */
+    exportCsv: (params: MessageQuery = {}) =>
+      downloadFile(`/api/messages/export?${messageQuery(params)}`, 'messages.csv'),
   },
   calls: {
     list: (params: {
@@ -631,8 +787,8 @@ export const api = {
       return get<{ items: Call[]; total: number }>(`/api/calls?${query}`)
     },
   },
-  at: (device: string, command: string) =>
-    post<{ lines: string[] }>('/api/at', { device, command }),
+  at: (deviceId: number, command: string) =>
+    post<{ lines: string[] }>('/api/at', { device_id: deviceId, command }),
   channels: {
     list: () => get<Channel[]>('/api/channels'),
     create: (body: ChannelInput) => post<Channel>('/api/channels', body),

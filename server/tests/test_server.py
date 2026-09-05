@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from datetime import UTC, datetime, timedelta
@@ -13,7 +14,7 @@ from fastapi.testclient import TestClient
 
 from hub_server.config import Settings
 from hub_server.db import Database
-from hub_server.gateway import Gateway
+from hub_server.gateway import AgentConnection, Gateway
 from hub_server.main import create_app
 
 
@@ -168,6 +169,18 @@ def _greet(ws) -> list[dict]:
     frame = ws.receive_json()
     assert frame["type"] == "sync_tasks", f"expected the task push, got {frame}"
     return frame["tasks"]
+
+
+def _register_devices(client) -> dict[str, dict]:
+    """Let the server meet the modules, then hang up.  Rows by name.
+
+    Commands are addressed by module row: a route looks up the owning agent in
+    ``devices``, so a test that addresses a module has to introduce it first.
+    Hanging up leaves the rows behind, which is all a faked ``call`` needs.
+    """
+    with _connect(client) as ws:
+        _greet(ws)
+    return {row["name"]: row for row in client.get("/api/devices").json()}
 
 
 def _minutes_ago(minutes: int) -> str:
@@ -433,6 +446,9 @@ async def test_failed_event_application_rolls_back_and_is_replayable(tmp_path):
     db.upsert_agent("test-agent", "0.1.0", 1, connected=True)
     gateway = Gateway(db, settings)
     socket = _AckSocket()
+    connection = AgentConnection(
+        agent_id="test-agent", websocket=socket, generation=1
+    )
     event = {
         "type": "sms_in", "seq": 17, "device": "a",
         "iccid": "89860622180012345670", "peer": "10086",
@@ -452,14 +468,14 @@ async def test_failed_event_application_rolls_back_and_is_replayable(tmp_path):
     gateway._apply_sms_in = fail_once  # type: ignore[method-assign]
     try:
         with pytest.raises(RuntimeError, match="injected failure"):
-            await gateway._ingest("test-agent", event, socket)
+            await gateway._ingest(connection, event)
 
         assert socket.frames == [], "a failed sequence must not be acknowledged"
         assert db.query("SELECT id FROM messages") == []
         assert db.query("SELECT seq FROM ingested") == []
 
-        await gateway._ingest("test-agent", event, socket)
-        await gateway._ingest("test-agent", event, socket)
+        await gateway._ingest(connection, event)
+        await gateway._ingest(connection, event)
 
         assert socket.frames == [
             {"type": "ack", "seq": 17},
@@ -861,6 +877,267 @@ def test_the_thread_window_cap_allows_a_long_conversation(admin):
     assert admin.get("/api/messages?limit=2001").status_code == 422
 
 
+def _peer_on_and_off_a_card(client) -> tuple[int, dict[str, int]]:
+    """One number reached twice: once through a card, once with no card at all.
+
+    The card-less message is what a module with no SIM records — the reading
+    path used to fold it in with the card's, because both were spelled with a
+    null ``sim_id``.  Returns the card's row id and the message ids by body.
+    """
+    db = client.app.state.hub.db
+    ids = {
+        "carded": db.insert_message(
+            agent_id="home-arch", device="a", direction="in", peer="10086",
+            body="有卡的短信", ts=_minutes_ago(2), iccid="89860622180012345670",
+        ),
+        "cardless": db.insert_message(
+            agent_id="home-arch", device="b", direction="in", peer="10086",
+            body="无卡的短信", ts=_minutes_ago(1), iccid="",
+        ),
+    }
+    sim_id = db.one(
+        "SELECT id FROM sims WHERE iccid = '89860622180012345670'"
+    )["id"]
+    return int(sim_id), ids
+
+
+def test_a_thread_with_no_card_is_isolated_from_the_same_number_on_a_card(admin):
+    """The isolation reproduction: `?peer=10086` returned `sim_id=[1, null]`.
+
+    Opening the thread of a card-less message showed another card's messages
+    from the same number, because "no card" and "every card" were both an
+    omitted `sim_id`.  The three scopes now have three spellings, and the one
+    the client picks decides the answer.
+    """
+    sim_id, ids = _peer_on_and_off_a_card(admin)
+
+    everything = admin.get("/api/messages?peer=10086").json()
+    assert {m["sim_id"] for m in everything["items"]} == {sim_id, None}, (
+        "omitting the card still means every card — that is the list contract"
+    )
+    assert everything["total"] == 2
+
+    unassigned = admin.get("/api/messages?peer=10086&sim_scope=unassigned").json()
+    assert [m["id"] for m in unassigned["items"]] == [ids["cardless"]]
+    assert unassigned["total"] == 1
+
+    carded = admin.get(f"/api/messages?peer=10086&sim_id={sim_id}").json()
+    assert [m["id"] for m in carded["items"]] == [ids["carded"]]
+    assert carded["total"] == 1
+
+    # Naming both is a contradiction, not a precedence rule to be guessed.
+    both = admin.get(f"/api/messages?peer=10086&sim_id={sim_id}&sim_scope=unassigned")
+    assert both.status_code == 422
+
+
+def test_marking_a_card_less_thread_read_leaves_the_card_alone(admin):
+    """Read and list have to cover the same rows, in both directions.
+
+    Before, the list of a card-less thread included the card's messages while
+    marking it read touched only the card-less ones — so opening the thread
+    showed a message it then reported as still unread.
+    """
+    sim_id, ids = _peer_on_and_off_a_card(admin)
+    assert admin.get("/api/messages/unread").json() == {"total": 2}
+
+    marked = admin.post(
+        "/api/messages/read", json={"sim_scope": "unassigned", "peer": "10086"}
+    )
+    assert marked.json() == {"ok": True, "marked": 1}
+    assert admin.get("/api/messages/unread").json() == {"total": 1}
+
+    unread = {
+        (row["sim_id"], row["peer"]): row["unread_count"]
+        for row in admin.get("/api/conversations").json()
+    }
+    assert unread[(None, "10086")] == 0
+    assert unread[(sim_id, "10086")] == 1, "the card's thread was not opened"
+
+    # The legacy spelling of the same thread — a bare null card — still works,
+    # and naming both spellings at once is refused.
+    assert admin.post(
+        "/api/messages/read", json={"sim_id": None, "peer": "10086"}
+    ).json() == {"ok": True, "marked": 0}
+    assert admin.post(
+        "/api/messages/read",
+        json={"sim_id": sim_id, "sim_scope": "unassigned", "peer": "10086"},
+    ).status_code == 422
+
+
+def test_an_export_covers_the_scope_it_was_started_from(admin):
+    """A download must not quietly widen to cards the screen was filtering out."""
+    _peer_on_and_off_a_card(admin)
+    body = admin.get("/api/messages/export?peer=10086&sim_scope=unassigned").text
+    assert "无卡的短信" in body
+    assert "有卡的短信" not in body
+
+
+def test_marking_read_stops_at_the_watermark_the_operator_saw(admin):
+    """A message that lands after the render must stay unread.
+
+    Otherwise the code that arrives while the thread is open is marked read
+    before anyone has seen it, and nothing in the UI ever flags it again.
+    """
+    db = admin.app.state.hub.db
+    ids = [
+        db.insert_message(
+            agent_id="home-arch", device="a", direction="in", peer="10086",
+            body=f"第 {index} 条", ts=_minutes_ago(3 - index),
+            iccid="89860622180012345670",
+        )
+        for index in range(3)
+    ]
+    sim_id = db.one("SELECT id FROM sims WHERE iccid = '89860622180012345670'")["id"]
+
+    # The operator saw the first two; the third arrived a moment later.
+    marked = admin.post(
+        "/api/messages/read",
+        json={"sim_id": sim_id, "peer": "10086", "through_id": ids[1]},
+    )
+    assert marked.json() == {"ok": True, "marked": 2}
+    assert admin.get("/api/messages/unread").json() == {"total": 1}
+    still_unread = [
+        m["id"] for m in
+        admin.get(f"/api/messages?peer=10086&sim_id={sim_id}").json()["items"]
+        if m["read_at"] is None
+    ]
+    assert still_unread == [ids[2]]
+
+    # Reading on catches up, and a watermark below the floor marks nothing.
+    assert admin.post(
+        "/api/messages/read",
+        json={"sim_id": sim_id, "peer": "10086", "through_id": ids[2]},
+    ).json() == {"ok": True, "marked": 1}
+    assert admin.get("/api/messages/unread").json() == {"total": 0}
+
+
+def test_marking_read_under_a_content_filter_leaves_the_hidden_kind_unread(admin):
+    """A transcript filtered to text must not mark the data messages it hid.
+
+    They were never on screen, and an operator provisioning message that is
+    silently read is one nobody will ever go looking for.
+    """
+    db = admin.app.state.hub.db
+    text_id = db.insert_message(
+        agent_id="home-arch", device="a", direction="in", peer="10086",
+        body="验证码 314159", ts=_minutes_ago(2), iccid="89860622180012345670",
+    )
+    data_id = db.insert_message(
+        agent_id="home-arch", device="a", direction="in", peer="10086",
+        body="", ts=_minutes_ago(1), iccid="89860622180012345670",
+        raw_pdu="0605040B8423F0", dcs=4, is_binary=True,
+    )
+    sim_id = db.one("SELECT id FROM sims WHERE iccid = '89860622180012345670'")["id"]
+
+    read = admin.post(
+        "/api/messages/read",
+        json={"sim_id": sim_id, "peer": "10086", "content": "text"},
+    )
+    assert read.json() == {"ok": True, "marked": 1}
+    unread = {
+        m["id"]: m["read_at"]
+        for m in admin.get(f"/api/messages?peer=10086&sim_id={sim_id}").json()["items"]
+    }
+    assert unread[text_id] is not None
+    assert unread[data_id] is None, "the hidden category must stay unread"
+    assert admin.get("/api/messages/unread").json() == {"total": 1}
+
+
+def _long_thread(client, *, count: int, shared_stamps: int = 0) -> tuple[int, list[int]]:
+    """One thread of ``count`` messages, newest last in the returned ids.
+
+    ``shared_stamps`` of them carry the *same* timestamp: a multipart SMS
+    stores every segment with one SCTS, and an ordering that cannot break that
+    tie is where a cursor walk starts repeating or skipping rows.
+    """
+    db = client.app.state.hub.db
+    seen = _minutes_ago(600)
+    sim_id = int(db.execute(
+        "INSERT INTO sims (iccid, label, first_seen_at, last_seen_at) "
+        "VALUES ('8986062218001234599', 'long', ?, ?)",
+        (seen, seen),
+    ).lastrowid)
+    tie = _minutes_ago(500)
+    ids: list[int] = []
+    for index in range(count):
+        stamp = tie if index < shared_stamps else _minutes_ago(count - index)
+        ids.append(int(db.execute(
+            "INSERT INTO messages "
+            "(agent_id, device, sim_id, direction, peer, body, ts, status, created_at) "
+            "VALUES ('agent-a', 'a', ?, 'in', '10086', ?, ?, 'received', ?)",
+            (sim_id, f"msg-{index:04d}", stamp, stamp),
+        ).lastrowid))
+    return sim_id, ids
+
+
+def test_a_long_thread_is_walked_by_cursor_without_gaps_or_repeats(admin):
+    """The other isolation reproduction: `?limit=2200` was a 422 dead end.
+
+    The thread view used to reach further back by growing one window, so a
+    conversation longer than the 2,000-row cap had no way to be read at all.
+    A `(ts,id)` cursor walks it a fixed page at a time instead, and the shared
+    timestamps here are the case an ordering without the id tiebreak loses.
+    """
+    sim_id, ids = _long_thread(admin, count=45, shared_stamps=12)
+    base = f"/api/messages?peer=10086&sim_id={sim_id}&limit=10&count=false"
+
+    walked: list[int] = []
+    page = admin.get(base).json()
+    assert page["total"] is None, "an endless scroll must not count the history"
+    pages = 0
+    while True:
+        pages += 1
+        assert pages <= 10, "the walk is not terminating"
+        walked.extend(message["id"] for message in page["items"])
+        if not page["has_more"]:
+            assert page["next_cursor"] is None
+            break
+        page = admin.get(f"{base}&before={page['next_cursor']}").json()
+
+    assert pages == 5
+    assert walked == list(reversed(ids)), "newest first, every row exactly once"
+    assert len(set(walked)) == len(walked)
+
+    # The window the UI opens with still answers "is there more" without a count.
+    first = admin.get(f"/api/messages?peer=10086&sim_id={sim_id}&limit=44").json()
+    assert first["has_more"] is True
+    assert first["total"] == 45
+    whole = admin.get(f"/api/messages?peer=10086&sim_id={sim_id}&limit=45").json()
+    assert whole["has_more"] is False and whole["next_cursor"] is None
+
+
+def test_a_cursor_belongs_to_the_filter_that_made_it(admin):
+    """A position in one ordering is meaningless in another.
+
+    Reusing a cursor under a different filter would page from a row this query
+    never produced — silently skipping or repeating — so the filter travels
+    inside the cursor and a mismatch is refused.
+    """
+    sim_id, _ = _long_thread(admin, count=6)
+    page = admin.get(
+        f"/api/messages?peer=10086&sim_id={sim_id}&limit=2"
+    ).json()
+    cursor = page["next_cursor"]
+    assert cursor and admin.get(
+        f"/api/messages?peer=10086&sim_id={sim_id}&limit=2&before={cursor}"
+    ).status_code == 200
+
+    for query in (
+        f"/api/messages?peer=95555&sim_id={sim_id}&before={cursor}",
+        f"/api/messages?peer=10086&sim_id={sim_id}&direction=out&before={cursor}",
+        f"/api/messages?peer=10086&sim_scope=unassigned&before={cursor}",
+        "/api/messages?before=not-a-cursor",
+        "/api/messages?before=" + "A" * 200,
+    ):
+        assert admin.get(query).status_code == 422, query
+
+    # Cursor and offset are two ways to say where to start, so naming both is
+    # a contradiction rather than a precedence rule.
+    assert admin.get(
+        f"/api/messages?peer=10086&sim_id={sim_id}&offset=2&before={cursor}"
+    ).status_code == 422
+
+
 def test_status_is_recorded_for_the_history_graph(admin):
     with _connect(admin) as ws:
         _greet(ws)
@@ -877,9 +1154,14 @@ def test_status_is_recorded_for_the_history_graph(admin):
     # samples, so each is still its own point and the raw values read back.
     history = admin.get("/api/devices/a/history?hours=1").json()
     assert [row["rssi"] for row in history] == [24, 18, 11]
+
+    # The all-device series is keyed by module id: two agents may both call a
+    # module "a", and a name-keyed response merged them into one curve.
+    devices = {row["name"]: row["id"] for row in admin.get("/api/devices").json()}
     histories = admin.get("/api/devices/history?hours=1").json()
-    assert [row["rssi"] for row in histories["a"]] == [24, 18, 11]
-    assert histories["b"] == []
+    assert [row["rssi"] for row in histories[str(devices["a"])]] == [24, 18, 11]
+    assert histories[str(devices["b"])] == []
+    assert "a" not in histories
 
 
 def test_history_bucket_width_bounds_the_row_count():
@@ -1297,6 +1579,214 @@ def test_second_connection_for_the_same_agent_is_refused(admin):
         assert excinfo.value.code == 4003
 
 
+def test_a_refused_duplicate_leaves_the_incumbent_fully_usable(admin):
+    """A rejected second hello must cost the live connection nothing.
+
+    Before a connection carried an identity of its own, the refused socket's
+    cleanup ran against the agent *id* and so evicted the incumbent: the live
+    agent kept sending events into a server that no longer believed it was
+    connected, every command to it answered 503, and its modules read offline
+    until it happened to reconnect.  Refusing with 4003 is only half the
+    requirement — this pins the other half.
+    """
+    import queue
+    import threading
+
+    from starlette.websockets import WebSocketDisconnect
+
+    gateway = admin.app.state.hub.gateway
+    ready: queue.Queue = queue.Queue()
+    refused: queue.Queue = queue.Queue()
+    seen: queue.Queue = queue.Queue()
+
+    def incumbent() -> None:
+        with _connect(admin) as ws:
+            _greet(ws)
+            ready.put(gateway.connections["test-agent"].generation)
+            assert refused.get(timeout=5) == "refused"
+            # Still ingesting, and still getting its ack.
+            ws.send_json({
+                "type": "status", "seq": 7, "device": "a", "online": True,
+            })
+            seen.put(ws.receive_json())
+            # Still reachable for commands.
+            frame = ws.receive_json()
+            ws.send_json({
+                "type": "cmd_result", "seq": 8, "cmd_id": frame["cmd_id"],
+                "ok": True, "data": {"response": "still here"},
+            })
+            seen.put("answered")
+
+    thread = threading.Thread(target=incumbent, daemon=True)
+    thread.start()
+    generation = ready.get(timeout=5)
+
+    with pytest.raises(WebSocketDisconnect) as excinfo:
+        with _connect(admin) as second:
+            second.send_json(HELLO)
+            second.receive_json()
+    assert excinfo.value.code == 4003
+
+    live = gateway.connections.get("test-agent")
+    assert live is not None, "the incumbent lost its registration"
+    assert live.generation == generation, "the incumbent was replaced"
+    assert admin.app.state.hub.db.one(
+        "SELECT connected FROM agents WHERE id = 'test-agent'"
+    )["connected"] == 1, "the database was marked offline while the agent was up"
+
+    refused.put("refused")
+    assert seen.get(timeout=5) == {"type": "ack", "seq": 7}
+    response = admin.post("/api/devices/a/ussd", json={"code": "*101#"})
+    assert response.status_code == 200
+    assert response.json()["response"] == "still here"
+    assert seen.get(timeout=5) == "answered"
+    thread.join(timeout=5)
+
+
+def test_a_second_hello_on_one_connection_is_refused(admin):
+    """Re-identifying mid-session is a protocol error, and leaves no residue."""
+    from starlette.websockets import WebSocketDisconnect
+
+    gateway = admin.app.state.hub.gateway
+    with pytest.raises(WebSocketDisconnect) as excinfo:
+        with _connect(admin) as ws:
+            _greet(ws)
+            ws.send_json({**HELLO, "agent_id": "someone-else"})
+            ws.receive_json()
+    assert excinfo.value.code == 4002
+
+    assert gateway.connections == {}
+    assert admin.app.state.hub.db.one(
+        "SELECT connected FROM agents WHERE id = 'test-agent'"
+    )["connected"] == 0
+    assert admin.app.state.hub.db.one(
+        "SELECT id FROM agents WHERE id = 'someone-else'"
+    ) is None, "a rejected hello registered an agent anyway"
+
+
+def test_events_before_hello_are_refused(admin):
+    """An unidentified socket must not be able to write anything."""
+    from starlette.websockets import WebSocketDisconnect
+
+    with pytest.raises(WebSocketDisconnect) as excinfo:
+        with _connect(admin) as ws:
+            ws.send_json({
+                "type": "sms_in", "seq": 1, "device": "a",
+                "iccid": "89860622180012345670", "peer": "10086",
+                "body": "no hello", "ts": "2026-08-02T18:00:00+08:00",
+            })
+            ws.receive_json()
+    assert excinfo.value.code == 4002
+    assert admin.get("/api/messages").json()["items"] == []
+
+
+async def test_a_command_result_only_completes_its_own_session(tmp_path):
+    """A result is bound to the session that was sent the command.
+
+    ``cmd_id`` is unique per waiter, not per fleet, so without the binding one
+    agent's reply can complete another agent's command — the browser is then
+    shown a reading taken from the wrong hardware.  A reconnect of the *same*
+    agent is the same problem: the new session never received the command.
+    """
+    from hub_server.gateway import _PendingCommand
+
+    settings = Settings(data_dir=tmp_path, agent_token="test-token")
+    db = Database(settings.db_path)
+    gateway = Gateway(db, settings)
+    try:
+        owner = AgentConnection(
+            agent_id="agent-a", websocket=_AckSocket(), generation=1
+        )
+        stranger = AgentConnection(
+            agent_id="agent-b", websocket=_AckSocket(), generation=2
+        )
+        reconnected = AgentConnection(
+            agent_id="agent-a", websocket=_AckSocket(), generation=3
+        )
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        gateway._pending["cmd-1"] = _PendingCommand(
+            agent_id="agent-a", generation=1, future=future
+        )
+
+        gateway._resolve_command(
+            stranger, {"cmd_id": "cmd-1", "ok": True, "data": {"from": "b"}}
+        )
+        assert not future.done(), "another agent completed a command it never got"
+
+        gateway._resolve_command(
+            reconnected, {"cmd_id": "cmd-1", "ok": True, "data": {"from": "new"}}
+        )
+        assert not future.done(), "a later session answered for an earlier one"
+
+        gateway._resolve_command(
+            owner, {"cmd_id": "cmd-1", "ok": True, "data": {"from": "a"}}
+        )
+        assert future.result() == {"from": "a"}
+    finally:
+        db.close()
+
+
+async def test_cleanup_of_a_superseded_connection_spares_the_incumbent(tmp_path):
+    """Registry cleanup is keyed on the connection, not on the agent id."""
+    settings = Settings(data_dir=tmp_path, agent_token="test-token")
+    db = Database(settings.db_path)
+    db.upsert_agent("agent-a", "0.1.0", 1, connected=True)
+    gateway = Gateway(db, settings)
+    try:
+        incumbent = AgentConnection(
+            agent_id="agent-a", websocket=_AckSocket(), generation=1
+        )
+        gateway.connections["agent-a"] = incumbent
+
+        gateway._unregister(
+            AgentConnection(
+                agent_id="agent-a", websocket=_AckSocket(), generation=2
+            )
+        )
+
+        assert gateway.connections["agent-a"] is incumbent
+        assert db.one("SELECT connected FROM agents WHERE id = 'agent-a'")[
+            "connected"
+        ] == 1
+
+        gateway._unregister(incumbent)
+        assert gateway.connections == {}
+        assert db.one("SELECT connected FROM agents WHERE id = 'agent-a'")[
+            "connected"
+        ] == 0
+    finally:
+        db.close()
+
+
+async def test_a_disconnect_reports_pending_commands_as_unknown(tmp_path):
+    """A dropped link must fail its waiters, not strand them until timeout."""
+    from hub_server.gateway import CommandFailed, _PendingCommand
+
+    settings = Settings(data_dir=tmp_path, agent_token="test-token")
+    db = Database(settings.db_path)
+    db.upsert_agent("agent-a", "0.1.0", 1, connected=True)
+    gateway = Gateway(db, settings)
+    try:
+        connection = AgentConnection(
+            agent_id="agent-a", websocket=_AckSocket(), generation=1
+        )
+        gateway.connections["agent-a"] = connection
+        mine: asyncio.Future = asyncio.get_running_loop().create_future()
+        theirs: asyncio.Future = asyncio.get_running_loop().create_future()
+        gateway._pending["cmd-1"] = _PendingCommand("agent-a", 1, mine)
+        gateway._pending["cmd-2"] = _PendingCommand("agent-b", 9, theirs)
+
+        gateway._unregister(connection)
+
+        with pytest.raises(CommandFailed, match="the result is unknown"):
+            mine.result()
+        assert not theirs.done(), "another agent's command was failed too"
+        assert "cmd-1" not in gateway._pending
+        theirs.cancel()
+    finally:
+        db.close()
+
+
 # --------------------------------------------------------------------------
 # commands
 # --------------------------------------------------------------------------
@@ -1329,7 +1819,7 @@ def test_set_radio_routes_a_typed_command_to_the_owning_agent(admin, monkeypatch
     gateway = admin.app.state.hub.gateway
     seen = {}
 
-    monkeypatch.setattr(gateway, "agent_for_device", lambda name: "test-agent")
+    _register_devices(admin)
 
     async def fake_call(agent_id, frame, **_kwargs):
         seen.update(agent_id=agent_id, frame=frame)
@@ -1340,6 +1830,8 @@ def test_set_radio_routes_a_typed_command_to_the_owning_agent(admin, monkeypatch
     response = admin.post("/api/devices/a/radio", json={"enabled": False})
     assert response.status_code == 200
     assert response.json()["radio_enabled"] is False
+    # The wire still carries the agent-local module name: only the server side
+    # of the addressing moved to row ids.
     assert seen == {
         "agent_id": "test-agent",
         "frame": {"type": "set_radio", "device": "a", "enabled": False},
@@ -1359,7 +1851,7 @@ def test_operator_controls_and_diagnostics_use_typed_long_timeout_commands(admin
     gateway = admin.app.state.hub.gateway
     seen = []
 
-    monkeypatch.setattr(gateway, "agent_for_device", lambda name: "test-agent")
+    _register_devices(admin)
 
     async def fake_call(agent_id, frame, **kwargs):
         seen.append((agent_id, frame, kwargs))
@@ -1392,6 +1884,139 @@ def test_operator_controls_and_diagnostics_use_typed_long_timeout_commands(admin
     # still answering.
     assert seen[-1][2] == {"timeout": 165.0}
     assert seen[2][1]["numeric"] is None
+
+
+def _two_agents_sharing_a_module_name(client) -> dict[str, int]:
+    """Two agents, each with a module called "modem-1".  Row ids by agent.
+
+    Distinct ICCIDs: the same physical card cannot sit in two modules, and
+    reusing one would drag SIM linkage into a test about module identity.
+    """
+    for index, agent_id in enumerate(("site-a", "site-b")):
+        with _connect(client) as ws:
+            ws.send_json({**HELLO, "agent_id": agent_id, "devices": [{
+                "name": "modem-1", "label": "保号卡", "port": "/dev/ttyUSB0",
+                "online": True, "registered": True, "radio_enabled": True,
+                "iccid": f"8986062218001234567{index}",
+                "imei": f"{index}11", "model": "AirM2M_780E",
+            }]})
+            assert ws.receive_json()["type"] == "sync_tasks"
+
+    rows = [
+        row for row in client.get("/api/devices").json() if row["name"] == "modem-1"
+    ]
+    assert {row["agent_id"] for row in rows} == {"site-a", "site-b"}
+    return {row["agent_id"]: row["id"] for row in rows}
+
+
+def test_a_module_name_shared_by_two_agents_is_addressed_by_id(admin, monkeypatch):
+    """The isolation reproduction: two hosts, each with a module "modem-1".
+
+    Names are unique per agent, not per fleet.  Every name-addressed command
+    used to be answered by whichever row the server met first, so toggling the
+    radio on site-b's module could take site-a's off the air instead.  The name
+    now fails loudly with both candidates; the row id addresses one module.
+    """
+    owners = _two_agents_sharing_a_module_name(admin)
+    seen: list[tuple[str, dict]] = []
+
+    async def fake_call(agent_id, frame, **_kwargs):
+        seen.append((agent_id, frame))
+        return {"radio_enabled": False, "operators": [], "message_id": 1}
+
+    monkeypatch.setattr(admin.app.state.hub.gateway, "call", fake_call)
+
+    for method, path, body in (
+        ("post", "/api/devices/modem-1/radio", {"enabled": False}),
+        ("post", "/api/devices/modem-1/refresh", None),
+        ("post", "/api/devices/modem-1/operators/scan", None),
+        ("get", "/api/devices/modem-1/history", None),
+        ("post", "/api/messages/send", {"device": "modem-1", "number": "10086",
+                                        "body": "余额"}),
+    ):
+        response = getattr(admin, method)(path, json=body) if body is not None \
+            else getattr(admin, method)(path)
+        assert response.status_code == 409, path
+        detail = response.json()["detail"]
+        assert detail["error"] == "ambiguous_device_name", path
+        assert sorted(c["device_id"] for c in detail["candidates"]) == sorted(
+            owners.values()
+        ), path
+        assert sorted(c["agent_id"] for c in detail["candidates"]) == ["site-a", "site-b"]
+    assert seen == [], "an ambiguous name must not reach any agent"
+
+    for agent_id, device_id in owners.items():
+        radio = admin.post(
+            f"/api/devices/by-id/{device_id}/radio", json={"enabled": False}
+        )
+        assert radio.status_code == 200, agent_id
+    # Each id reached its own host, and the wire still names the module the way
+    # that host knows it.
+    assert [entry[0] for entry in seen] == list(owners)
+    assert {entry[1]["device"] for entry in seen} == {"modem-1"}
+
+
+def test_same_named_modules_keep_separate_history_series(admin):
+    """One curve per module, even when the two modules share a name."""
+    owners = _two_agents_sharing_a_module_name(admin)
+    for agent_id, rssi in (("site-a", 25), ("site-b", 9)):
+        with _connect(admin) as ws:
+            ws.send_json({**HELLO, "agent_id": agent_id, "devices": []})
+            assert ws.receive_json()["type"] == "sync_tasks"
+            ws.send_json({
+                "type": "status", "seq": 1, "device": "modem-1", "online": True,
+                "registered": True, "rssi": rssi, "dbm": -113 + 2 * rssi, "bars": 3,
+                "ts": _minutes_ago(5),
+            })
+            assert ws.receive_json() == {"type": "ack", "seq": 1}
+
+    histories = admin.get("/api/devices/history?hours=1").json()
+    assert [row["rssi"] for row in histories[str(owners["site-a"])]] == [25]
+    assert [row["rssi"] for row in histories[str(owners["site-b"])]] == [9]
+    for agent_id, device_id in owners.items():
+        series = admin.get(f"/api/devices/by-id/{device_id}/history?hours=1").json()
+        assert [row["rssi"] for row in series] == [25 if agent_id == "site-a" else 9]
+
+
+def test_a_task_cannot_be_pinned_to_an_ambiguous_module_name(admin):
+    """A keep-alive task on the wrong SIM burns the wrong card's schedule."""
+    owners = _two_agents_sharing_a_module_name(admin)
+    refused = admin.post("/api/tasks", json={"device": "modem-1", "name": "保号"})
+    assert refused.status_code == 409
+    assert refused.json()["detail"]["error"] == "ambiguous_device_name"
+
+    task = admin.post("/api/tasks", json={
+        "device_id": owners["site-b"], "name": "保号",
+    }).json()
+    assert task["agent_id"] == "site-b"
+    assert task["device"] == "modem-1", "the wire keeps the agent-local name"
+    assert task["device_id"] == owners["site-b"]
+
+    gateway = admin.app.state.hub.gateway
+    assert [row["id"] for row in gateway.tasks_for("site-b")] == [task["id"]]
+    assert gateway.tasks_for("site-a") == []
+
+
+def test_a_legacy_task_on_an_ambiguous_name_is_given_to_nobody(admin):
+    """A row from before device ids cannot be silently assigned.
+
+    Both agents running it would send the same SMS on the same schedule from
+    two different cards, and neither is more likely to be the intended one, so
+    the row waits for an operator instead.
+    """
+    _two_agents_sharing_a_module_name(admin)
+    db = admin.app.state.hub.db
+    db.execute(
+        "INSERT INTO tasks (name, device, agent_id, created_at) "
+        "VALUES ('遗留任务', 'modem-1', '', ?)",
+        (datetime.now(UTC).isoformat(timespec="seconds"),),
+    )
+    gateway = admin.app.state.hub.gateway
+    assert gateway.tasks_for("site-a") == []
+    assert gateway.tasks_for("site-b") == []
+    # Still visible to the operator, and still saying it belongs to no agent.
+    listed = admin.get("/api/tasks").json()
+    assert [(row["device"], row["agent_id"]) for row in listed] == [("modem-1", "")]
 
 
 def test_operator_selection_rejects_invalid_numeric_and_unknown_devices(admin):
@@ -1584,7 +2209,11 @@ def test_task_accepts_the_voice_call_action(admin):
 
 
 def test_task_can_be_triggered_manually(admin, monkeypatch):
+    _register_devices(admin)
     task = admin.post("/api/tasks", json={"device": "a", "name": "手动保号"}).json()
+    # The row was pinned to the module it names, so the run does not have to
+    # re-resolve a name at trigger time.
+    assert task["agent_id"] == "test-agent"
     gateway = admin.app.state.hub.gateway
     seen = []
 
@@ -1595,7 +2224,6 @@ def test_task_can_be_triggered_manually(admin, monkeypatch):
         seen.append(("call", agent_id, frame))
         return {"task_id": task["id"], "status": "started"}
 
-    monkeypatch.setattr(gateway, "agent_for_device", lambda _name: "test-agent")
     monkeypatch.setattr(gateway, "push_tasks", fake_push)
     monkeypatch.setattr(gateway, "call", fake_call)
 
@@ -2281,6 +2909,132 @@ def test_purge_endpoint_reports_every_table(admin):
         "notify_logs", "audit_events", "incidents",
     ):
         assert table in body
+
+
+def test_retention_keeps_idempotency_rows_by_default(admin):
+    """The doc's reproduction: housekeeping must not un-claim a sequence.
+
+    ``ingested`` used to be trimmed at a fixed seven days with no setting and
+    no way off.  A row there is not history, it is the claim on a sequence
+    number: delete it and the very next replay of that event is applied a
+    second time — the same SMS stored twice, the same task receipt counted
+    twice.  Nothing in the protocol bounds how long an agent's queue can hold
+    an unacked event, so the default has to be keep-forever.
+    """
+    db = admin.app.state.hub.db
+    event = {
+        "type": "sms_in", "seq": 21, "device": "a",
+        "iccid": "89860622180012345670", "peer": "10086",
+        "body": "exactly once", "ts": "2026-08-02T18:00:00+08:00",
+    }
+    with _connect(admin) as ws:
+        _greet(ws)
+        ws.send_json(event)
+        assert ws.receive_json() == {"type": "ack", "seq": 21}
+
+    # Older than the seven-day horizon that used to be hard-coded.
+    db.execute("UPDATE ingested SET at = ?", (_minutes_ago(30 * 24 * 60),))
+    removed = db.purge(
+        message_days=admin.app.state.hub.message_retention_days,
+        status_days=30, log_days=30, audit_days=180, incident_days=90,
+    )
+    assert removed.get("ingested", 0) == 0
+    assert db.one("SELECT COUNT(*) AS n FROM ingested")["n"] == 1
+
+    with _connect(admin) as ws:
+        _greet(ws)
+        ws.send_json(event)  # the agent replays after a lost ack
+        assert ws.receive_json() == {"type": "ack", "seq": 21}
+
+    assert len(admin.get("/api/messages").json()["items"]) == 1
+
+
+def test_an_explicit_horizon_is_the_only_way_to_forget_a_sequence(admin):
+    """Opting in trims the table — and gives up replay protection with it."""
+    db = admin.app.state.hub.db
+    with _connect(admin) as ws:
+        _greet(ws)
+        ws.send_json({
+            "type": "sms_in", "seq": 22, "device": "a",
+            "iccid": "89860622180012345670", "peer": "10086",
+            "body": "forgettable", "ts": "2026-08-02T18:00:00+08:00",
+        })
+        ws.receive_json()
+
+    db.execute("UPDATE ingested SET at = ?", (_minutes_ago(30 * 24 * 60),))
+    removed = db.purge(message_days=0, status_days=0, ingested_days=7)
+
+    assert removed["ingested"] == 1
+    assert db.one("SELECT COUNT(*) AS n FROM ingested")["n"] == 0
+
+
+def test_a_rebuilt_agent_queue_is_not_mistaken_for_a_replay(admin):
+    """A new sequence space must be ingested, and reported to the operator.
+
+    An agent whose store file is replaced restarts AUTOINCREMENT at 1, so it
+    hands out seq 1..N a second time for entirely different events.  Keyed on
+    the agent id alone, every one of those looked like a duplicate and was
+    dropped in silence — the modules were online, the link was up, and no
+    message ever arrived again.
+    """
+    db = admin.app.state.hub.db
+    event = {
+        "type": "sms_in", "seq": 1, "device": "a",
+        "iccid": "89860622180012345670", "peer": "10086",
+        "body": "first epoch", "ts": "2026-08-02T18:00:00+08:00",
+    }
+    with _connect(admin) as ws:
+        _greet(ws)
+        ws.send_json(event)
+        ws.receive_json()
+
+    with _connect(admin) as ws:
+        ws.send_json({**HELLO, "stream_id": "epoch-two"})
+        assert ws.receive_json()["type"] == "sync_tasks"
+        ws.send_json({**event, "body": "second epoch"})
+        assert ws.receive_json() == {"type": "ack", "seq": 1}
+
+    bodies = [row["body"] for row in admin.get("/api/messages").json()["items"]]
+    assert sorted(bodies) == ["first epoch", "second epoch"]
+    assert db.one(
+        "SELECT stream_id FROM agents WHERE id = 'test-agent'"
+    )["stream_id"] == "epoch-two"
+
+    incident = db.one(
+        "SELECT kind, severity, status FROM incidents "
+        "WHERE fingerprint = 'agent-stream-reset:test-agent'"
+    )
+    assert incident is not None, "a rebuilt queue must not be silent"
+    assert incident["kind"] == "agent_stream_reset"
+    assert incident["status"] == "active"
+
+    # The same stream reconnecting is not a reset.
+    db.resolve_incident("agent-stream-reset:test-agent", detail="ack")
+    with _connect(admin) as ws:
+        ws.send_json({**HELLO, "stream_id": "epoch-two"})
+        assert ws.receive_json()["type"] == "sync_tasks"
+    assert db.one(
+        "SELECT status FROM incidents "
+        "WHERE fingerprint = 'agent-stream-reset:test-agent'"
+    )["status"] == "resolved"
+
+
+def test_an_agents_first_stream_label_is_not_reported_as_a_rebuild(admin):
+    """Upgrading an agent must not page the operator.
+
+    Agents old enough not to report a stream are recorded under the empty
+    label and keep it as long as they keep their store, so an empty previous
+    label is only a rebuild if events were ingested under it.  A first
+    connection has none, and neither does a fleet-wide upgrade.
+    """
+    db = admin.app.state.hub.db
+    with _connect(admin) as ws:
+        ws.send_json({**HELLO, "stream_id": "epoch-one"})
+        assert ws.receive_json()["type"] == "sync_tasks"
+
+    assert db.one(
+        "SELECT id FROM incidents WHERE kind = 'agent_stream_reset'"
+    ) is None
 
 
 # --------------------------------------------------------------------------

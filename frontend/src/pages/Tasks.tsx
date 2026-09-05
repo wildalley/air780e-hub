@@ -37,7 +37,7 @@ import { api, ApiError, type Device, type Task, type TaskInput } from '../api'
 import { formatTs } from '../format'
 import { usePager } from '../swr'
 import { useToast } from '../toast'
-import { Loading, Pager } from '../components/common'
+import { Pager, QueryState, RefreshNotice } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
 import { LIVE_MS } from '../swr'
 import { STATUS } from '../tokens'
@@ -46,6 +46,7 @@ import { STATUS } from '../tokens'
 const BLANK: TaskInput = {
   name: '',
   device: '',
+  device_id: null,
   enabled: true,
   action: 'send_sms',
   target_number: '10086',
@@ -62,6 +63,7 @@ function toInput(task: Task): TaskInput {
   return {
     name: task.name,
     device: task.device,
+    device_id: task.device_id,
     sim_id: task.sim_id,
     enabled: Boolean(task.enabled),
     action: task.action,
@@ -93,11 +95,21 @@ export function TasksPage() {
   const [editing, setEditing] = useState<{ id: number | null; input: TaskInput } | null>(null)
   const [runningId, setRunningId] = useState<number | null>(null)
 
-  const { data: tasks, mutate: mutateTasks } = useSWR('/api/tasks', () => api.tasks.list(), {
+  const {
+    data: tasks,
+    error: tasksError,
+    isLoading: tasksLoading,
+    mutate: mutateTasks,
+  } = useSWR('/api/tasks', () => api.tasks.list(), {
     refreshInterval: LIVE_MS,
   })
   const logPager = usePager()
-  const { data: logPage, mutate: mutateLogs } = useSWR(
+  const {
+    data: logPage,
+    error: logError,
+    isLoading: logLoading,
+    mutate: mutateLogs,
+  } = useSWR(
     ['/api/task-logs', logPager.query],
     () => api.tasks.logs(logPager.query),
     { refreshInterval: LIVE_MS, keepPreviousData: true },
@@ -105,7 +117,12 @@ export function TasksPage() {
   const logs = logPage?.items ?? []
   // Shared cache key with the devices page and the composer — the dropdown of
   // modules costs nothing here if another view already fetched it.
-  const { data: devices = [] } = useSWR('/api/devices', () => api.devices.list())
+  const {
+    data: deviceList,
+    error: devicesError,
+    mutate: reloadDevices,
+  } = useSWR('/api/devices', () => api.devices.list())
+  const devices = deviceList ?? []
 
   // A write changes the task list and, once the agent reports back, its log.
   const load = useCallback(
@@ -146,7 +163,11 @@ export function TasksPage() {
     }
   }
 
-  if (!tasks) return <Loading />
+  if (!tasks) {
+    return (
+      <QueryState page="保号任务" error={tasksError} onRetry={mutateTasks} busy={tasksLoading} />
+    )
+  }
 
   return (
     <Stack spacing={3}>
@@ -158,13 +179,29 @@ export function TasksPage() {
             variant="contained"
             startIcon={<AddIcon />}
             onClick={() =>
-              setEditing({ id: null, input: { ...BLANK, device: devices[0]?.name ?? '' } })
+              setEditing({
+                id: null,
+                input: {
+                  ...BLANK,
+                  device: devices[0]?.name ?? '',
+                  device_id: devices[0]?.id ?? null,
+                },
+              })
             }
             disabled={devices.length === 0}
           >
             新建任务
           </Button>
         }
+      />
+
+      <RefreshNotice data={tasks} error={tasksError} onRetry={mutateTasks} busy={tasksLoading} />
+      {/* Without this, a failed module list shows up as a greyed-out 新建任务
+          button and reads as "this hub has no modules". */}
+      <RefreshNotice
+        data={deviceList}
+        error={devicesError}
+        onRetry={reloadDevices}
       />
 
       <Alert severity="info">
@@ -382,6 +419,12 @@ export function TasksPage() {
           <Typography variant="h3" gutterBottom>
             执行日志
           </Typography>
+          <RefreshNotice
+            data={logPage}
+            error={logError}
+            loading={logLoading}
+            onRetry={mutateLogs}
+          />
           {logs.length === 0 ? (
             <Typography variant="body2" sx={{
               color: 'text.secondary'
@@ -484,15 +527,25 @@ function TaskDialog({
             fullWidth
           />
 
+          {/* Bound to the module row, so a task cannot end up pinned to a
+              name two agents share.  The name travels along for display and
+              for the frame the agent receives. */}
           <TextField
             select
             label="使用哪张卡"
-            value={value.device}
-            onChange={(e) => set('device', e.target.value)}
+            value={value.device_id ? String(value.device_id) : ''}
+            onChange={(e) => {
+              const picked = devices.find((device) => device.id === Number(e.target.value))
+              onChange({
+                ...value,
+                device_id: picked?.id ?? null,
+                device: picked?.name ?? '',
+              })
+            }}
             fullWidth
           >
             {devices.map((device) => (
-              <MenuItem key={device.name} value={device.name}>
+              <MenuItem key={device.id} value={String(device.id)}>
                 {device.sim_label || device.label || device.name}
               </MenuItem>
             ))}
@@ -670,7 +723,11 @@ function TaskDialog({
       </DialogContent>
       <DialogActions>
         <Button onClick={onClose}>取消</Button>
-        <Button variant="contained" onClick={onSave} disabled={!value.device}>
+        <Button
+          variant="contained"
+          onClick={onSave}
+          disabled={!value.device_id && !value.device}
+        >
           保存
         </Button>
       </DialogActions>

@@ -12,19 +12,19 @@ import asyncio
 import json
 import logging
 import random
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from typing import Any
 
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from . import PROTOCOL_VERSION
+from .commands import CommandDispatcher, CommandHandler, RejectHandler
 from .config import ServerConfig
 from .store import LocalStore
 
 log = logging.getLogger(__name__)
 
-CommandHandler = Callable[[dict[str, Any]], Awaitable[None]]
 DescribeDevices = Callable[[], list[dict[str, Any]]]
 
 BATCH = 200
@@ -45,6 +45,7 @@ class ServerLink:
         version: str,
         store: LocalStore,
         on_command: CommandHandler,
+        on_command_rejected: RejectHandler,
         describe_devices: DescribeDevices,
         max_delay: float = 60.0,
     ) -> None:
@@ -52,7 +53,7 @@ class ServerLink:
         self.agent_id = agent_id
         self.version = version
         self.store = store
-        self.on_command = on_command
+        self._commands = CommandDispatcher(on_command, on_command_rejected)
         self.describe_devices = describe_devices
         self.max_delay = max_delay
 
@@ -72,8 +73,15 @@ class ServerLink:
     async def stop(self) -> None:
         self._stopped = True
         self._wake.set()
+        await self._commands.stop()
 
     async def run(self) -> None:
+        try:
+            await self._reconnect()
+        finally:
+            await self.stop()
+
+    async def _reconnect(self) -> None:
         if not self.config.enabled:
             log.info("no server configured; running standalone")
             return
@@ -131,6 +139,10 @@ class ServerLink:
                 "version": self.version,
                 "protocol_version": PROTOCOL_VERSION,
                 "last_seq": self.store.last_seq(),
+                # Tells the server which sequence-number space these events
+                # belong to, so a rebuilt local queue is read as a new stream
+                # rather than as a replay of numbers it has already seen.
+                "stream_id": self.store.stream_id(),
                 "devices": self.describe_devices(),
             })
 
@@ -139,7 +151,10 @@ class ServerLink:
                 await self._receiver(ws)
             finally:
                 sender.cancel()
-                await asyncio.gather(sender, return_exceptions=True)
+                try:
+                    self._commands.discard_queued()
+                finally:
+                    await asyncio.gather(sender, return_exceptions=True)
 
     # -- outbound ----------------------------------------------------------
 
@@ -175,6 +190,8 @@ class ServerLink:
 
     async def _receiver(self, ws) -> None:
         async for raw in ws:
+            if self._stopped:
+                return
             try:
                 frame = json.loads(raw)
             except (ValueError, TypeError):
@@ -190,10 +207,12 @@ class ServerLink:
             elif kind == "resend_from":
                 self._handle_resend(frame)
             else:
-                try:
-                    await self.on_command(frame)
-                except Exception:
-                    log.exception("command handler failed for %s", kind)
+                accepted = self._commands.submit(frame)
+                if not accepted and frame.get("cmd_id") is None:
+                    # sync_tasks has no receipt. Reconnect so the server sends
+                    # its full configuration again instead of silently losing it.
+                    await ws.close(code=1013, reason="command queue is full")
+                    return
 
     def _handle_ack(self, frame: dict[str, Any]) -> None:
         seq = frame.get("seq")

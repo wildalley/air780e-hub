@@ -16,13 +16,13 @@ import {
 } from '@mui/material'
 import SaveIcon from '@mui/icons-material/SaveOutlined'
 import SimIcon from '@mui/icons-material/SimCardOutlined'
-import useSWR, { mutate as mutateKey } from 'swr'
+import useSWR, { useSWRConfig } from 'swr'
 import { api, ApiError, type Sim, type SimBillingType } from '../api'
 import { formatTs, relativeTs } from '../format'
 import { simBalanceStatus, type SimBalanceLevel } from '../simBalance'
 import { mostUrgentSimDeadline, type SimDeadlineLevel } from '../simExpiry'
 import { useToast } from '../toast'
-import { Loading } from '../components/common'
+import { QueryState, RefreshNotice } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
 
 type EditableSimField =
@@ -89,8 +89,17 @@ function Metadata({ label, value }: { label: string; value: string | number }) {
 export function SimsPage() {
   const toast = useToast()
   const [drafts, setDrafts] = useState<Record<number, SimDraft>>({})
+  // Not the `mutate` exported from 'swr': that one always addresses the default
+  // cache, and every login builds a private one. Revalidating the nav badge by
+  // key has to go through the cache this subtree is actually reading from.
+  const { mutate: mutateKey } = useSWRConfig()
 
-  const { data: sims, mutate: load } = useSWR('/api/sims', () => api.sims.list())
+  const {
+    data: sims,
+    error: simsError,
+    isLoading: simsLoading,
+    mutate: load,
+  } = useSWR('/api/sims', () => api.sims.list())
 
   const save = async (sim: Sim) => {
     const draft = drafts[sim.id]
@@ -128,11 +137,15 @@ export function SimsPage() {
   const edit = (id: number, field: EditableSimField, value: string) =>
     setDrafts((current) => ({ ...current, [id]: { ...current[id], [field]: value } }))
 
-  if (!sims) return <Loading />
+  if (!sims) {
+    return <QueryState page="SIM 卡" error={simsError} onRetry={load} busy={simsLoading} />
+  }
 
   return (
     <Stack spacing={3}>
       <PageHeader title="SIM 卡" subtitle="历史挂在卡上,换模块也不丢" />
+
+      <RefreshNotice data={sims} error={simsError} onRetry={load} busy={simsLoading} />
 
       {sims.length === 0 ? (
         <Alert severity="info">还没有识别到 SIM 卡。模块上报 ICCID 后会自动出现在这里。</Alert>

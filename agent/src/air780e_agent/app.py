@@ -57,6 +57,7 @@ class AgentApp:
             version=__version__,
             store=self.store,
             on_command=self.handle_command,
+            on_command_rejected=self.reject_command,
             describe_devices=self.describe_devices,
             max_delay=config.reconnect_max_delay,
         )
@@ -272,6 +273,10 @@ class AgentApp:
         self.store.close()
 
     # -- commands from the server -----------------------------------------
+
+    def reject_command(self, frame: dict[str, Any], error: str) -> None:
+        log.warning("command %s rejected: %s", frame.get("type"), error)
+        self._cmd_result(frame.get("cmd_id"), False, error=error)
 
     async def handle_command(self, frame: dict[str, Any]) -> None:
         kind = frame.get("type")

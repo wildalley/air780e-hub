@@ -59,8 +59,18 @@ export function usePager(pageSize = 50) {
   }
 }
 
-/** Statuses where a retry cannot succeed — the answer will not change. */
-const TERMINAL = new Set([400, 401, 403, 404, 422])
+/**
+ * Statuses where a retry cannot succeed — the answer will not change.
+ *
+ * These are the app's own mistakes or a permanent refusal: a lapsed session, a
+ * row that is gone, a body the endpoint will never accept, a route that does
+ * not exist. Backing off and asking again just spends the operator's battery
+ * and, for 401, fills the audit log.
+ */
+const TERMINAL = new Set([400, 401, 403, 404, 405, 410, 422, 501])
+
+/** Never wait longer than this, whatever `Retry-After` claims. */
+const RETRY_AFTER_CAP_MS = 60_000
 
 export const SWR_OPTIONS: SWRConfiguration = {
   // Two mounts of the same key within this window share one request. Covers
@@ -78,7 +88,12 @@ export const SWR_OPTIONS: SWRConfiguration = {
     // Exponential backoff with jitter, so a server restart does not get a
     // synchronised thundering herd from every open tab.
     const base = config.errorRetryInterval ?? 3_000
-    const delay = base * 2 ** count * (0.5 + Math.random())
+    let delay = base * 2 ** count * (0.5 + Math.random())
+    // A throttle told us its own window: obey it instead of guessing, and never
+    // come back early — arriving before it reopens earns another 429.
+    if (error instanceof ApiError && error.retryAfterMs !== undefined) {
+      delay = Math.min(error.retryAfterMs, RETRY_AFTER_CAP_MS) + Math.random() * 1_000
+    }
     setTimeout(() => void revalidate({ retryCount: count + 1 }), delay)
   },
 }

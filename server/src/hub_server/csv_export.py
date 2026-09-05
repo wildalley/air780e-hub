@@ -7,7 +7,7 @@ import io
 from collections.abc import Iterator
 from typing import Any
 
-from .db import Database
+from .db import Database, MessageScope
 
 MESSAGE_CSV_HEADER = (
     "id",
@@ -31,14 +31,16 @@ MESSAGE_CSV_HEADER = (
 
 def iter_message_csv(
     db: Database,
+    scope: MessageScope | None = None,
     *,
     limit: int | None = None,
-    sim_id: int | None = None,
-    peer: str | None = None,
-    search: str | None = None,
-    content: str | None = None,
 ) -> Iterator[str]:
-    """Yield a UTF-8 Excel-compatible CSV without retaining the full export."""
+    """Yield a UTF-8 Excel-compatible CSV without retaining the full export.
+
+    Takes the same scope object the list and the total are read with, so a
+    download cannot quietly cover a different set of cards than the screen it
+    was started from.
+    """
     buffer = io.StringIO()
     writer = csv.writer(buffer)
 
@@ -51,13 +53,7 @@ def iter_message_csv(
     # Excel otherwise guesses a legacy encoding for Chinese message bodies.
     yield "\ufeff"
     yield line(MESSAGE_CSV_HEADER)
-    for message in db.iter_messages(
-        limit=limit,
-        sim_id=sim_id,
-        peer=peer,
-        search=search,
-        content=content,
-    ):
+    for message in db.iter_messages(scope, limit=limit):
         yield line(
             (
                 message["id"],

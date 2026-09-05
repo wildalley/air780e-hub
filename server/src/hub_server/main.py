@@ -103,6 +103,7 @@ async def _housekeeping(state: AppState) -> None:
                 audit_days=state.settings.audit_retention_days,
                 incident_days=state.settings.incident_retention_days,
                 audit_max_rows=state.settings.audit_max_rows,
+                ingested_days=state.settings.ingested_retention_days,
             )
             state.auth.purge_expired_sessions()
             state.db.reconcile_sim_incidents(
@@ -127,6 +128,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except Exception:
             log.exception("initial SIM incident reconciliation failed")
         task = asyncio.create_task(_housekeeping(state), name="housekeeping")
+        # Anything the last run left owed in the outbox goes out now: the queue
+        # is what makes a push survive a restart, and nothing else drains it.
+        state.notifier.start()
         try:
             yield
         finally:
@@ -136,7 +140,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             # wire finish before the HTTP client closes — AppState.close() is
             # synchronous and cannot await them.
             await state.alerter.aclose()
-            await state.notifier.drain()
             await state.notifier.aclose()
             state.close()
 

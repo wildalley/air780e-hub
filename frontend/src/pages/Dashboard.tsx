@@ -41,7 +41,7 @@ import { SignalChart, type SignalSeries } from '../components/SignalChart'
 import { formatTs, relativeTs } from '../format'
 import { messagePreview } from '../messages'
 import { entranceStyle } from '../motion'
-import { Loading, OnlineChip } from '../components/common'
+import { OnlineChip, QueryState, RefreshNotice } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
 import { LIVE_MS } from '../swr'
 import { STATUS, VIZ, seriesColor } from '../tokens'
@@ -58,31 +58,59 @@ export function DashboardPage() {
   const [hours, setHours] = useState(24)
   const [statsDays, setStatsDays] = useState(30)
 
-  const { data: overview } = useSWR('/api/overview', () => api.overview(), {
+  const {
+    data: overview,
+    error: overviewError,
+    isLoading: overviewLoading,
+    mutate: reloadOverview,
+  } = useSWR('/api/overview', () => api.overview(), {
     // Revalidation holds the previous render rather than flashing a skeleton.
     refreshInterval: LIVE_MS,
   })
   // Separate key per window, so flipping 24h/7d serves an already-fetched
   // range from cache instead of refetching it.
-  const { data: history = {} } = useSWR(
+  const {
+    data: history,
+    error: historyError,
+    isLoading: historyLoading,
+    mutate: reloadHistory,
+  } = useSWR(
     ['/api/devices/history', hours],
     () => api.devices.histories(hours),
     { refreshInterval: LIVE_MS, keepPreviousData: true },
   )
-  const { data: stats } = useSWR(
+  const {
+    data: stats,
+    error: statsError,
+    isLoading: statsLoading,
+    mutate: reloadStats,
+  } = useSWR(
     ['/api/stats/messages', statsDays],
     () => api.stats.messages(statsDays),
     { refreshInterval: TREND_MS, keepPreviousData: true },
   )
   // The panel shows the first few and a count, so one small page is enough —
   // no pager here, unlike the Operations page which lists them all.
-  const { data: incidentPage } = useSWR(
+  const {
+    data: incidentPage,
+    error: incidentError,
+    mutate: reloadIncidents,
+  } = useSWR(
     '/api/operations/incidents?status=open',
     () => api.operations.incidents('open', 'limit=25&offset=0'),
     { refreshInterval: LIVE_MS },
   )
 
-  if (!overview) return <Loading />
+  if (!overview) {
+    return (
+      <QueryState
+        page="仪表盘"
+        error={overviewError}
+        onRetry={reloadOverview}
+        busy={overviewLoading}
+      />
+    )
+  }
 
   const { counters, devices, recent_messages: recent } = overview
   const allOnline = counters.devices_online === counters.devices_total
@@ -90,10 +118,10 @@ export function DashboardPage() {
   // Colour is keyed by the device's stable position in the list, so filtering
   // or a device dropping offline never repaints the other one.
   const series: SignalSeries[] = devices.map((device, index) => ({
-    name: device.name,
+    id: String(device.id),
     label: device.sim_label || device.label || device.name,
     index,
-    points: history[device.name] ?? [],
+    points: history?.[String(device.id)] ?? [],
     current: device.last_seen_at
       ? {
           ts: device.last_seen_at,
@@ -108,6 +136,11 @@ export function DashboardPage() {
     <Stack spacing={3}>
       <PageHeader title="仪表盘" subtitle="模块、短信与存储,一目了然" />
 
+      <RefreshNotice data={overview} error={overviewError} onRetry={reloadOverview} />
+
+      {/* The alarm panel is the one place where a failed read must not read as
+          "nothing wrong" — an empty list here is a claim, not an absence. */}
+      <RefreshNotice data={incidentPage} error={incidentError} onRetry={reloadIncidents} />
       <AttentionPanel
         incidents={incidentPage?.items ?? []}
         total={incidentPage?.total ?? 0}
@@ -153,10 +186,22 @@ export function DashboardPage() {
       </Box>
 
       <Box sx={entranceStyle(220)}>
+        <RefreshNotice
+          data={history}
+          error={historyError}
+          loading={historyLoading}
+          onRetry={reloadHistory}
+        />
         <SignalChart series={series} hours={hours} onHoursChange={setHours} />
       </Box>
 
       <Box sx={entranceStyle(240)}>
+        <RefreshNotice
+          data={stats}
+          error={statsError}
+          loading={statsLoading}
+          onRetry={reloadStats}
+        />
         <TrendCard stats={stats ?? null} days={statsDays} onDaysChange={setStatsDays} viz={viz} />
       </Box>
 

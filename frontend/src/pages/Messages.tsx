@@ -1,5 +1,14 @@
-import { useEffect, useMemo, useRef, useState, useCallback, type ReactNode } from 'react'
+import {
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useCallback,
+  type ReactNode,
+} from 'react'
 import useSWR from 'swr'
+import useSWRInfinite from 'swr/infinite'
 import {
   Alert,
   Avatar,
@@ -40,15 +49,25 @@ import CheckIcon from '@mui/icons-material/CheckOutlined'
 import {
   deliveryStatusLabel,
   detectOtp,
-  hasOlderMessages,
+  mergeThreadPages,
   messagePreview,
   OTP_RE,
   resolveThread,
+  resolveThreadDevice,
   threadPreview,
+  threadScope,
 } from '../messages'
-import { api, ApiError, type Conversation, type Device, type Message } from '../api'
+import {
+  api,
+  ApiError,
+  errorText,
+  type Conversation,
+  type Device,
+  type Message,
+  type MessagePage,
+} from '../api'
 import { useToast } from '../toast'
-import { Loading } from '../components/common'
+import { Loading, RefreshNotice } from '../components/common'
 import { PageHeader } from '../components/PageHeader'
 import { useDebounced } from '../swr'
 import { STATUS } from '../tokens'
@@ -70,6 +89,10 @@ type MessageContent = 'all' | 'text' | 'data'
 // Roughly where a GSM-7 message splits.  Only a hint: the agent does the real
 // segmentation, and Unicode content splits far earlier.
 const SINGLE_SEGMENT = 70
+
+/** Identity of a thread as a string, for the draft store. */
+const threadKey = (thread: Pick<Conversation, 'peer' | 'sim_id'>) =>
+  `${thread.sim_id ?? 'unassigned'}:${thread.peer}`
 
 /** Split a body around its codes; codes render as highlighted tokens. */
 function highlightOtp(body: string): ReactNode[] {
@@ -119,8 +142,22 @@ export function MessagesPage() {
   const [searchOpen, setSearchOpen] = useState(false)
   const [composeOpen, setComposeOpen] = useState(false)
   const [content, setContent] = useState<MessageContent>('all')
+  // Drafts live above the thread view, which remounts on every thread switch:
+  // an unsent reply has to survive a glance at another conversation. Memory
+  // only — an SMS body is not something to leave in localStorage, and this
+  // whole subtree unmounts on logout.
+  const [drafts, setDrafts] = useState<Record<string, string>>({})
+  const setDraft = useCallback(
+    (thread: Pick<Conversation, 'peer' | 'sim_id'>, text: string) =>
+      setDrafts((current) => ({ ...current, [threadKey(thread)]: text })),
+    [],
+  )
 
-  const { data: threads, mutate: loadThreads } = useSWR(
+  const {
+    data: threads,
+    error: threadsError,
+    mutate: loadThreads,
+  } = useSWR(
     ['/api/messages/conversations', content],
     () => api.messages.conversations(content === 'all' ? undefined : content),
     { refreshInterval: 10_000 }
@@ -171,7 +208,14 @@ export function MessagesPage() {
             </Tooltip>
             <Tooltip title="导出 CSV">
               <IconButton
-                onClick={() => void api.messages.exportCsv(content === 'all' ? undefined : content)}
+                onClick={() =>
+                  // The same filter the list is showing — an export that
+                  // silently covered a different set than the screen it was
+                  // started from is the bug this scope object exists to prevent.
+                  void api.messages.exportCsv({
+                    content: content === 'all' ? undefined : content,
+                  })
+                }
                 size="small"
               >
                 <DownloadIcon />
@@ -205,6 +249,8 @@ export function MessagesPage() {
         {showList && (
           <ThreadList
             threads={filtered}
+            error={threadsError}
+            onRetry={loadThreads}
             selected={selected}
             onSelect={setSelected}
             search={search}
@@ -224,6 +270,8 @@ export function MessagesPage() {
             thread={selected}
             content={content}
             devices={devices}
+            draft={selected ? drafts[threadKey(selected)] ?? '' : ''}
+            onDraft={(text) => selected && setDraft(selected, text)}
             onBack={narrow ? () => setSelected(null) : undefined}
             onRead={() => void loadThreads()}
             onSent={async () => {
@@ -278,6 +326,8 @@ export function MessagesPage() {
 
 function ThreadList({
   threads,
+  error,
+  onRetry,
   selected,
   onSelect,
   search,
@@ -287,6 +337,9 @@ function ThreadList({
   fullWidth,
 }: {
   threads: Conversation[] | null
+  /** A failed conversations read; the list must not look merely empty. */
+  error?: unknown
+  onRetry?: () => unknown
   selected: Conversation | null
   onSelect: (thread: Conversation) => void
   search: string
@@ -329,8 +382,17 @@ function ThreadList({
       </Stack>
       <Divider />
       <Box sx={{ overflowY: 'auto', flexGrow: 1 }}>
+        {/* A stale list is the difference between "no new messages" and "we have
+            not been able to ask" — on this page the operator is usually waiting
+            for a code that is supposed to arrive within seconds. */}
+        <RefreshNotice
+          data={threads}
+          error={error}
+          onRetry={onRetry}
+          sx={{ mx: 2, mt: 2, mb: 0 }}
+        />
         {threads === null ? (
-          <Loading />
+          error ? null : <Loading />
         ) : threads.length === 0 ? (
           <Typography
             variant="body2"
@@ -442,6 +504,8 @@ function ThreadView({
   thread,
   content,
   devices,
+  draft,
+  onDraft,
   onBack,
   onRead,
   onSent,
@@ -450,6 +514,9 @@ function ThreadView({
   thread: Conversation | null
   content: MessageContent
   devices: Device[]
+  /** Held by the page, so an unsent reply survives a look at another thread. */
+  draft: string
+  onDraft: (text: string) => void
   onBack?: () => void
   /** Fired after this thread's incoming messages are marked read. */
   onRead?: () => void
@@ -458,65 +525,169 @@ function ThreadView({
 }) {
   const [busy, setBusy] = useState(false)
   const bottom = useRef<HTMLDivElement | null>(null)
+  const scroller = useRef<HTMLDivElement | null>(null)
 
-  // Keyed by the thread, so switching conversations swaps the cache entry
-  // instead of clearing state in an effect — no null flash on a thread that
-  // has already been read once.
-  // How far back this thread has been read. Grows a whole window rather than
-  // paging: a transcript has no page boundaries to land on, and an offset one
-  // could gap or repeat if an SMS arrives mid-scroll. Remounting on a thread
-  // switch resets it, so a new conversation starts at one window again.
-  const [reach, setReach] = useState(THREAD_PAGE)
+  const scope = thread ? threadScope(thread.sim_id) : null
+  const kind = content === 'all' ? undefined : content
 
-  const { data, mutate } = useSWR(
-    thread ? ['/api/messages', thread.sim_id, thread.peer, reach, content] : null,
-    async () => {
-      const data = await api.messages.list({
-        peer: thread!.peer,
-        sim_id: thread!.sim_id ?? undefined,
-        limit: reach,
-        content: content === 'all' ? undefined : content,
-      })
-      // Opening a conversation is the read receipt.
-      if (data.items.some((m) => m.direction === 'in' && !m.read_at)) {
-        await api.messages.markRead(thread!.sim_id, thread!.peer)
-        onRead?.()
-      }
-      // The API returns newest first; a conversation reads oldest first.
-      return { messages: [...data.items].reverse(), total: data.total }
+  // Fixed pages walked backwards by cursor, not one window that grows.
+  //
+  // The window it replaces re-read the whole conversation every five seconds
+  // and, past the server's 2,000-row cap, answered 422 — a dead end in the
+  // middle of a history the operator was entitled to read. Each page here is
+  // cached under its own cursor, so paging back is additive: only page 0, the
+  // live tail, is revalidated, and `(ts,id)` boundaries cannot gap or repeat
+  // when an SMS lands mid-scroll the way an offset can.
+  const { data: pages, error: pagesError, size, setSize, mutate, isValidating } =
+    useSWRInfinite<MessagePage>(
+    (index, previous: MessagePage | null) => {
+      if (!thread || scope === null) return null
+      if (index === 0) return ['/api/messages', scope, thread.peer, content, '']
+      // A page with nothing older behind it ends the walk.
+      if (!previous?.next_cursor) return null
+      return ['/api/messages', scope, thread.peer, content, previous.next_cursor]
     },
+    ([, , peer, , before]: [string, typeof scope, string, MessageContent, string]) =>
+      api.messages.list({
+        scope: scope ?? 'all',
+        peer,
+        content: kind,
+        limit: THREAD_PAGE,
+        before: before || undefined,
+        // The transcript re-reads itself every few seconds; counting a
+        // 10,000-message history each time answers nothing `has_more` doesn't.
+        count: false,
+      }),
     {
       keepPreviousData: true,
+      // Only the tail. Older pages are immutable history — re-reading them on
+      // every tick is what made a long conversation expensive.
+      revalidateFirstPage: true,
+      revalidateAll: false,
       // Delivery reports arrive independently from the send request. Keep the
       // open transcript live so pending bubbles settle without a manual refresh.
       refreshInterval: 5_000,
     },
   )
 
-  const messages = data?.messages
-  const hasOlder = data ? hasOlderMessages(data.total, data.messages.length) : false
+  // The API returns newest first, a conversation reads oldest first, and the
+  // pages overlap once the tail grows — see `mergeThreadPages`.
+  const messages = useMemo(() => mergeThreadPages(pages), [pages])
+  const loaded = pages !== undefined
+  const hasOlder = pages?.[pages.length - 1]?.has_more ?? false
+  const loadingOlder = size > (pages?.length ?? 0) && isValidating
 
   const load = mutate
 
-  // Per-thread draft. The parent gives this component a `key` derived from the
-  // thread, so switching conversations remounts and the draft starts empty —
-  // no effect needed to clear it.
-  const [draft, setDraft] = useState('')
+  // Follow the tail only when the operator is already at it. `scrollIntoView`
+  // on every new message used to yank the view out from under someone reading
+  // history — the new arrival is announced instead, and they choose when to go.
+  const [atBottom, setAtBottom] = useState(true)
+  // Where the operator's eyes last were, frozen at the moment they scrolled away
+  // from the tail. While they are *at* the tail there is nothing to remember —
+  // the newest message is on screen by definition, so `seen` derives from it.
+  const [frozen, setFrozen] = useState(0)
 
-  // Keyed on the newest message, not the whole list: prepending older messages
-  // must leave the scroll where it is. Depending on `messages` would jump the
-  // operator back to the bottom on every "load older" — the opposite of the ask.
-  const newestId = messages?.length ? messages[messages.length - 1].id : undefined
+  const newest = messages.length ? messages[messages.length - 1] : undefined
+  const newestId = newest?.id
   useEffect(() => {
+    if (!newestId || !atBottom) return
     bottom.current?.scrollIntoView({ block: 'end' })
-  }, [newestId])
+  }, [newestId, atBottom])
+
+  // The newest message the operator has actually had in front of them. Both the
+  // "N 条新消息" count and the read watermark are measured from here.
+  const seen = atBottom ? newestId ?? 0 : frozen
+
+  /** Back to the tail, releasing the frozen mark so `seen` follows it again. */
+  const followTail = useCallback(() => {
+    setAtBottom(true)
+    setFrozen(0)
+  }, [])
+
+  const unseen = useMemo(() => {
+    if (atBottom || !seen) return 0
+    const index = messages.findIndex((message) => message.id === seen)
+    return index < 0 ? 0 : messages.length - 1 - index
+  }, [messages, atBottom, seen])
+
+  // Reading is a deliberate act, not a side effect of a fetch.
+  //
+  // Marking read inside the fetcher meant a background revalidation — or a
+  // prefetch of older pages — could read a thread nobody was looking at, and
+  // the watermark it sent was "whatever the query returned", including a code
+  // that landed between the render and the request. This advances only what is
+  // on screen, only while this tab is in the foreground, and only as far as the
+  // newest message the operator has seen.
+  const [foreground, setForeground] = useState(
+    () => typeof document === 'undefined' || document.visibilityState === 'visible',
+  )
+  useEffect(() => {
+    const onVisibility = () => setForeground(document.visibilityState === 'visible')
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => document.removeEventListener('visibilitychange', onVisibility)
+  }, [])
+
+  const reported = useRef(0)
+  useEffect(() => {
+    if (!thread || scope === null || !foreground) return
+    // The seen mark, or — for a thread scrolled away from before it ever
+    // settled — the newest row already in hand. Either way a known watermark,
+    // never "everything this filter can reach".
+    const watermark = seen || newestId
+    if (!watermark || watermark <= reported.current) return
+    const unread = messages.some(
+      (message) =>
+        message.direction === 'in' && !message.read_at && message.id <= watermark,
+    )
+    if (!unread) return
+    reported.current = watermark
+    void api.messages
+      .markRead(scope, thread.peer, watermark, kind)
+      .then(() => onRead?.())
+      // A failed read receipt must be retryable, not swallowed for the life of
+      // the thread — the badge would then disagree with the transcript.
+      .catch(() => {
+        reported.current = 0
+      })
+  }, [thread, scope, kind, foreground, messages, newestId, seen, onRead])
+
+  // Keep the first visible message where it is when older ones are prepended.
+  // Measured from the bottom, which is the edge that does not move.
+  const anchor = useRef<number | null>(null)
+  const loadOlder = useCallback(() => {
+    const element = scroller.current
+    anchor.current = element ? element.scrollHeight - element.scrollTop : null
+    void setSize((current) => current + 1)
+  }, [setSize])
+
+  useLayoutEffect(() => {
+    const element = scroller.current
+    if (!element || anchor.current === null) return
+    element.scrollTop = element.scrollHeight - anchor.current
+    anchor.current = null
+  }, [messages.length])
+
+  const onScroll = useCallback(() => {
+    const element = scroller.current
+    if (!element) return
+    const bottomGap = element.scrollHeight - element.scrollTop - element.clientHeight
+    const pinned = bottomGap < 80
+    setAtBottom(pinned)
+    // Leaving the tail freezes the seen mark at what was on screen; returning
+    // releases it. Anything that arrives in between is counted, not scrolled to.
+    setFrozen((current) => (pinned ? 0 : current || newestId || 0))
+    // Reaching the top continues the walk on its own; the button below stays
+    // for keyboard and screen-reader users, who never generate this event.
+    if (element.scrollTop < 120 && hasOlder && !loadingOlder) loadOlder()
+  }, [newestId, hasOlder, loadingOlder, loadOlder])
 
   // Hooks stay unconditional while the empty-state render has no thread.
-  const device = thread
-    ? (devices.find(
-        (d) => d.iccid && thread.sim_iccid && d.iccid === thread.sim_iccid,
-      ) ?? devices.find((d) => d.name === thread.device))
-    : undefined
+  // The card is the reliable link; the module name is only a fallback for a
+  // thread with no SIM, and only when exactly one module answers to it — two
+  // agents can each have a `modem-1`, and replying through the wrong one would
+  // send from the wrong card.
+  const device = thread ? resolveThreadDevice(devices, thread) : undefined
   const online = Boolean(device?.online)
 
   const sendText = useCallback(
@@ -524,7 +695,10 @@ function ThreadView({
       if (!device || !thread) return false
       setBusy(true)
       try {
-        await api.messages.send(device.name, thread.peer, body)
+        await api.messages.send(device.id, thread.peer, body)
+        // Your own message is the one exception to not stealing the scroll:
+        // sending is a request to be at the bottom.
+        followTail()
         await load()
         await onSent()
         return true
@@ -535,7 +709,7 @@ function ThreadView({
         setBusy(false)
       }
     },
-    [device, thread, load, onSent, onError],
+    [device, thread, load, onSent, onError, followTail],
   )
 
   if (!thread) {
@@ -559,7 +733,7 @@ function ThreadView({
   }
 
   const send = async () => {
-    if (await sendText(draft)) setDraft('')
+    if (await sendText(draft)) onDraft('')
   }
 
   const retry = (message: Message) => {
@@ -597,18 +771,37 @@ function ThreadView({
       </Stack>
       <Divider />
 
-      <Box sx={{ flexGrow: 1, overflowY: 'auto', px: 2, py: 2, minHeight: 0 }}>
-        {!messages ? (
-          <Loading />
+      <Box
+        ref={scroller}
+        onScroll={onScroll}
+        sx={{ flexGrow: 1, overflowY: 'auto', px: 2, py: 2, minHeight: 0, position: 'relative' }}
+      >
+        {!loaded ? (
+          pagesError ? (
+            <Alert
+              severity="warning"
+              variant="outlined"
+              action={
+                <Button color="inherit" size="small" onClick={() => void load()}>
+                  重试
+                </Button>
+              }
+            >
+              这段对话没能读出来({errorText(pagesError)})。
+            </Alert>
+          ) : (
+            <Loading />
+          )
         ) : (
           <Stack spacing={0.5}>
+            {/* The transcript re-reads itself every few seconds; when that stops
+                working, an operator waiting on a verification code has to know
+                that "no new message" is not an answer. */}
+            <RefreshNotice data={pages} error={pagesError} onRetry={load} sx={{ mb: 1 }} />
             {hasOlder && (
               <Box sx={{ alignSelf: 'center', pb: 1 }}>
-                <Button
-                  size="small"
-                  onClick={() => setReach((current) => current + THREAD_PAGE)}
-                >
-                  加载更早的消息
+                <Button size="small" onClick={loadOlder} disabled={loadingOlder}>
+                  {loadingOlder ? '正在加载…' : '加载更早的消息'}
                 </Button>
               </Box>
             )}
@@ -624,6 +817,23 @@ function ThreadView({
           </Stack>
         )}
       </Box>
+      {/* Arrivals while the operator is reading history: announced, never
+          scrolled to. Clicking is what moves the view. */}
+      {unseen > 0 && (
+        <Box sx={{ position: 'relative', height: 0, textAlign: 'center' }}>
+          <Chip
+            size="small"
+            color="primary"
+            clickable
+            label={`有 ${unseen} 条新消息`}
+            onClick={() => {
+              followTail()
+              bottom.current?.scrollIntoView({ block: 'end', behavior: 'smooth' })
+            }}
+            sx={{ position: 'absolute', bottom: 8, left: '50%', transform: 'translateX(-50%)' }}
+          />
+        </Box>
+      )}
 
       <Divider />
       <Box sx={{ p: 1.5, flexShrink: 0 }}>
@@ -642,7 +852,7 @@ function ThreadView({
               maxRows={5}
               placeholder={online ? `回复 ${thread.peer}` : '模块离线,暂时发不出去'}
               value={draft}
-              onChange={(e) => setDraft(e.target.value)}
+              onChange={(e) => onDraft(e.target.value)}
               disabled={!online || busy}
               onKeyDown={(e) => {
                 // Enter sends, Shift+Enter makes a new line — the convention
@@ -928,22 +1138,23 @@ function ComposeDialog({
   onError: (message: string) => void
 }) {
   // `null` = untouched, so the first module is a render-time fallback rather
-  // than state an effect has to seed once the list arrives.
-  const [picked, setPicked] = useState<string | null>(null)
+  // than state an effect has to seed once the list arrives.  The id, not the
+  // name: the name is ambiguous once two agents each have a `modem-1`, and the
+  // select would then bind to whichever of them rendered first.
+  const [picked, setPicked] = useState<number | null>(null)
   const [number, setNumber] = useState('')
   const [body, setBody] = useState('')
   const [busy, setBusy] = useState(false)
 
   const device =
-    picked !== null && devices.some((d) => d.name === picked)
-      ? picked
-      : (devices[0]?.name ?? '')
-  const setDevice = setPicked
+    devices.find((d) => d.id === picked) ?? devices[0]
+  const deviceId = device?.id ?? 0
 
   const send = async () => {
     setBusy(true)
     try {
-      await api.messages.send(device, number, body)
+      if (!deviceId) return
+      await api.messages.send(deviceId, number, body)
       const peer = number
       setNumber('')
       setBody('')
@@ -957,7 +1168,7 @@ function ComposeDialog({
     }
   }
 
-  const online = devices.find((d) => d.name === device)?.online
+  const online = device?.online
 
   return (
     <Dialog open={open} onClose={onClose} fullWidth maxWidth="sm">
@@ -967,12 +1178,12 @@ function ComposeDialog({
           <TextField
             select
             label="使用哪张卡"
-            value={device}
-            onChange={(e) => setDevice(e.target.value)}
+            value={deviceId ? String(deviceId) : ''}
+            onChange={(e) => setPicked(Number(e.target.value))}
             fullWidth
           >
             {devices.map((d) => (
-              <MenuItem key={d.name} value={d.name} disabled={!d.online}>
+              <MenuItem key={d.id} value={String(d.id)} disabled={!d.online}>
                 {d.sim_label || d.label || d.name}
                 {d.online ? '' : '(离线)'}
               </MenuItem>
@@ -1001,7 +1212,7 @@ function ComposeDialog({
         <Button
           variant="contained"
           onClick={() => void send()}
-          disabled={busy || !device || !number || !body || !online}
+          disabled={busy || !deviceId || !number || !body || !online}
         >
           发送
         </Button>
@@ -1072,7 +1283,9 @@ function SearchDialog({
 
   const { data, error, isLoading } = useSWR(
     active ? ['/api/messages/search', term] : null,
-    () => api.messages.list({ search: term, limit: 50 }),
+    // No total: the dialog shows the best 50 hits, and counting every match of
+    // a LIKE over the whole history on each pause is work nothing displays.
+    () => api.messages.list({ search: term, limit: 50, count: false }),
     { keepPreviousData: false },
   )
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -89,6 +90,9 @@ TASK_FIELDS = (
     "retry_max", "notify_on_result",
 )
 
+# kv key holding the label for this store's sequence-number space.
+STREAM_ID_KEY = "stream_id"
+
 
 def utcnow() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
@@ -112,6 +116,7 @@ class LocalStore:
         self._db = sqlite3.connect(self.path, isolation_level=None)
         self._db.row_factory = sqlite3.Row
         self._db.executescript(SCHEMA)
+        self._ensure_stream_id()
 
     def close(self) -> None:
         self._db.close()
@@ -171,6 +176,31 @@ class LocalStore:
             "SELECT seq FROM sqlite_sequence WHERE name = 'events'"
         ).fetchone()
         return int(row["seq"]) if row else 0
+
+    def stream_id(self) -> str:
+        """Stable label for *this* sequence-number space.
+
+        Sequence numbers are only unique within one store file: lose or replace
+        it and AUTOINCREMENT restarts at 1, so seq 1..N are handed out a second
+        time to entirely different events.  The server dedupes on
+        (agent_id, stream_id, seq), so a rebuilt queue has to say so — without
+        this it looks like a replay of events the server already applied and
+        every message on the new queue is silently dropped.
+        """
+        return self.get(STREAM_ID_KEY) or ""
+
+    def _ensure_stream_id(self) -> None:
+        """Label the sequence space, once, when the store is opened.
+
+        Open time is when the answer is knowable: a file with no sequence
+        history at all is a new space and gets a fresh label, while one that
+        has already handed out numbers keeps the empty legacy label.  Those
+        numbers were ingested under it, and re-labelling them on upgrade would
+        un-dedupe every event still waiting for an ACK.
+        """
+        if self.get(STREAM_ID_KEY) is not None:
+            return
+        self.set(STREAM_ID_KEY, "" if self.last_seq() else secrets.token_hex(8))
 
     def trim_events(self, keep: int) -> int:
         """Drop the oldest *status* events when the queue runs away.

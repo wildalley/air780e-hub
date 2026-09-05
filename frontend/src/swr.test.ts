@@ -48,9 +48,51 @@ describe('SWR_OPTIONS.onErrorRetry', () => {
   })
 
   it('does not retry client errors that cannot change', () => {
-    for (const status of [400, 403, 404, 422]) {
+    for (const status of [400, 403, 404, 405, 410, 422, 501]) {
       expect(retriesOn(new ApiError(status, 'no'))).toBe(false)
     }
+  })
+
+  it('retries a throttle, since that one clears on its own', () => {
+    expect(retriesOn(new ApiError(429, 'too many requests'))).toBe(true)
+  })
+
+  it('waits as long as a throttle asked instead of guessing a backoff', () => {
+    // A rate limiter in front of the hub knows its own window. The default
+    // backoff for the first attempt is 1.5–4.5s; coming back then, when the
+    // server said 30s, earns another 429 and never converges.
+    const delays: number[] = []
+    const spy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((
+      _fn: () => void,
+      ms?: number,
+    ) => {
+      delays.push(ms ?? 0)
+      return 0 as unknown as ReturnType<typeof setTimeout>
+    }) as typeof setTimeout)
+
+    fire(new ApiError(429, 'slow down', 30_000), 0)
+    spy.mockRestore()
+
+    expect(delays).toHaveLength(1)
+    // At least the window it named, and not wildly past it.
+    expect(delays[0]).toBeGreaterThanOrEqual(30_000)
+    expect(delays[0]).toBeLessThan(32_000)
+  })
+
+  it('caps an implausible Retry-After rather than parking the page for an hour', () => {
+    const delays: number[] = []
+    const spy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((
+      _fn: () => void,
+      ms?: number,
+    ) => {
+      delays.push(ms ?? 0)
+      return 0 as unknown as ReturnType<typeof setTimeout>
+    }) as typeof setTimeout)
+
+    fire(new ApiError(503, 'maintenance', 3_600_000), 0)
+    spy.mockRestore()
+
+    expect(delays[0]).toBeLessThanOrEqual(61_000)
   })
 
   it('retries a server error, which may be transient', () => {

@@ -177,6 +177,7 @@ npm run build
 
 ## 文档
 
+- [前后端优化方案与实施路线](docs/optimization-plan.md)
 - [部署指南](docs/deploy.md)
 - [发布清单](docs/release.md)
 - [短信性能基线](docs/performance.md)

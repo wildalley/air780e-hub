@@ -520,6 +520,54 @@ async def test_message_body_is_not_written_to_logs(agent, caplog):
 # --------------------------------------------------------------------------
 
 
+async def test_stop_persists_interrupted_commands_before_closing_store(tmp_path, monkeypatch):
+    config = AgentConfig.parse(TWO_DEVICES)
+    config.db_path = tmp_path / "agent.db"
+    app = AgentApp(config)
+    started = asyncio.Event()
+    cleanup_counts = []
+
+    async def blocked_raw_at(_command):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleanup_counts.append(app.store.unacked_count())
+
+    monkeypatch.setattr(app.workers["a"], "raw_at", blocked_raw_at)
+    try:
+        assert app.link._commands.submit({
+            "type": "raw_at", "cmd_id": "running", "device": "a", "command": "AT+CSQ",
+        })
+        async with asyncio.timeout(3):
+            await started.wait()
+            assert app.link._commands.submit({
+                "type": "send_sms", "cmd_id": "queued", "device": "a",
+                "number": "10086", "body": "test",
+            })
+            await app.stop()
+        assert cleanup_counts == [1]
+    finally:
+        await app.stop()
+
+    reopened = LocalStore(config.db_path)
+    try:
+        results = {
+            event.payload["cmd_id"]: event.payload
+            for event in reopened.unacked_events()
+            if event.kind == "cmd_result"
+        }
+        assert set(results) == {"running", "queued"}
+        assert results["queued"]["ok"] is False
+        assert results["queued"]["error"] == "agent is stopping; command was not started"
+        assert results["running"]["ok"] is False
+        assert results["running"]["error"] == (
+            "agent stopped while command was running; execution result is unknown"
+        )
+    finally:
+        reopened.close()
+
+
 async def test_send_sms_command(agent):
     await agent.wait_online()
     await agent.app.handle_command({

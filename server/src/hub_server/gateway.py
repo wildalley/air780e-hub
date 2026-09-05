@@ -12,13 +12,14 @@ symmetric — events flow up, commands flow down.  Two invariants matter:
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
 import secrets
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Protocol
 
 from . import PROTOCOL_VERSION, __version__
 from .auth import verify_agent_token, verify_agent_token_hash
@@ -61,6 +62,18 @@ CLOSE_PROTOCOL_ERROR = 4002
 CLOSE_AGENT_CONFLICT = 4003
 CLOSE_INTERNAL_ERROR = 1011
 
+# Frame bounds.  Everything arriving here is untrusted input off a socket, and
+# the two costs of leaving it unbounded are different in kind: an oversized
+# frame is a memory problem, while a ``seq`` outside the range the agent can
+# actually generate is a *correctness* problem — it claims a row in the
+# idempotency table that a real event will later be unable to claim.
+MAX_FRAME_CHARS = 4 * 1024 * 1024  # matches the Agent client's own max_size
+MAX_HELLO_DEVICES = 256
+MAX_ID_CHARS = 128  # agent_id, stream_id: identifiers, not free text
+# SQLite stores a signed 64-bit integer; stay well inside it so arithmetic on a
+# sequence can never overflow the column it is compared against.
+MAX_SEQ = 2**62
+
 COMMAND_TIMEOUT = 30.0
 SETTING_PREVIOUS_AGENT_TOKEN_HASH = "previous_agent_token_hash"
 SETTING_PREVIOUS_AGENT_TOKEN_EXPIRES_AT = "previous_agent_token_expires_at"
@@ -81,9 +94,36 @@ RECOVERY_ACTION_NAMES = {
     "registration_watch": "网络注册监测",
 }
 
-MessageHook = Callable[[int, dict[str, Any]], Awaitable[None]]
-TaskResultHook = Callable[[int, dict[str, Any]], Awaitable[None]]
-CallHook = Callable[[int, dict[str, Any]], Awaitable[None]]
+def _valid_seq(value: Any) -> bool:
+    """Whether a frame's ``seq`` can be trusted as a position in the stream.
+
+    ``bool`` is a subclass of ``int`` in Python, so ``True`` would otherwise
+    claim sequence 1 in the idempotency table and make the agent's real first
+    event read back as an already-applied duplicate.
+    """
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 1 <= value <= MAX_SEQ
+    )
+
+
+class _NotifyHook(Protocol):
+    """A hook that turns one stored event into a notification.
+
+    ``event_key`` identifies the agent event, so a hook backed by a durable queue
+    can recognise the intent the ingest transaction already wrote for it and a
+    replay of a lost ack cannot queue the same push twice.
+    """
+
+    async def __call__(
+        self, ref_id: int, frame: dict[str, Any], *, event_key: str | None = None
+    ) -> None: ...
+
+
+MessageHook = _NotifyHook
+TaskResultHook = _NotifyHook
+CallHook = _NotifyHook
 # (agent_id, device, online) — fired on every module up/down state the gateway
 # learns, so the offline alerter can debounce and page.  Synchronous: it only
 # schedules work and returns, never awaits a push on the ingest path.
@@ -102,15 +142,43 @@ class CommandFailed(RuntimeError):
 
 @dataclass
 class AgentConnection:
+    """One registered agent session.
+
+    ``generation`` is the part that makes this object an *identity* rather than
+    a description: it is handed out once, never reused, and never inferred from
+    the agent id.  Registry cleanup and command results are both matched
+    against it, so a second connection claiming the same agent id can never be
+    mistaken for the session that actually owns it.
+    """
+
     agent_id: str
     websocket: Any
+    generation: int = 0
     version: str = ""
     protocol_version: int = 0
+    # The agent's local event-store epoch.  Empty for an agent old enough not
+    # to report one; see ``Database.apply_event``.
+    stream_id: str = ""
     devices: list[dict[str, Any]] = field(default_factory=list)
     connected_at: str = field(default_factory=utcnow)
 
     async def send(self, frame: dict[str, Any]) -> None:
         await self.websocket.send_text(json.dumps(frame, ensure_ascii=False))
+
+
+@dataclass
+class _PendingCommand:
+    """A command waiting for its ``cmd_result``, and who owes it.
+
+    ``cmd_id`` is unique per waiter, not per fleet, so the source has to be
+    recorded alongside the future: without it one agent's result can complete
+    another agent's command and hand the browser a reading from the wrong
+    hardware.
+    """
+
+    agent_id: str
+    generation: int
+    future: asyncio.Future
 
 
 @dataclass
@@ -122,6 +190,13 @@ class AppliedEvent:
     call_id: int | None = None
     device_change: tuple[str, bool] | None = None
     command_result: bool = False
+    # "agent|stream|seq" for the event this came from, or None for an event with
+    # no identity to be idempotent against.  The notification hooks get it so
+    # they can find the intent the transaction already queued for them.
+    event_key: str | None = None
+
+    def notify_key(self, kind: str) -> str | None:
+        return f"{self.event_key}|{kind}" if self.event_key else None
 
 
 class Gateway:
@@ -145,7 +220,10 @@ class Gateway:
         # Called on each module up/down edge; the offline alerter hangs off it.
         self.on_device_change = on_device_change
         self.connections: dict[str, AgentConnection] = {}
-        self._pending: dict[str, asyncio.Future] = {}
+        self._pending: dict[str, _PendingCommand] = {}
+        # Connection generations are handed out from here.  Monotonic and never
+        # reset, so no two sessions in this process share one.
+        self._generations = itertools.count(1)
 
     @property
     def pending_command_count(self) -> int:
@@ -178,7 +256,16 @@ class Gateway:
         return verify_agent_token_hash(token, expected_hash)
 
     async def serve(self, websocket: Any) -> None:
-        """Drive one agent connection start to finish."""
+        """Drive one agent connection start to finish.
+
+        The connection walks ``awaiting_hello -> registered -> closing`` and
+        never goes back.  Registration hands *this* connection object ownership
+        of the agent id; a connection that never got it — because it never said
+        hello, or because it lost the race for an id already held — must leave
+        the incumbent's registry entry and database state exactly as it found
+        them.  That is why the cleanup below is keyed on the connection object
+        and not on the id it asked for.
+        """
         await websocket.accept()
 
         if not self.authenticate(websocket.headers.get("authorization")):
@@ -193,53 +280,75 @@ class Gateway:
             await websocket.close(code=1000, reason="self-check complete")
             return
 
-        agent_id: str | None = None
+        registered: AgentConnection | None = None
         try:
             while True:
                 raw = await websocket.receive_text()
+                if len(raw) > MAX_FRAME_CHARS:
+                    await websocket.close(
+                        code=CLOSE_PROTOCOL_ERROR, reason="frame too large"
+                    )
+                    return
                 try:
                     frame = json.loads(raw)
                 except ValueError:
                     await websocket.close(code=CLOSE_PROTOCOL_ERROR, reason="bad json")
                     return
-                if not isinstance(frame, dict) or "type" not in frame:
+                if not isinstance(frame, dict) or not isinstance(
+                    frame.get("type"), str
+                ):
                     await websocket.close(code=CLOSE_PROTOCOL_ERROR, reason="no type")
                     return
 
                 if frame["type"] == "hello":
-                    agent_id = str(frame.get("agent_id") or "").strip()
-                    if not agent_id:
+                    if registered is not None:
+                        # One connection, one identity.  A second hello could
+                        # otherwise rename this session and orphan the registry
+                        # entry the first one created.
+                        log.warning(
+                            "agent %s sent a second hello; closing",
+                            registered.agent_id,
+                        )
+                        await websocket.close(
+                            code=CLOSE_PROTOCOL_ERROR, reason="hello already sent"
+                        )
+                        return
+                    candidate = str(frame.get("agent_id") or "").strip()
+                    if not candidate or len(candidate) > MAX_ID_CHARS:
                         await websocket.close(
                             code=CLOSE_PROTOCOL_ERROR, reason="no agent_id"
                         )
                         return
-                    if agent_id in self.connections:
-                        log.warning("agent %s already connected; rejecting", agent_id)
+                    if candidate in self.connections:
+                        log.warning("agent %s already connected; rejecting", candidate)
                         await websocket.close(
                             code=CLOSE_AGENT_CONFLICT, reason="already connected"
                         )
                         return
-                    self._register(agent_id, websocket, frame)
+                    registered = self._register(candidate, websocket, frame)
                     # Keep-alive tasks are the one piece of state the agent
                     # persists on its own (D3), so a task edited or deleted
                     # while it was offline would otherwise keep running
                     # forever.  Push the full list every connect; it is a
                     # small frame and full-replace makes it self-correcting.
-                    await self.push_tasks(agent_id)
+                    await self.push_tasks(candidate)
                     continue
 
-                if agent_id is None:
+                if registered is None:
                     await websocket.close(
                         code=CLOSE_PROTOCOL_ERROR, reason="hello must come first"
                     )
                     return
 
-                await self._ingest(agent_id, frame, websocket)
+                await self._ingest(registered, frame)
         except Exception as exc:
             # A disconnect surfaces as WebSocketDisconnect; anything else is
             # worth a look but must not take the server down.
             if type(exc).__name__ != "WebSocketDisconnect":
-                log.exception("agent %s connection failed", agent_id or "?")
+                log.exception(
+                    "agent %s connection failed",
+                    registered.agent_id if registered else "?",
+                )
                 try:
                     # Stop this ordered stream before any higher cumulative
                     # ACK can overtake the event that just rolled back.
@@ -250,21 +359,36 @@ class Gateway:
                 except Exception:
                     pass
         finally:
-            if agent_id is not None:
-                self._unregister(agent_id)
+            if registered is not None:
+                self._unregister(registered)
 
-    def _register(self, agent_id: str, websocket: Any, frame: dict[str, Any]) -> None:
+    def _register(
+        self, agent_id: str, websocket: Any, frame: dict[str, Any]
+    ) -> AgentConnection:
         version = str(frame.get("version", ""))
         protocol_version = _optional_int(frame.get("protocol_version")) or 0
-        devices = frame.get("devices") or []
-        self.connections[agent_id] = AgentConnection(
+        stream_id = str(frame.get("stream_id") or "").strip()[:MAX_ID_CHARS]
+        # Bounded and pre-filtered: the registry list is walked on every device
+        # lookup, and a non-dict entry there would raise far from here.
+        devices = [
+            device
+            for device in (frame.get("devices") or [])
+            if isinstance(device, dict)
+        ][:MAX_HELLO_DEVICES]
+        connection = AgentConnection(
             agent_id=agent_id,
             websocket=websocket,
+            generation=next(self._generations),
             version=version,
             protocol_version=protocol_version,
+            stream_id=stream_id,
             devices=devices,
         )
-        self.db.upsert_agent(agent_id, version, protocol_version, connected=True)
+        self.connections[agent_id] = connection
+        self._note_stream(agent_id, stream_id)
+        self.db.upsert_agent(
+            agent_id, version, protocol_version, connected=True, stream_id=stream_id
+        )
         fingerprint = f"agent-version:{agent_id}"
         problems = []
         if version != __version__:
@@ -285,19 +409,79 @@ class Gateway:
         else:
             self.db.resolve_incident(fingerprint, detail="Agent 与 Server 版本已一致")
         for device in devices:
-            if isinstance(device, dict):
-                self.db.upsert_device(agent_id, device)
-                if "online" in device:
-                    self._note_device(agent_id, device.get("name", ""),
-                                      bool(device.get("online")))
+            self.db.upsert_device(agent_id, device)
+            if "online" in device:
+                self._note_device(agent_id, device.get("name", ""),
+                                  bool(device.get("online")))
         log.info(
-            "agent %s connected (v%s, protocol=%s, %d device(s), last_seq=%s)",
-            agent_id, version or "?", protocol_version or "?", len(devices),
-            frame.get("last_seq"),
+            "agent %s connected (v%s, protocol=%s, stream=%s, %d device(s), "
+            "last_seq=%s)",
+            agent_id, version or "?", protocol_version or "?", stream_id or "-",
+            len(devices), frame.get("last_seq"),
+        )
+        return connection
+
+    def _note_stream(self, agent_id: str, stream_id: str) -> None:
+        """Record a change of the agent's local event-store epoch.
+
+        A new stream id means the agent's queue was rebuilt, so its sequence
+        numbers restart from 1 while the server still holds the old stream's
+        idempotency rows.  Dedupe already keys on the stream, so ingest stays
+        correct — but the reset itself is worth a human looking at, because the
+        events the old stream never got to send are gone.
+
+        An agent connecting for the first time is not a reset, and neither is
+        one whose first label arrives with an upgrade: agents old enough not to
+        report a stream are recorded under the empty label, and they keep it as
+        long as they keep their store.  So an empty previous label only counts
+        as a rebuild when events were actually ingested under it.
+        """
+        previous = str(
+            (self.db.one("SELECT stream_id FROM agents WHERE id = ?", (agent_id,)) or {})
+            .get("stream_id")
+            or ""
+        )
+        if not stream_id or previous == stream_id:
+            return
+        if not previous and not self.db.one(
+            "SELECT 1 AS found FROM ingested "
+            "WHERE agent_id = ? AND stream_id = '' LIMIT 1",
+            (agent_id,),
+        ):
+            return
+        log.warning(
+            "agent %s reports a new event stream (%s -> %s)",
+            agent_id, previous or "-", stream_id,
+        )
+        self.db.open_incident(
+            f"agent-stream-reset:{agent_id}",
+            kind="agent_stream_reset",
+            severity="warning",
+            source=agent_id,
+            title="Agent 本地事件队列已重建",
+            detail=(
+                f"事件流标识由 {previous or '（未标识）'} 变为 {stream_id}。"
+                "序号已从头开始，旧流中尚未发送的事件无法再补投；"
+                "请确认 Agent 数据目录是否被重建或替换。"
+            ),
         )
 
-    def _unregister(self, agent_id: str) -> None:
-        self.connections.pop(agent_id, None)
+    def _unregister(self, connection: AgentConnection) -> None:
+        """Release this connection's registration, if it still holds one.
+
+        Guarded by object identity rather than by agent id: a refused duplicate
+        connection runs its own cleanup while the incumbent is still serving,
+        and evicting the incumbent there is what made a healthy agent read as
+        offline with no way back until it happened to reconnect.
+        """
+        agent_id = connection.agent_id
+        if self.connections.get(agent_id) is not connection:
+            log.debug(
+                "skipping cleanup for a superseded %s connection", agent_id
+            )
+            return
+        del self.connections[agent_id]
+        self._abandon_pending(connection)
         self.db.set_agent_connected(agent_id, False)
         # Capture which modules were up *before* flipping them: the agent's link
         # dropping takes all of them offline at once, and each such edge is what
@@ -311,39 +495,72 @@ class Gateway:
             self._note_device(agent_id, row["name"], False)
         log.info("agent %s disconnected", agent_id)
 
+    def _abandon_pending(self, connection: AgentConnection) -> None:
+        """Fail every command still waiting on a connection that has gone.
+
+        The hardware may well have carried the command out, so the waiter is
+        told the outcome is unknown rather than left holding a future that
+        nothing can complete any more.
+        """
+        for cmd_id, pending in list(self._pending.items()):
+            if (
+                pending.agent_id != connection.agent_id
+                or pending.generation != connection.generation
+            ):
+                continue
+            self._pending.pop(cmd_id, None)
+            if not pending.future.done():
+                pending.future.set_exception(
+                    CommandFailed(
+                        f"agent {connection.agent_id} disconnected before "
+                        f"answering; the result is unknown"
+                    )
+                )
+
     def _note_device(self, agent_id: str, name: str, online: bool) -> None:
         if self.on_device_change is not None and name:
             self.on_device_change(agent_id, name, online)
 
     # -- ingest ------------------------------------------------------------
 
-    async def _ingest(
-        self, agent_id: str, frame: dict[str, Any], websocket: Any
-    ) -> None:
+    async def _ingest(self, connection: AgentConnection, frame: dict[str, Any]) -> None:
+        agent_id = connection.agent_id
         kind = frame["type"]
         seq = frame.get("seq")
 
-        if isinstance(seq, int):
-            # The callback is synchronous on purpose: Database holds one
-            # short transaction and its lock around all persistence writes.
-            # Notifications and alert hooks run only after COMMIT below.
-            fresh, applied = self.db.apply_event(
-                agent_id,
-                seq,
-                kind,
-                lambda: self._apply(agent_id, kind, frame),
-            )
-            if not fresh:
-                log.debug("duplicate %s seq=%d from %s, skipped", kind, seq, agent_id)
-            else:
-                await self._after_apply(agent_id, kind, frame, applied)
-            # Ack either way: a duplicate is still safely delivered.
-            await websocket.send_text(json.dumps({"type": "ack", "seq": seq}))
+        if not _valid_seq(seq):
+            # Unsequenced frames carry no idempotency guarantee, so there is
+            # nothing safe to apply and nothing to acknowledge.
+            if seq is not None:
+                log.warning(
+                    "ignoring %s from %s with invalid seq %r", kind, agent_id, seq
+                )
+            return
+
+        # The callback is synchronous on purpose: Database holds one
+        # short transaction and its lock around all persistence writes.  The
+        # notification *intent* is written in there too, so a committed event
+        # already owes a push; sending it is a queue the notifier drains.
+        # Delivery and alert hooks still run only after COMMIT below.
+        event_key = f"{agent_id}|{connection.stream_id}|{seq}"
+        fresh, applied = self.db.apply_event(
+            agent_id,
+            seq,
+            kind,
+            lambda: self._apply(agent_id, kind, frame, event_key),
+            stream_id=connection.stream_id,
+        )
+        if not fresh:
+            log.debug("duplicate %s seq=%d from %s, skipped", kind, seq, agent_id)
+        else:
+            await self._after_apply(connection, kind, frame, applied)
+        # Ack either way: a duplicate is still safely delivered.
+        await connection.send({"type": "ack", "seq": seq})
 
     def _apply(
-        self, agent_id: str, kind: str, frame: dict[str, Any]
+        self, agent_id: str, kind: str, frame: dict[str, Any], event_key: str = ""
     ) -> AppliedEvent:
-        applied = AppliedEvent()
+        applied = AppliedEvent(event_key=event_key or None)
         if kind == "sms_in":
             applied.message_id = self._apply_sms_in(agent_id, frame)
         elif kind == "sms_out":
@@ -362,28 +579,70 @@ class Gateway:
             applied.command_result = True
         else:
             log.debug("ignoring unknown event kind %r", kind)
+        self._queue_notification(applied, frame)
         return applied
+
+    def _queue_notification(
+        self, applied: AppliedEvent, frame: dict[str, Any]
+    ) -> None:
+        """Record the push this event owes, inside the event's own transaction.
+
+        This is what makes a notification survive the process that received the
+        event: once the transaction commits, the intent is stored, and a restart
+        picks it up.  Doing it after COMMIT instead would leave the gap the acked
+        event cannot close — a duplicate skips the post-commit hooks entirely, so
+        a replay could never make up for a push lost in that window.
+
+        Whether anyone actually wants the push (a rule, a task's own preference,
+        the direction of a call) is decided when the notifier expands the intent.
+        Rule matching runs a regex per rule and has no business inside a
+        transaction that is holding up an ack.
+        """
+        for kind, ref_id in (
+            ("message", applied.message_id),
+            ("task_result", applied.task_id),
+            ("call", applied.call_id),
+        ):
+            if ref_id is None:
+                continue
+            self.db.enqueue_notification(
+                kind,
+                ref_id=ref_id,
+                frame=frame,
+                # One key per (event, kind); an event only ever produces one of
+                # these, but spelling the kind out keeps the key readable in the
+                # table and safe if that ever stops being true.
+                event_key=applied.notify_key(kind),
+            )
 
     async def _after_apply(
         self,
-        agent_id: str,
+        connection: AgentConnection,
         kind: str,
         frame: dict[str, Any],
         applied: AppliedEvent,
     ) -> None:
         """Start non-durable side effects after the event is safely stored."""
+        agent_id = connection.agent_id
         try:
             if applied.command_result:
-                self._resolve_command(frame)
+                self._resolve_command(connection, frame)
             if applied.device_change is not None:
                 device, online = applied.device_change
                 self._note_device(agent_id, device, online)
             if applied.message_id is not None and self.on_message is not None:
-                await self.on_message(applied.message_id, frame)
+                await self.on_message(
+                    applied.message_id, frame, event_key=applied.notify_key("message")
+                )
             if applied.task_id is not None and self.on_task_result is not None:
-                await self.on_task_result(applied.task_id, frame)
+                await self.on_task_result(
+                    applied.task_id, frame,
+                    event_key=applied.notify_key("task_result"),
+                )
             if applied.call_id is not None and self.on_call is not None:
-                await self.on_call(applied.call_id, frame)
+                await self.on_call(
+                    applied.call_id, frame, event_key=applied.notify_key("call")
+                )
         except Exception:
             # Persistence has committed and replaying it cannot repair an
             # in-process callback.  Keep the event durable and log the hook
@@ -710,15 +969,38 @@ class Gateway:
 
     # -- commands ----------------------------------------------------------
 
-    def _resolve_command(self, frame: dict[str, Any]) -> None:
-        cmd_id = frame.get("cmd_id")
-        future = self._pending.pop(str(cmd_id), None)
-        if future is None or future.done():
+    def _resolve_command(
+        self, connection: AgentConnection, frame: dict[str, Any]
+    ) -> None:
+        """Complete the waiting command this result belongs to.
+
+        A result only counts when it comes back over the same session that sent
+        the command.  ``cmd_id`` is short and per-process, so without that check
+        one agent could complete another's pending command — including with a
+        success the caller's own hardware never produced.
+        """
+        cmd_id = str(frame.get("cmd_id"))
+        pending = self._pending.get(cmd_id)
+        if pending is None:
+            return
+        if (
+            pending.agent_id != connection.agent_id
+            or pending.generation != connection.generation
+        ):
+            log.warning(
+                "discarding cmd_result %s from %s: it belongs to %s",
+                cmd_id, connection.agent_id, pending.agent_id,
+            )
+            return
+        self._pending.pop(cmd_id, None)
+        if pending.future.done():
             return
         if frame.get("ok"):
-            future.set_result(frame.get("data") or {})
+            pending.future.set_result(frame.get("data") or {})
         else:
-            future.set_exception(CommandFailed(frame.get("error") or "command failed"))
+            pending.future.set_exception(
+                CommandFailed(frame.get("error") or "command failed")
+            )
 
     async def call(
         self, agent_id: str, frame: dict[str, Any], *, timeout: float = COMMAND_TIMEOUT
@@ -730,7 +1012,9 @@ class Gateway:
 
         cmd_id = "c-" + secrets.token_hex(4)
         future: asyncio.Future = asyncio.get_running_loop().create_future()
-        self._pending[cmd_id] = future
+        self._pending[cmd_id] = _PendingCommand(
+            agent_id=agent_id, generation=connection.generation, future=future
+        )
         try:
             await connection.send({**frame, "cmd_id": cmd_id})
             return await asyncio.wait_for(future, timeout=timeout)
@@ -753,28 +1037,53 @@ class Gateway:
         return next(iter(self.connections), None)
 
     def agent_for_device(self, device_name: str) -> str | None:
+        """The agent owning *device_name*, when exactly one does.
+
+        Legacy name addressing.  Names are unique per agent, not per fleet, so
+        this returns nothing at all where a name is shared: the API resolves
+        modules by row id (``/api/devices/by-id/…``) and reports the candidates
+        instead of picking one, and picking one here is what sent commands to
+        the wrong host's module.
+        """
+        rows = self.db.query(
+            "SELECT agent_id FROM devices WHERE name = ?", (device_name,)
+        )
+        if len(rows) == 1:
+            return rows[0]["agent_id"]
+        if rows:
+            log.warning(
+                "device name %s is used by %d agents; refusing to guess",
+                device_name, len(rows),
+            )
+            return None
+        # Not in the table yet: a module reported in a hello that has not been
+        # persisted is still addressable while its connection is up.
         for agent_id, connection in self.connections.items():
             if any(d.get("name") == device_name for d in connection.devices):
                 return agent_id
-        row = self.db.one(
-            "SELECT agent_id FROM devices WHERE name = ?", (device_name,)
-        )
-        return row["agent_id"] if row else None
+        return None
 
     # -- keep-alive tasks --------------------------------------------------
 
     def tasks_for(self, agent_id: str) -> list[dict[str, Any]]:
         """This agent's keep-alive tasks, in ``sync_tasks`` wire form.
 
-        Ownership is by ``agent_id`` when the row carries one, and by which
-        agent currently owns the named device otherwise — a task created from
-        the UI only names a device.
+        Ownership comes from the row's own identities — ``agent_id``, else the
+        module id it points at.  Only rows old enough to carry neither fall back
+        to the name, and an ambiguous name is owned by nobody: sending a task to
+        every agent that happens to have a module of that name would have each
+        of them sending the same SMS on the same schedule.
         """
         tasks = []
         for row in self.db.query("SELECT * FROM tasks ORDER BY id"):
-            owner = row.get("agent_id") or self.agent_for_device(
-                row.get("device", "")
-            )
+            owner = str(row.get("agent_id") or "")
+            if not owner and row.get("device_id"):
+                owned = self.db.one(
+                    "SELECT agent_id FROM devices WHERE id = ?", (row["device_id"],)
+                )
+                owner = str((owned or {}).get("agent_id") or "")
+            if not owner:
+                owner = self.agent_for_device(str(row.get("device") or "")) or ""
             if owner != agent_id:
                 continue
             tasks.append({

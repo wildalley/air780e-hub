@@ -11,7 +11,9 @@ from hub_server import db as db_module
 from hub_server.db import (
     SCHEMA,
     SCHEMA_VERSION,
+    BadCursor,
     Database,
+    MessageScope,
     MigrationFailed,
     SchemaTooNew,
     utcnow,
@@ -860,7 +862,7 @@ def test_a_salvaged_message_round_trips_and_is_searchable(tmp_path):
             "recovered_code": "314159",
         }
 
-        found = database.messages(search="314159")
+        found = database.messages(MessageScope(search="314159"))
         assert [m["id"] for m in found] == [damaged]
 
         thread = database.conversations()[0]
@@ -899,6 +901,49 @@ def test_message_read_paths_use_the_new_indexes(tmp_path):
         assert "ts>?" in trend_details
     finally:
         database.close()
+
+
+def test_a_scope_spells_the_three_card_cases_apart():
+    """"Every card", "this card" and "no card" must not share a spelling.
+
+    The `IS NULL` form is the one that used to be missing: the list read a null
+    card as "no filter" and the read path as `IS NULL`, so the two disagreed
+    about which rows a card-less thread contains.
+    """
+    everything, _ = MessageScope().where()
+    assert everything == ""
+
+    unassigned, params = MessageScope(sim="unassigned", peer="10086").where()
+    assert unassigned == "WHERE m.sim_id IS NULL AND m.peer = ?"
+    assert params == ["10086"]
+
+    carded, params = MessageScope(sim=7).where()
+    assert carded == "WHERE m.sim_id = ?"
+    assert params == [7]
+
+    # `UPDATE messages` cannot be aliased, and mark-read has to be able to
+    # build the very same condition.
+    bare, _ = MessageScope(sim="unassigned").where(alias="")
+    assert bare == "WHERE sim_id IS NULL"
+
+
+def test_a_history_cursor_round_trips_and_refuses_a_foreign_filter():
+    scope = MessageScope(sim=3, peer="10086")
+    cursor = scope.cursor({"id": 42, "ts": "2026-08-16T00:00:00+00:00"})
+    assert scope.parse_cursor(cursor) == ("2026-08-16T00:00:00+00:00", 42)
+
+    for stranger in (
+        MessageScope(sim=4, peer="10086"),
+        MessageScope(sim=3, peer="95555"),
+        MessageScope(sim=3, peer="10086", content="text"),
+        MessageScope(sim="unassigned", peer="10086"),
+    ):
+        with pytest.raises(BadCursor):
+            stranger.parse_cursor(cursor)
+
+    for bad in ("", "!!!", "A" * 200, cursor[:-2]):
+        with pytest.raises(BadCursor):
+            scope.parse_cursor(bad)
 
 
 def test_sim_lifecycle_incidents_warn_escalate_and_resolve_independently(tmp_path):

@@ -43,7 +43,15 @@ import {
 export type SignalStatusSample = Pick<StatusPoint, 'ts' | 'online' | 'registered' | 'dbm'>
 
 export interface SignalSeries {
-  name: string
+  /**
+   * Fleet-unique series identity — the module's row id as a string.
+   *
+   * It is the recharts `dataKey` and the React key, so it has to be unique
+   * across the whole chart: two agents can each have a module named `modem-1`,
+   * and keying on the name collapsed both into one line.  `label` is what the
+   * reader sees.
+   */
+  id: string
   label: string
   index: number
   points: StatusPoint[]
@@ -106,7 +114,7 @@ function buildSamples(series: SignalSeries[]): Map<string, TimedSample[]> {
       if (Number.isFinite(t)) byTime.set(t, item.current)
     }
     output.set(
-      item.name,
+      item.id,
       [...byTime.entries()]
         .sort(([a], [b]) => a - b)
         .map(([t, sample]) => ({ t, sample })),
@@ -124,15 +132,15 @@ function buildRows(
 ): Row[] {
   const byTime = new Map<number, Row>()
   for (const item of series) {
-    for (const { t, sample } of samples.get(item.name) ?? []) {
+    for (const { t, sample } of samples.get(item.id) ?? []) {
       if (t < rangeStart || t > rangeEnd) continue
       let row = byTime.get(t)
       if (!row) {
         row = { t }
         byTime.set(t, row)
       }
-      row[item.name] = sample.dbm
-      row[statusKey(item.name)] = registrationState(sample)
+      row[item.id] = sample.dbm
+      row[statusKey(item.id)] = registrationState(sample)
     }
   }
   return [...byTime.values()].sort((a, b) => a.t - b.t)
@@ -238,7 +246,7 @@ function RegistrationTimeline({
 
       <Stack spacing={1.5}>
         {rows.map((row) => (
-          <Box key={row.series.name}>
+          <Box key={row.series.id}>
             <Stack
               direction="row"
               spacing={1}
@@ -346,7 +354,7 @@ export function SignalChart({ series, hours, onHoursChange }: Props) {
   const timelines = useMemo<TimelineRow[]>(
     () =>
       series.map((item) => {
-        const itemSamples = samples.get(item.name) ?? []
+        const itemSamples = samples.get(item.id) ?? []
         const intervals = buildRegistrationIntervals(
           itemSamples.map(({ sample }) => sample),
           rangeStart,
@@ -364,7 +372,7 @@ export function SignalChart({ series, hours, onHoursChange }: Props) {
 
   const domain = useMemo<[number, number]>(() => {
     const values = rows.flatMap((row) =>
-      series.map((item) => row[item.name]).filter((value): value is number => typeof value === 'number'),
+      series.map((item) => row[item.id]).filter((value): value is number => typeof value === 'number'),
     )
     if (!values.length) return [-113, -51]
     const min = Math.floor(Math.min(...values) / 10) * 10 - 5
@@ -375,12 +383,12 @@ export function SignalChart({ series, hours, onHoursChange }: Props) {
   const latest = useMemo(() => {
     const output = new Map<string, SignalStatusSample | null>()
     for (const item of series) {
-      output.set(item.name, samples.get(item.name)?.at(-1)?.sample ?? null)
+      output.set(item.id, samples.get(item.id)?.at(-1)?.sample ?? null)
     }
     return output
   }, [samples, series])
 
-  const hasSignal = rows.some((row) => series.some((item) => typeof row[item.name] === 'number'))
+  const hasSignal = rows.some((row) => series.some((item) => typeof row[item.id] === 'number'))
 
   return (
     <Card>
@@ -426,10 +434,10 @@ export function SignalChart({ series, hours, onHoursChange }: Props) {
 
         <Stack direction="row" spacing={3} useFlexGap sx={{ mb: 2, flexWrap: 'wrap', rowGap: 1 }}>
           {series.map((item) => {
-            const current = latest.get(item.name)
+            const current = latest.get(item.id)
             const state = current ? registrationState(current) : 'unknown'
             return (
-              <Stack key={item.name} direction="row" spacing={1} sx={{ alignItems: 'center' }}>
+              <Stack key={item.id} direction="row" spacing={1} sx={{ alignItems: 'center' }}>
                 <Box
                   aria-hidden
                   sx={{
@@ -507,11 +515,11 @@ export function SignalChart({ series, hours, onHoursChange }: Props) {
                             {formatTime(time, hours)}
                           </Typography>
                           {series.map((item) => {
-                            const point = sampleAt(samples.get(item.name) ?? [], time)
+                            const point = sampleAt(samples.get(item.id) ?? [], time)
                             const state = point ? registrationState(point) : 'unknown'
                             return (
                               <Stack
-                                key={item.name}
+                                key={item.id}
                                 direction="row"
                                 spacing={1}
                                 sx={{ mt: 0.25, alignItems: 'center' }}
@@ -545,9 +553,9 @@ export function SignalChart({ series, hours, onHoursChange }: Props) {
                   />
                   {series.map((item) => (
                     <Line
-                      key={item.name}
+                      key={item.id}
                       type="monotone"
-                      dataKey={item.name}
+                      dataKey={item.id}
                       name={item.label}
                       stroke={seriesColor(mode, item.index)}
                       strokeWidth={2}
@@ -576,7 +584,7 @@ export function SignalChart({ series, hours, onHoursChange }: Props) {
                 <TableRow>
                   <TableCell>时间</TableCell>
                   {series.map((item) => (
-                    <TableCell key={item.name} align="right">
+                    <TableCell key={item.id} align="right">
                       {item.label}
                     </TableCell>
                   ))}
@@ -587,10 +595,10 @@ export function SignalChart({ series, hours, onHoursChange }: Props) {
                   <TableRow key={row.t}>
                     <TableCell>{formatTime(row.t, hours)}</TableCell>
                     {series.map((item) => {
-                      const state = row[statusKey(item.name)] as RegistrationState | undefined
-                      const value = row[item.name]
+                      const state = row[statusKey(item.id)] as RegistrationState | undefined
+                      const value = row[item.id]
                       return (
-                        <TableCell key={item.name} align="right">
+                        <TableCell key={item.id} align="right">
                           <Typography variant="body2">
                             {typeof value === 'number' ? `${value} dBm` : '—'}
                           </Typography>

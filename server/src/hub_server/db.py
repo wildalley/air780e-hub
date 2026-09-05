@@ -13,15 +13,18 @@ single-modem model.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import logging
 import sqlite3
 import threading
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +48,8 @@ log = logging.getLogger(__name__)
 # Version 12 records packet-data attachment, PDP state, and roaming policy.
 # Version 13 records the Agent's effective local data policy separately from
 # the modem's packet attachment and PDP state.
+# Version 16 makes a notification owed by a stored event durable, so a restart
+# resumes it instead of losing it with the process.
 #
 # To add a migration: append one entry to ``MIGRATIONS`` with the next integer
 # and bump this constant, and add the same columns/tables/indexes to SCHEMA so a brand
@@ -54,7 +59,7 @@ log = logging.getLogger(__name__)
 # Never renumber or edit a released entry — a database that already ran it will
 # not run it again, so an edit only affects databases that have not, and the two
 # then disagree about what version N means.
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 16
 
 # Persisted (settings table) key for the SMS retention window, in days.  The
 # operator edits it on the Notify page; when unset the env default applies.
@@ -89,17 +94,24 @@ CREATE TABLE IF NOT EXISTS agents (
     protocol_version INTEGER NOT NULL DEFAULT 0,
     last_seen_at TEXT,
     connected    INTEGER NOT NULL DEFAULT 0,
-    last_seq     INTEGER NOT NULL DEFAULT 0
+    last_seq     INTEGER NOT NULL DEFAULT 0,
+    -- The agent's local event store has an identity of its own, reported at
+    -- hello.  Sequence numbers are only unique *within* one store: rebuild the
+    -- agent's data directory and numbering restarts at 1 while this server
+    -- still holds the old numbers, so the two together are what identifies an
+    -- event.  Empty for an agent old enough not to report one.
+    stream_id    TEXT NOT NULL DEFAULT ''
 );
 
 -- Every event the agent sends is recorded in the same transaction that
 -- applies it, so a replay after a lost ack cannot duplicate a message.
 CREATE TABLE IF NOT EXISTS ingested (
-    agent_id TEXT NOT NULL,
-    seq      INTEGER NOT NULL,
-    kind     TEXT NOT NULL,
-    at       TEXT NOT NULL,
-    PRIMARY KEY (agent_id, seq)
+    agent_id  TEXT NOT NULL,
+    stream_id TEXT NOT NULL DEFAULT '',
+    seq       INTEGER NOT NULL,
+    kind      TEXT NOT NULL,
+    at        TEXT NOT NULL,
+    PRIMARY KEY (agent_id, stream_id, seq)
 );
 
 CREATE TABLE IF NOT EXISTS sims (
@@ -320,12 +332,81 @@ CREATE TABLE IF NOT EXISTS notify_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_notify_ts ON notify_logs(ts DESC);
 
+-- A notification that is owed because an event was stored.  Written in the same
+-- transaction as the event itself, so a COMMIT is already a promise to notify:
+-- delivery no longer depends on one in-process callback surviving the moment.
+CREATE TABLE IF NOT EXISTS notify_outbox (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL,
+    -- The row this is about: messages.id, tasks.id or calls.id by kind.
+    ref_id      INTEGER,
+    -- The agent event this came from, as "agent|stream|seq".  Unique so a
+    -- replay after a lost ack cannot queue the same push twice.  NULL for
+    -- intents the server raises itself, which have no event to be idempotent
+    -- against and are deduplicated by their caller or not at all.
+    event_key   TEXT,
+    -- The frame as received, kept so the text can still be rendered after a
+    -- restart -- the process that held it in memory is gone by then.
+    frame       TEXT NOT NULL DEFAULT '{}',
+    -- Rendered once at expansion for the kinds whose text does not depend on a
+    -- channel template, so a later attempt sends what the event said, not what
+    -- the row happens to say now.
+    title       TEXT NOT NULL DEFAULT '',
+    body        TEXT NOT NULL DEFAULT '',
+    -- pending -> expanded (deliveries exist) | skipped (nothing to send)
+    status      TEXT NOT NULL DEFAULT 'pending',
+    created_at  TEXT NOT NULL,
+    expanded_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_notify_outbox_event
+    ON notify_outbox(event_key) WHERE event_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_notify_outbox_status ON notify_outbox(status, id);
+
+-- One row per (intent, channel, rule): the unit that is attempted, retried and
+-- eventually given up on.  ``notify_logs`` remains the audit trail of finished
+-- attempts; this table is the work still owed, and it survives a restart.
+CREATE TABLE IF NOT EXISTS notify_deliveries (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    outbox_id   INTEGER NOT NULL REFERENCES notify_outbox(id) ON DELETE CASCADE,
+    channel_id  INTEGER NOT NULL REFERENCES channels(id) ON DELETE CASCADE,
+    -- CASCADE, not SET NULL: a deleted rule is the reason this push existed, and
+    -- nulling it would also let two deliveries collide on the unique index below
+    -- in the middle of an unrelated rule deletion.
+    rule_id     INTEGER REFERENCES rules(id) ON DELETE CASCADE,
+    -- pending -> ok | failed (given up) | expired (too old to be worth sending)
+    status      TEXT NOT NULL DEFAULT 'pending',
+    attempts    INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT NOT NULL,
+    -- A claim, not a state: the worker stamps these while it is sending, and a
+    -- process that dies mid-send leaves a lease that simply expires, so the row
+    -- is picked up again instead of sitting in a "leased" state forever.
+    lease_owner TEXT,
+    lease_until TEXT,
+    error_code  TEXT,
+    safe_detail TEXT NOT NULL DEFAULT '',
+    expires_at  TEXT,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+-- Expanding the same intent twice must not double-send.  SQLite counts NULLs as
+-- distinct in a UNIQUE constraint, so a rule-less delivery (a task receipt, a
+-- call) needs IFNULL here or every re-expansion would insert another copy.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_notify_deliveries_target
+    ON notify_deliveries(outbox_id, channel_id, IFNULL(rule_id, 0));
+CREATE INDEX IF NOT EXISTS idx_notify_deliveries_due
+    ON notify_deliveries(status, next_attempt_at);
+
 CREATE TABLE IF NOT EXISTS tasks (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     name             TEXT NOT NULL DEFAULT '',
     sim_id           INTEGER REFERENCES sims(id) ON DELETE CASCADE,
     device           TEXT NOT NULL DEFAULT '',
     agent_id         TEXT NOT NULL DEFAULT '',
+    -- The module this task runs on, by row identity.  ``device``/``agent_id``
+    -- stay for the wire frame and for history, but a name is only unique
+    -- within one agent, so routing by name alone can pick the wrong module
+    -- once two hosts each have a ``modem-1``.
+    device_id        INTEGER REFERENCES devices(id) ON DELETE SET NULL,
     enabled          INTEGER NOT NULL DEFAULT 1,
     action           TEXT NOT NULL DEFAULT 'send_sms',
     target_number    TEXT NOT NULL DEFAULT '10086',
@@ -438,6 +519,41 @@ def to_utc_iso(value: str | None) -> str:
     return parsed.astimezone(UTC).isoformat(timespec="seconds")
 
 
+# How much of a provider's complaint is worth keeping on a queued delivery.
+# Long enough for a real reason, short enough that a provider echoing the whole
+# payload back cannot bloat the queue.
+DETAIL_LIMIT = 300
+
+
+def _shift(moment: str, seconds: float) -> str:
+    """``moment`` moved by ``seconds``, in the same string form as ``utcnow``."""
+    try:
+        parsed = datetime.fromisoformat(moment)
+    except ValueError:
+        parsed = datetime.now(UTC)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return (parsed + timedelta(seconds=seconds)).astimezone(UTC).isoformat(
+        timespec="seconds"
+    )
+
+
+def _age_seconds(at: str | None, now: str) -> int | None:
+    """How long ago ``at`` was, or None if there is nothing there."""
+    if not at:
+        return None
+    try:
+        then = datetime.fromisoformat(at)
+        moment = datetime.fromisoformat(now)
+    except ValueError:
+        return None
+    if then.tzinfo is None:
+        then = then.replace(tzinfo=UTC)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return max(0, int((moment - then).total_seconds()))
+
+
 def _pdu_is_data(raw_pdu: str) -> bool:
     """Classify a stored inbound PDU without decoding its user data as text."""
     try:
@@ -495,6 +611,124 @@ def _pdu_is_data(raw_pdu: str) -> bool:
             return True
         cursor = element_end
     return False
+
+
+class BadCursor(ValueError):
+    """A history cursor that this filter cannot page with."""
+
+
+@dataclass(frozen=True, slots=True)
+class MessageScope:
+    """Which messages a read is about — one condition object, shared.
+
+    ``sim`` is the point.  A card used to be an ``int | None`` where ``None``
+    carried two different meanings depending on who read it: the list treated
+    it as "every card", ``mark_read`` as ``sim_id IS NULL``.  Opening the
+    thread of a card-less message therefore listed another card's messages
+    from the same number, while marking read touched only the card-less ones.
+    The three cases are now spelled apart — a card id, ``"all"``, and
+    ``"unassigned"`` — and every read of the table (body, total, export,
+    unread, mark-read) builds its SQL from this one object.
+    """
+
+    sim: int | Literal["all", "unassigned"] = "all"
+    direction: str | None = None
+    peer: str | None = None
+    search: str | None = None
+    content: str | None = None
+
+    def where(self, *, alias: str = "m") -> tuple[str, list[Any]]:
+        """``WHERE`` clause and positional parameters for this scope.
+
+        ``alias`` is empty for ``UPDATE messages``, which SQLite does not let
+        us alias — the same clause has to serve both statements or the read
+        and the write drift apart again.
+        """
+        column = f"{alias}." if alias else ""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if self.sim == "unassigned":
+            clauses.append(f"{column}sim_id IS NULL")
+        elif self.sim != "all":
+            clauses.append(f"{column}sim_id = ?")
+            params.append(self.sim)
+        if self.direction:
+            clauses.append(f"{column}direction = ?")
+            params.append(self.direction)
+        if self.peer:
+            clauses.append(f"{column}peer = ?")
+            params.append(self.peer)
+        if self.search:
+            # The salvaged fragment is searched alongside the body: on a damaged
+            # message `body` is mojibake, so a search for the code that *was*
+            # recovered would otherwise find nothing.
+            clauses.append(
+                f"({column}body LIKE ? OR {column}peer LIKE ? "
+                f"OR {column}recovered_body LIKE ? OR {column}recovered_code LIKE ?)"
+            )
+            params.extend([f"%{self.search}%"] * 4)
+        if self.content == "text":
+            clauses.append(f"{column}is_binary = 0")
+        elif self.content == "data":
+            clauses.append(f"{column}is_binary = 1")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return where, params
+
+    @property
+    def fingerprint(self) -> str:
+        """Short digest of the filter, carried inside this scope's cursors.
+
+        A cursor is a position in one ordered result.  Handed to a different
+        filter it points somewhere meaningless — pages would silently skip or
+        repeat — so the filter it came from travels with it and a mismatch is
+        an error rather than a wrong page.
+        """
+        canonical = json.dumps(
+            [self.sim, self.direction, self.peer, self.search, self.content],
+            ensure_ascii=False, sort_keys=True,
+        )
+        return hashlib.blake2s(canonical.encode(), digest_size=4).hexdigest()
+
+    def cursor(self, row: Mapping[str, Any]) -> str:
+        """Opaque position of ``row`` in this scope's ordering."""
+        payload = f"1|{self.fingerprint}|{int(row['id'])}|{row['ts']}"
+        return base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+
+    def parse_cursor(self, text: str) -> tuple[str, int]:
+        """``(ts, id)`` from one of this scope's cursors.
+
+        Deliberately strict — length, alphabet, field count, and the filter
+        digest are all checked.  A cursor is client-supplied text that ends up
+        in an ordering comparison, and "close enough" would mean paging from a
+        position this query never produced.
+        """
+        if not text or len(text) > 160:
+            raise BadCursor("cursor length")
+        padded = text + "=" * (-len(text) % 4)
+        try:
+            payload = base64.urlsafe_b64decode(padded.encode("ascii")).decode()
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise BadCursor("cursor encoding") from exc
+        parts = payload.split("|", 3)
+        if len(parts) != 4:
+            raise BadCursor("cursor fields")
+        version, fingerprint, raw_id, ts = parts
+        if version != "1":
+            raise BadCursor("cursor version")
+        if fingerprint != self.fingerprint:
+            raise BadCursor("cursor filter")
+        if not raw_id.isdigit() or len(raw_id) > 19:
+            raise BadCursor("cursor id")
+        if len(ts) > 40:
+            raise BadCursor("cursor timestamp")
+        try:
+            # Parsed, not merely measured: a cursor truncated in transit still
+            # base64-decodes, and a clipped timestamp would page from a moment
+            # that never existed.
+            datetime.fromisoformat(ts)
+        except ValueError as exc:
+            raise BadCursor("cursor timestamp") from exc
+        return ts, int(raw_id)
 
 
 class Database:
@@ -615,6 +849,12 @@ class Database:
          "_migration_data_controls"),
         (13, "record the effective local packet-data policy",
          "_migration_data_policy"),
+        (14, "identify Agent events by their local event-stream epoch",
+         "_migration_event_stream_epoch"),
+        (15, "address keep-alive tasks by module row rather than by name",
+         "_migration_task_device_id"),
+        (16, "persist the notifications a stored event owes",
+         "_migration_notify_outbox"),
     )
 
     def _add_columns_if_missing(self, table: str, columns: dict[str, str]) -> None:
@@ -834,6 +1074,169 @@ class Database:
             {"data_enabled": "INTEGER NOT NULL DEFAULT 0"},
         )
 
+    def _migration_event_stream_epoch(self) -> None:
+        """v13 -> v14: make an event's identity include which store it came from.
+
+        ``seq`` is an autoincrement in the agent's own SQLite file, so it is
+        unique inside that file and nowhere else.  Rebuild the agent's data
+        directory — a reinstall, a wiped volume, a restored host — and numbering
+        starts over at 1 while this server still holds rows for 1..N of the old
+        store.  Keyed on ``(agent_id, seq)`` alone, every event of the new store
+        reads back as an already-applied duplicate and is acked without ever
+        being applied: silent, permanent data loss for as long as the new
+        sequence stays below the old high-water mark.
+
+        Existing rows keep the empty stream id, which is exactly what an agent
+        that does not report one sends, so their dedupe behaviour is unchanged.
+        """
+        self._add_columns_if_missing(
+            "agents", {"stream_id": "TEXT NOT NULL DEFAULT ''"}
+        )
+        columns = {
+            row[1] for row in self._db.execute("PRAGMA table_info(ingested)")
+        }
+        if "stream_id" in columns:
+            return
+        # The primary key itself has to change, which SQLite only does by
+        # rebuilding.  Several statements, no executescript: the step must stay
+        # inside the transaction ``_run_step`` opened around it.
+        self._db.execute(
+            "CREATE TABLE ingested_v14 ("
+            "  agent_id  TEXT NOT NULL,"
+            "  stream_id TEXT NOT NULL DEFAULT '',"
+            "  seq       INTEGER NOT NULL,"
+            "  kind      TEXT NOT NULL,"
+            "  at        TEXT NOT NULL,"
+            "  PRIMARY KEY (agent_id, stream_id, seq)"
+            ")"
+        )
+        self._db.execute(
+            "INSERT INTO ingested_v14 (agent_id, stream_id, seq, kind, at) "
+            "SELECT agent_id, '', seq, kind, at FROM ingested"
+        )
+        self._db.execute("DROP TABLE ingested")
+        self._db.execute("ALTER TABLE ingested_v14 RENAME TO ingested")
+
+    def _migration_task_device_id(self) -> None:
+        """v14 -> v15: pin each keep-alive task to a module row.
+
+        ``devices`` is unique on ``(agent_id, name)``, so a bare device name
+        stops being an address as soon as two agents each have a ``modem-1``.
+        Back-fill only where the name resolves to exactly one module; an
+        ambiguous task is disabled and reported rather than pointed at a guess,
+        because guessing here means sending a real SMS from the wrong SIM.
+        """
+        self._add_columns_if_missing(
+            "tasks",
+            {"device_id": "INTEGER REFERENCES devices(id) ON DELETE SET NULL"},
+        )
+        rows = self._db.execute(
+            "SELECT id, device, agent_id FROM tasks WHERE device <> ''"
+        ).fetchall()
+        ambiguous: list[str] = []
+        for row in rows:
+            if row["agent_id"]:
+                matches = self._db.execute(
+                    "SELECT id FROM devices WHERE name = ? AND agent_id = ?",
+                    (row["device"], row["agent_id"]),
+                ).fetchall()
+            else:
+                matches = self._db.execute(
+                    "SELECT id FROM devices WHERE name = ?", (row["device"],)
+                ).fetchall()
+            if len(matches) == 1:
+                self._db.execute(
+                    "UPDATE tasks SET device_id = ?, agent_id = "
+                    "(SELECT agent_id FROM devices WHERE id = ?) WHERE id = ?",
+                    (matches[0]["id"], matches[0]["id"], row["id"]),
+                )
+            elif len(matches) > 1:
+                self._db.execute(
+                    "UPDATE tasks SET enabled = 0 WHERE id = ?", (row["id"],)
+                )
+                ambiguous.append(f"#{row['id']} {row['device']}")
+        if ambiguous:
+            # ``open_incident`` runs on the same connection and does not commit,
+            # so it stays inside this step's transaction.
+            self.open_incident(
+                "task-device-ambiguous",
+                kind="task_device_ambiguous",
+                severity="warning",
+                source="migration",
+                title="保号任务的目标模块无法唯一确定",
+                detail=(
+                    "以下任务的设备名在多个 Agent 上都存在，已暂停以避免发到错误的卡，"
+                    "请在任务页重新指定模块后启用：" + "、".join(ambiguous)
+                ),
+            )
+            log.warning(
+                "%d keep-alive task(s) disabled: ambiguous device name", len(ambiguous)
+            )
+
+    def _migration_notify_outbox(self) -> None:
+        """v15 -> v16: make an owed notification survive the process.
+
+        Nothing is backfilled.  The intents this table would hold for past
+        events are precisely the pushes that already went out (or already
+        failed) in a process that is gone; recreating them from ``messages``
+        would re-send every SMS in the retention window at once.  The audit
+        trail of what happened before this point stays in ``notify_logs``.
+        """
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS notify_outbox (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind        TEXT NOT NULL,
+                ref_id      INTEGER,
+                event_key   TEXT,
+                frame       TEXT NOT NULL DEFAULT '{}',
+                title       TEXT NOT NULL DEFAULT '',
+                body        TEXT NOT NULL DEFAULT '',
+                status      TEXT NOT NULL DEFAULT 'pending',
+                created_at  TEXT NOT NULL,
+                expanded_at TEXT
+            )
+            """
+        )
+        self._db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_notify_outbox_event "
+            "ON notify_outbox(event_key) WHERE event_key IS NOT NULL"
+        )
+        self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notify_outbox_status "
+            "ON notify_outbox(status, id)"
+        )
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS notify_deliveries (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                outbox_id   INTEGER NOT NULL
+                            REFERENCES notify_outbox(id) ON DELETE CASCADE,
+                channel_id  INTEGER NOT NULL
+                            REFERENCES channels(id) ON DELETE CASCADE,
+                rule_id     INTEGER REFERENCES rules(id) ON DELETE CASCADE,
+                status      TEXT NOT NULL DEFAULT 'pending',
+                attempts    INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at TEXT NOT NULL,
+                lease_owner TEXT,
+                lease_until TEXT,
+                error_code  TEXT,
+                safe_detail TEXT NOT NULL DEFAULT '',
+                expires_at  TEXT,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL
+            )
+            """
+        )
+        self._db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_notify_deliveries_target "
+            "ON notify_deliveries(outbox_id, channel_id, IFNULL(rule_id, 0))"
+        )
+        self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notify_deliveries_due "
+            "ON notify_deliveries(status, next_attempt_at)"
+        )
+
     def _snapshot_before_migration(self, from_version: int) -> Path | None:
         """Copy the database aside before migrating it.
 
@@ -961,21 +1364,29 @@ class Database:
         seq: int,
         kind: str,
         apply: Callable[[], Any],
+        *,
+        stream_id: str = "",
     ) -> tuple[bool, Any]:
         """Claim and apply one Agent event atomically.
 
-        ``(agent_id, seq)`` is durable only if every business write made by
-        ``apply`` commits with it.  A transient failure rolls the whole event
-        back, allowing the Agent to replay it after the connection drops.
+        ``(agent_id, stream_id, seq)`` is durable only if every business write
+        made by ``apply`` commits with it.  A transient failure rolls the whole
+        event back, allowing the Agent to replay it after the connection drops.
         Returns ``(False, None)`` for an already committed replay.
+
+        ``stream_id`` names the agent's local event store.  It belongs in the
+        key because ``seq`` restarts from 1 whenever that store is rebuilt, and
+        without it the new store's events would be mistaken for replays of the
+        old one's.  An agent that reports no stream id keeps the empty value, so
+        its numbering is compared only against its own history.
         """
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
                 cursor = self._db.execute(
-                    "INSERT OR IGNORE INTO ingested (agent_id, seq, kind, at) "
-                    "VALUES (?, ?, ?, ?)",
-                    (agent_id, seq, kind, utcnow()),
+                    "INSERT OR IGNORE INTO ingested "
+                    "(agent_id, stream_id, seq, kind, at) VALUES (?, ?, ?, ?, ?)",
+                    (agent_id, stream_id, seq, kind, utcnow()),
                 )
                 if cursor.rowcount == 0:
                     # Older databases did not maintain agents.last_seq.  A
@@ -1005,16 +1416,23 @@ class Database:
     # -- agents and devices ------------------------------------------------
 
     def upsert_agent(
-        self, agent_id: str, version: str, protocol_version: int, connected: bool
+        self,
+        agent_id: str,
+        version: str,
+        protocol_version: int,
+        connected: bool,
+        *,
+        stream_id: str = "",
     ) -> None:
         self.execute(
             "INSERT INTO agents "
-            "(id, version, protocol_version, last_seen_at, connected) "
-            "VALUES (?, ?, ?, ?, ?) "
+            "(id, version, protocol_version, last_seen_at, connected, stream_id) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(id) DO UPDATE SET version = excluded.version, "
             "protocol_version = excluded.protocol_version, "
-            "last_seen_at = excluded.last_seen_at, connected = excluded.connected",
-            (agent_id, version, protocol_version, utcnow(), int(connected)),
+            "last_seen_at = excluded.last_seen_at, connected = excluded.connected, "
+            "stream_id = excluded.stream_id",
+            (agent_id, version, protocol_version, utcnow(), int(connected), stream_id),
         )
 
     def set_agent_connected(self, agent_id: str, connected: bool) -> None:
@@ -1801,15 +2219,27 @@ class Database:
             params,
         )
 
-    def mark_read(self, *, sim_id: int | None, peer: str) -> int:
-        """Mark one conversation's incoming messages as read; returns count."""
+    def mark_read(
+        self, scope: MessageScope, *, through_id: int | None = None
+    ) -> int:
+        """Mark one thread's incoming messages read; returns how many.
+
+        ``through_id`` is the watermark the client actually saw.  Without it a
+        message that lands between the render and this request would be marked
+        read before anyone read it, which is how a verification code goes
+        missing: it never appears as unread anywhere.
+        """
+        where, params = scope.where(alias="")
+        clause = f"{where} AND " if where else "WHERE "
+        watermark = ""
+        if through_id is not None:
+            watermark = " AND id <= ?"
         now = utcnow()
         with self._lock:
             cur = self._db.execute(
-                "UPDATE messages SET read_at = ? "
-                "WHERE direction = 'in' AND read_at IS NULL "
-                "  AND peer = ? AND sim_id IS ?",
-                (now, peer, sim_id),
+                f"UPDATE messages SET read_at = ? {clause}"
+                f"direction = 'in' AND read_at IS NULL{watermark}",
+                (now, *params, *([through_id] if through_id is not None else [])),
             )
         return cur.rowcount
 
@@ -1822,19 +2252,28 @@ class Database:
 
     def messages(
         self,
+        scope: MessageScope | None = None,
         *,
         limit: int | None = 50,
         offset: int = 0,
-        sim_id: int | None = None,
-        direction: str | None = None,
-        peer: str | None = None,
-        search: str | None = None,
-        content: str | None = None,
+        before: str | None = None,
     ) -> list[dict[str, Any]]:
-        where, params = self._message_filter(
-            sim_id=sim_id, direction=direction, peer=peer, search=search,
-            content=content,
-        )
+        """Newest first.  ``before`` pages older than one of this scope's cursors.
+
+        Offset paging is kept for the tables that show a page number; a thread
+        transcript uses the cursor instead, because an offset boundary gaps or
+        repeats when a message arrives mid-scroll.
+        """
+        scope = scope or MessageScope()
+        where, params = scope.where()
+        if before is not None:
+            ts, row_id = scope.parse_cursor(before)
+            # Matching ORDER BY (ts DESC, id DESC): equal timestamps are common
+            # — a multipart SMS stores every segment with one SCTS — so the id
+            # has to break the tie here exactly as it does in the ordering.
+            keyword = "AND" if where else "WHERE"
+            where = f"{where} {keyword} (m.ts < ? OR (m.ts = ? AND m.id < ?))"
+            params.extend([ts, ts, row_id])
         sql = (
             "SELECT m.*, s.label AS sim_label, s.iccid AS sim_iccid "
             "FROM messages m LEFT JOIN sims s ON s.id = m.sim_id "
@@ -1845,51 +2284,11 @@ class Database:
             params.extend([limit, offset])
         return self.query(sql, tuple(params))
 
-    @staticmethod
-    def _message_filter(
-        *,
-        sim_id: int | None = None,
-        direction: str | None = None,
-        peer: str | None = None,
-        search: str | None = None,
-        content: str | None = None,
-    ) -> tuple[str, list[Any]]:
-        clauses: list[str] = []
-        params: list[Any] = []
-        if sim_id is not None:
-            clauses.append("m.sim_id = ?")
-            params.append(sim_id)
-        if direction:
-            clauses.append("m.direction = ?")
-            params.append(direction)
-        if peer:
-            clauses.append("m.peer = ?")
-            params.append(peer)
-        if search:
-            # The salvaged fragment is searched alongside the body: on a damaged
-            # message `body` is mojibake, so a search for the code that *was*
-            # recovered would otherwise find nothing.
-            clauses.append(
-                "(m.body LIKE ? OR m.peer LIKE ? OR m.recovered_body LIKE ? "
-                " OR m.recovered_code LIKE ?)"
-            )
-            params.extend([f"%{search}%"] * 4)
-        if content == "text":
-            clauses.append("m.is_binary = 0")
-        elif content == "data":
-            clauses.append("m.is_binary = 1")
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        return where, params
-
     def iter_messages(
         self,
+        scope: MessageScope | None = None,
         *,
         limit: int | None = None,
-        sim_id: int | None = None,
-        direction: str | None = None,
-        peer: str | None = None,
-        search: str | None = None,
-        content: str | None = None,
         batch_size: int = 500,
     ) -> Iterable[dict[str, Any]]:
         """Stream a stable read without retaining every message in memory.
@@ -1898,21 +2297,12 @@ class Database:
         writes while a large export is being downloaded. In-memory databases
         are only used by tests, where falling back to a bounded list is fine.
         """
+        scope = scope or MessageScope()
         if str(self.path) == ":memory:":
-            yield from self.messages(
-                limit=limit,
-                sim_id=sim_id,
-                direction=direction,
-                peer=peer,
-                search=search,
-                content=content,
-            )
+            yield from self.messages(scope, limit=limit)
             return
 
-        where, params = self._message_filter(
-            sim_id=sim_id, direction=direction, peer=peer, search=search,
-            content=content,
-        )
+        where, params = scope.where()
         sql = (
             "SELECT m.*, s.label AS sim_label, s.iccid AS sim_iccid "
             "FROM messages m LEFT JOIN sims s ON s.id = m.sim_id "
@@ -1934,19 +2324,8 @@ class Database:
         finally:
             connection.close()
 
-    def count_messages(
-        self,
-        *,
-        sim_id: int | None = None,
-        direction: str | None = None,
-        peer: str | None = None,
-        search: str | None = None,
-        content: str | None = None,
-    ) -> int:
-        where, params = self._message_filter(
-            sim_id=sim_id, direction=direction, peer=peer, search=search,
-            content=content,
-        )
+    def count_messages(self, scope: MessageScope | None = None) -> int:
+        where, params = (scope or MessageScope()).where()
         row = self.one(
             f"SELECT COUNT(*) AS n FROM messages m {where}", tuple(params)
         )
@@ -1961,6 +2340,253 @@ class Database:
             "FROM messages WHERE ts >= ? "
             "GROUP BY date(ts), sim_id ORDER BY day",
             (since,),
+        )
+
+    # -- notification outbox -------------------------------------------------
+
+    def enqueue_notification(
+        self,
+        kind: str,
+        *,
+        ref_id: int | None = None,
+        frame: Mapping[str, Any] | None = None,
+        event_key: str | None = None,
+        title: str = "",
+        body: str = "",
+    ) -> int | None:
+        """Record that a notification is owed.  Returns its id, or None.
+
+        None means the intent was already queued: ``event_key`` identifies the
+        agent event behind it, and a replay after a lost ack arrives with the
+        same key.  Callers treat that as success, because the first insert is
+        what will be delivered.
+
+        Meant to be called from inside ``apply_event``'s callback, where it joins
+        the event's own transaction — the point of the table is that a COMMIT is
+        already a promise to notify.
+        """
+        cursor = self.execute(
+            "INSERT OR IGNORE INTO notify_outbox "
+            "(kind, ref_id, event_key, frame, title, body, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
+            (
+                kind,
+                ref_id,
+                event_key,
+                json.dumps(dict(frame or {}), ensure_ascii=False),
+                title,
+                body,
+                utcnow(),
+            ),
+        )
+        return int(cursor.lastrowid) if cursor.rowcount else None
+
+    def pending_intents(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Intents that still have to be turned into per-channel deliveries."""
+        return self.query(
+            "SELECT * FROM notify_outbox WHERE status = 'pending' "
+            "ORDER BY id LIMIT ?",
+            (limit,),
+        )
+
+    def add_delivery(
+        self,
+        outbox_id: int,
+        channel_id: int,
+        *,
+        rule_id: int | None = None,
+        expires_at: str | None = None,
+    ) -> int | None:
+        """Queue one push for one channel.  None if it is already queued."""
+        now = utcnow()
+        cursor = self.execute(
+            "INSERT OR IGNORE INTO notify_deliveries "
+            "(outbox_id, channel_id, rule_id, status, attempts, next_attempt_at, "
+            " expires_at, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'pending', 0, ?, ?, ?, ?)",
+            (outbox_id, channel_id, rule_id, now, expires_at, now, now),
+        )
+        return int(cursor.lastrowid) if cursor.rowcount else None
+
+    def finish_intent(
+        self,
+        outbox_id: int,
+        status: str,
+        *,
+        title: str | None = None,
+        body: str | None = None,
+    ) -> None:
+        """Mark an intent expanded (deliveries exist) or skipped (nothing to do).
+
+        ``title``/``body`` carry the text rendered while expanding, for the kinds
+        whose wording is fixed by the event rather than by a channel template.
+        """
+        self.execute(
+            "UPDATE notify_outbox SET status = ?, expanded_at = ?, "
+            "title = COALESCE(?, title), body = COALESCE(?, body) WHERE id = ?",
+            (status, utcnow(), title or None, body or None, outbox_id),
+        )
+
+    def claim_deliveries(
+        self, *, owner: str, lease_seconds: float, limit: int, now: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Take ownership of up to ``limit`` due deliveries.
+
+        Claiming and reading happen in one transaction so two workers -- or one
+        worker whose previous pass has not finished -- cannot both send the same
+        push.  The lease is a timestamp rather than a state: a process that dies
+        holding it leaves rows that become due again on their own, which is what
+        makes recovery need no cleanup pass.
+        """
+        moment = now or utcnow()
+        until = _shift(moment, lease_seconds)
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                rows = [
+                    dict(row)
+                    for row in self._db.execute(
+                        "SELECT d.*, o.kind, o.ref_id, o.frame, o.title, o.body "
+                        "FROM notify_deliveries d "
+                        "JOIN notify_outbox o ON o.id = d.outbox_id "
+                        "WHERE d.status = 'pending' AND d.next_attempt_at <= ? "
+                        "  AND (d.lease_until IS NULL OR d.lease_until <= ?) "
+                        "ORDER BY d.next_attempt_at, d.id LIMIT ?",
+                        (moment, moment, limit),
+                    ).fetchall()
+                ]
+                for row in rows:
+                    self._db.execute(
+                        "UPDATE notify_deliveries "
+                        "SET lease_owner = ?, lease_until = ?, updated_at = ? "
+                        "WHERE id = ?",
+                        (owner, until, moment, row["id"]),
+                    )
+                    row["lease_owner"], row["lease_until"] = owner, until
+                self._db.execute("COMMIT")
+                return rows
+            except BaseException:
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
+                raise
+
+    def settle_delivery(
+        self,
+        delivery_id: int,
+        *,
+        status: str,
+        attempts: int,
+        error_code: str | None = None,
+        safe_detail: str = "",
+        next_attempt_at: str | None = None,
+    ) -> None:
+        """Write back the outcome of one attempt.
+
+        ``status`` stays 'pending' for a retry, with ``next_attempt_at`` saying
+        when; the lease is released either way so a worker that stops between
+        attempts does not park the row until its lease runs out.
+        """
+        self.execute(
+            "UPDATE notify_deliveries SET status = ?, attempts = ?, "
+            "error_code = ?, safe_detail = ?, next_attempt_at = ?, "
+            "lease_owner = NULL, lease_until = NULL, updated_at = ? "
+            "WHERE id = ?",
+            (
+                status,
+                attempts,
+                error_code,
+                safe_detail[:DETAIL_LIMIT],
+                next_attempt_at or utcnow(),
+                utcnow(),
+                delivery_id,
+            ),
+        )
+
+    def retry_delivery(self, delivery_id: int) -> bool:
+        """Put a given-up delivery back in the queue.  False if there is none.
+
+        Attempts are deliberately not reset: the count is the history of what
+        this push cost, and an operator retrying a channel they just fixed wants
+        the next failure to give up promptly rather than start the budget over.
+        """
+        cursor = self.execute(
+            "UPDATE notify_deliveries SET status = 'pending', next_attempt_at = ?, "
+            "lease_owner = NULL, lease_until = NULL, updated_at = ? "
+            "WHERE id = ? AND status IN ('failed', 'expired')",
+            (utcnow(), utcnow(), delivery_id),
+        )
+        return bool(cursor.rowcount)
+
+    def notify_backlog(self, *, now: str | None = None) -> dict[str, Any]:
+        """What the queue looks like, for the operations page.
+
+        ``oldest_pending_age_seconds`` is the number that matters: a backlog of
+        20 that is seconds old is a busy minute, the same 20 an hour old means
+        deliveries have stopped moving.
+        """
+        moment = now or utcnow()
+        counts = {
+            str(row["status"]): int(row["n"])
+            for row in self.query(
+                "SELECT status, COUNT(*) AS n FROM notify_deliveries GROUP BY status"
+            )
+        }
+        oldest = self.one(
+            "SELECT MIN(created_at) AS at FROM notify_deliveries WHERE status = 'pending'"
+        )
+        due = self.one(
+            "SELECT COUNT(*) AS n FROM notify_deliveries "
+            "WHERE status = 'pending' AND next_attempt_at <= ?",
+            (moment,),
+        )
+        unexpanded = self.one(
+            "SELECT COUNT(*) AS n FROM notify_outbox WHERE status = 'pending'"
+        )
+        return {
+            "pending": counts.get("pending", 0),
+            "failed": counts.get("failed", 0),
+            "expired": counts.get("expired", 0),
+            "ok": counts.get("ok", 0),
+            "due_now": int((due or {}).get("n") or 0),
+            "unexpanded_intents": int((unexpanded or {}).get("n") or 0),
+            "oldest_pending_at": (oldest or {}).get("at"),
+            "oldest_pending_age_seconds": _age_seconds((oldest or {}).get("at"), moment),
+            "failures_by_reason": {
+                str(row["error_code"] or "unknown"): int(row["n"])
+                for row in self.query(
+                    "SELECT error_code, COUNT(*) AS n FROM notify_deliveries "
+                    "WHERE status IN ('failed', 'expired') "
+                    "GROUP BY error_code ORDER BY n DESC LIMIT 10"
+                )
+            },
+        }
+
+    def next_delivery_due_at(self) -> str | None:
+        """When the earliest queued push becomes due, or None if none is queued.
+
+        The worker sleeps on this rather than on a fixed interval: a retry with
+        no backoff is due immediately and should not wait out a poll, and one
+        told to come back in five minutes should not be looked at sixty times
+        first.  Rows under lease are included — their lease expiring is itself
+        something to come back for.
+        """
+        row = self.one(
+            "SELECT MIN(CASE WHEN lease_until > next_attempt_at "
+            "THEN lease_until ELSE next_attempt_at END) AS at FROM notify_deliveries "
+            "WHERE status = 'pending'"
+        )
+        return (row or {}).get("at")
+
+    def stuck_deliveries(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Given-up deliveries, newest first, with what to call the channel."""
+        return self.query(
+            "SELECT d.*, o.kind, o.ref_id, c.name AS channel_name "
+            "FROM notify_deliveries d "
+            "JOIN notify_outbox o ON o.id = d.outbox_id "
+            "LEFT JOIN channels c ON c.id = d.channel_id "
+            "WHERE d.status IN ('failed', 'expired') "
+            "ORDER BY d.updated_at DESC LIMIT ?",
+            (limit,),
         )
 
     # -- operations ---------------------------------------------------------
@@ -2060,6 +2686,7 @@ class Database:
         audit_days: int = 0,
         incident_days: int = 0,
         audit_max_rows: int = 0,
+        ingested_days: int = 0,
     ) -> dict[str, int]:
         """Delete aged rows.  Verification codes should not live forever.
 
@@ -2132,11 +2759,21 @@ class Database:
                 "AND resolved_at < ?",
                 (cutoff,),
             ).rowcount
-        # Idempotency records only need to outlive a plausible replay window.
-        cutoff = (datetime.now(UTC) - timedelta(days=7)).isoformat()
-        removed["ingested"] = self.execute(
-            "DELETE FROM ingested WHERE at < ?", (cutoff,)
-        ).rowcount
+        if ingested_days > 0:
+            # Deleting an idempotency row un-claims its sequence number: the
+            # agent replays anything it never saw acked, and a replay of an
+            # event whose row is gone applies a second time — a duplicate SMS,
+            # a duplicate call record.  The old fixed 7-day horizon assumed the
+            # protocol bounds how long an unacked event can wait, and nothing
+            # does: an agent offline over a holiday still holds its queue.  So
+            # this is opt-in, and an operator who turns it on is choosing a
+            # window they believe covers their worst outage.
+            cutoff = (
+                datetime.now(UTC) - timedelta(days=ingested_days)
+            ).isoformat()
+            removed["ingested"] = self.execute(
+                "DELETE FROM ingested WHERE at < ?", (cutoff,)
+            ).rowcount
         return removed
 
     # -- backup and restore ------------------------------------------------

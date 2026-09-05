@@ -17,11 +17,11 @@ import shutil
 import tempfile
 import time
 from datetime import UTC, date, datetime, timedelta
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from starlette.background import BackgroundTask
 
 from . import PROTOCOL_VERSION, __version__
@@ -29,7 +29,13 @@ from .alerts import SETTING_ENABLED
 from .auth import SESSION_COOKIE, AuthError, hash_agent_token
 from .config import ConfigError
 from .csv_export import iter_message_csv
-from .db import SETTING_MESSAGE_RETENTION_DAYS, MigrationFailed, utcnow
+from .db import (
+    SETTING_MESSAGE_RETENTION_DAYS,
+    BadCursor,
+    MessageScope,
+    MigrationFailed,
+    utcnow,
+)
 from .gateway import (
     SETTING_PREVIOUS_AGENT_TOKEN_EXPIRES_AT,
     SETTING_PREVIOUS_AGENT_TOKEN_HASH,
@@ -121,6 +127,47 @@ _BUCKET_TS = (
 
 
 # --------------------------------------------------------------------------
+# message scope
+# --------------------------------------------------------------------------
+
+
+def message_scope(
+    sim_id: int | None = None,
+    # The third case, spelled out.  Omitting `sim_id` means every card — that
+    # is what the list has always done, and what the totals and the export
+    # assume — so "the messages with no card" needs a name of its own rather
+    # than a null that also reads as "unfiltered".
+    sim_scope: Literal["unassigned"] | None = None,
+    direction: Literal["in", "out"] | None = None,
+    peer: str | None = None,
+    search: str | None = None,
+    content: Literal["text", "data"] | None = None,
+) -> MessageScope:
+    """Build the one condition object every message read shares.
+
+    A dependency rather than per-route parameters: the list, the total, the
+    cursor and the export have to mean the same thing by construction, and the
+    way they stopped meaning the same thing was each spelling its own filter.
+    """
+    if sim_scope == "unassigned" and sim_id is not None:
+        raise HTTPException(
+            422, detail="sim_id and sim_scope=unassigned are mutually exclusive"
+        )
+    return MessageScope(
+        sim="unassigned" if sim_scope == "unassigned" else (
+            "all" if sim_id is None else sim_id
+        ),
+        direction=direction,
+        peer=peer,
+        search=search,
+        content=content,
+    )
+
+
+MessageScopeQuery = Annotated[MessageScope, Depends(message_scope)]
+
+
+# --------------------------------------------------------------------------
 # paged list responses
 # --------------------------------------------------------------------------
 
@@ -158,6 +205,14 @@ def paged(
     return {"items": items, "total": int(row["n"]) if row else 0}
 
 
+def _ussd_code(body: dict[str, str]) -> str:
+    """The USSD code out of a free-form body, or a 400."""
+    code = str(body.get("code") or "").strip()
+    if not code:
+        raise HTTPException(status_code=400, detail="code is required")
+    return code
+
+
 # --------------------------------------------------------------------------
 # request bodies
 # --------------------------------------------------------------------------
@@ -172,14 +227,24 @@ class ChangePasswordBody(BaseModel):
     new: str = Field(min_length=1, max_length=128)
 
 
-class SendSmsBody(BaseModel):
-    device: str
+class DeviceRef(BaseModel):
+    """How a body-addressed command names its module.
+
+    ``device_id`` is the unambiguous form and wins when both are given; the
+    name is kept because existing clients send it, and is only accepted when it
+    resolves to a single module fleet-wide.
+    """
+
+    device: str = ""
+    device_id: int | None = None
+
+
+class SendSmsBody(DeviceRef):
     number: str = Field(min_length=1, max_length=32)
     body: str = Field(min_length=1, max_length=2000)
 
 
-class RawAtBody(BaseModel):
-    device: str
+class RawAtBody(DeviceRef):
     command: str = Field(min_length=2, max_length=200)
 
 
@@ -243,8 +308,36 @@ class RuleBody(BaseModel):
 
 
 class ReadBody(BaseModel):
+    """One thread, and how far into it the operator has actually read.
+
+    ``sim_scope="unassigned"`` is the explicit spelling for the thread of
+    messages with no card; a bare null ``sim_id`` still means the same thing,
+    which is what this endpoint always did.  What it must never mean here is
+    "every card" — that would mark a number's history read across the fleet.
+    """
+
     sim_id: int | None = None
+    sim_scope: Literal["unassigned"] | None = None
     peer: str = Field(min_length=1, max_length=32)
+    # The newest message the client had actually rendered.  Anything that
+    # arrives after that stays unread; see ``Database.mark_read``.
+    through_id: int | None = Field(default=None, ge=1)
+    # The filter the transcript was being read under.  A view showing only text
+    # must not mark the data messages it hid — they were never on screen.
+    content: Literal["text", "data"] | None = None
+
+    @model_validator(mode="after")
+    def _one_identity(self) -> ReadBody:
+        if self.sim_scope == "unassigned" and self.sim_id is not None:
+            raise ValueError("sim_id and sim_scope=unassigned are exclusive")
+        return self
+
+    def scope(self) -> MessageScope:
+        return MessageScope(
+            sim="unassigned" if self.sim_id is None else self.sim_id,
+            peer=self.peer,
+            content=self.content,
+        )
 
 
 class RulePreviewBody(BaseModel):
@@ -263,7 +356,12 @@ class NotifySettingsBody(BaseModel):
 class TaskBody(BaseModel):
     name: str = ""
     sim_id: int | None = None
-    device: str
+    device: str = ""
+    # The module this task runs on.  ``device``/``agent_id`` are still accepted
+    # so existing clients keep working, but they are resolved and rewritten
+    # server-side: a task that fires an SMS every day must not be able to drift
+    # onto another host's module because two of them share a name.
+    device_id: int | None = None
     agent_id: str = ""
     enabled: bool = True
     action: Literal["send_sms", "ping", "raw_at", "voice_call"] = "send_sms"
@@ -400,6 +498,75 @@ def build_router(state: AppState) -> APIRouter:
 
     # -- devices and SIMs --------------------------------------------------
 
+    # A module's identity is its row id.  Names are unique per agent, not per
+    # fleet: two hosts each carrying a module called "a" is the ordinary shape
+    # of a multi-site deployment, and every name-addressed route then had to
+    # choose between them — the old resolver took whichever connection it met
+    # first, so "send from a" could leave from the wrong SIM in the wrong
+    # building.  Name addressing stays for existing clients, but only where the
+    # name resolves to exactly one module; anything else is refused with the
+    # candidates rather than answered with a guess.
+
+    def _device_by_id(device_id: int) -> dict[str, Any]:
+        row = state.db.one(
+            "SELECT id, agent_id, name FROM devices WHERE id = ?", (device_id,)
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail="no such device")
+        return row
+
+    def _devices_named(name: str) -> list[dict[str, Any]]:
+        return state.db.query(
+            "SELECT id, agent_id, name FROM devices WHERE name = ? ORDER BY agent_id",
+            (name,),
+        )
+
+    def _ambiguous_device(name: str, rows: list[dict[str, Any]]) -> HTTPException:
+        return HTTPException(
+            status_code=409,
+            detail={
+                "error": "ambiguous_device_name",
+                "message": (
+                    f"{len(rows)} 台 Agent 都有名为 {name} 的模组，"
+                    "无法判断指向哪一个；请改用模组 ID 寻址。"
+                ),
+                "candidates": [
+                    {"device_id": row["id"], "agent_id": row["agent_id"]}
+                    for row in rows
+                ],
+            },
+        )
+
+    def _device_by_name(name: str) -> dict[str, Any]:
+        rows = _devices_named(name)
+        if not rows:
+            raise HTTPException(status_code=404, detail="no such device")
+        if len(rows) > 1:
+            raise _ambiguous_device(name, rows)
+        return rows[0]
+
+    def _body_device(body: DeviceRef) -> dict[str, Any]:
+        """Resolve a body-addressed module: id if given, else a unique name."""
+        if body.device_id is not None:
+            return _device_by_id(body.device_id)
+        if not body.device:
+            raise HTTPException(
+                status_code=422, detail="device or device_id is required"
+            )
+        return _device_by_name(body.device)
+
+    async def _device_call(
+        target: dict[str, Any], frame: dict[str, Any], *, timeout: float = 30.0
+    ) -> dict[str, Any]:
+        """Run a command on *target*, addressed the way its own agent sees it.
+
+        The wire keeps using the agent-local module name: it is unambiguous
+        inside one agent, and the agent has no notion of the server's row ids.
+        """
+        return await _call(
+            target["agent_id"], {**frame, "device": target["name"]}, timeout=timeout
+        )
+
     @router.get("/devices", dependencies=guard)
     def list_devices() -> list[dict[str, Any]]:
         return state.db.query(
@@ -413,36 +580,34 @@ def build_router(state: AppState) -> APIRouter:
     ) -> dict[str, list[dict[str, Any]]]:
         """Return every device series in one request for the dashboard.
 
+        Keyed by module id, as a string because that is what a JSON object key
+        is.  Grouping by name merged two same-named modules on different hosts
+        into one series — a chart in which neither module's signal was shown.
+
         Downsampled into time buckets — see ``history_bucket_seconds``.  The
-        response shape is the same as an unbucketed one, so a caller reading
-        points off it needs no changes; only the density differs.
+        point shape is the same as an unbucketed one, so a caller reading points
+        off it needs no changes; only the density differs.
         """
         cutoff = (
             datetime.now(UTC) - timedelta(hours=hours)
         ).isoformat(timespec="seconds")
         width = history_bucket_seconds(hours)
         bucket = _BUCKET_TS.format(ts="s.ts", width=width)
-        names = [row["name"] for row in state.db.query("SELECT name FROM devices")]
-        grouped: dict[str, list[dict[str, Any]]] = {name: [] for name in names}
+        grouped: dict[str, list[dict[str, Any]]] = {
+            str(row["id"]): [] for row in state.db.query("SELECT id FROM devices")
+        }
         rows = state.db.query(
-            f"SELECT d.name, {bucket} AS ts, {history_columns('s.')} "
-            "FROM device_status s JOIN devices d ON d.id = s.device_id "
-            "WHERE s.ts >= ? "
-            f"GROUP BY d.name, CAST(strftime('%s', s.ts) / {width} AS INTEGER) "
-            "ORDER BY d.name, ts",
+            f"SELECT s.device_id, {bucket} AS ts, {history_columns('s.')} "
+            "FROM device_status s WHERE s.ts >= ? "
+            f"GROUP BY s.device_id, CAST(strftime('%s', s.ts) / {width} AS INTEGER) "
+            "ORDER BY s.device_id, ts",
             (cutoff,),
         )
         for row in rows:
-            grouped.setdefault(row.pop("name"), []).append(row)
+            grouped.setdefault(str(row.pop("device_id")), []).append(row)
         return grouped
 
-    @router.get("/devices/{name}/history", dependencies=guard)
-    def device_history(
-        name: str, hours: int = Query(24, ge=1, le=24 * 30)
-    ) -> list[dict[str, Any]]:
-        row = state.db.one("SELECT id FROM devices WHERE name = ?", (name,))
-        if row is None:
-            raise HTTPException(status_code=404, detail="no such device")
+    def _device_history(device_id: int, hours: int) -> list[dict[str, Any]]:
         # Compute the cutoff here rather than with SQLite's datetime('now'):
         # that function formats with a space separator, which does not compare
         # correctly against the ISO-8601 'T' timestamps stored in the column.
@@ -456,35 +621,107 @@ def build_router(state: AppState) -> APIRouter:
             "FROM device_status WHERE device_id = ? AND ts >= ? "
             f"GROUP BY CAST(strftime('%s', ts) / {width} AS INTEGER) "
             "ORDER BY ts",
-            (row["id"], cutoff),
+            (device_id, cutoff),
         )
+
+    @router.get("/devices/by-id/{device_id}/history", dependencies=guard)
+    def device_history_by_id(
+        device_id: int, hours: int = Query(24, ge=1, le=24 * 30)
+    ) -> list[dict[str, Any]]:
+        return _device_history(_device_by_id(device_id)["id"], hours)
+
+    @router.post("/devices/by-id/{device_id}/refresh", dependencies=guard)
+    async def refresh_device_by_id(device_id: int) -> dict[str, Any]:
+        return await _device_call(
+            _device_by_id(device_id), {"type": "query", "what": "status"}
+        )
+
+    @router.post("/devices/by-id/{device_id}/radio", dependencies=guard)
+    async def set_device_radio_by_id(
+        device_id: int, body: RadioBody
+    ) -> dict[str, Any]:
+        return await _device_call(
+            _device_by_id(device_id), {"type": "set_radio", "enabled": body.enabled}
+        )
+
+    @router.post("/devices/by-id/{device_id}/data", dependencies=guard)
+    async def set_device_data_by_id(
+        device_id: int, body: RadioBody
+    ) -> dict[str, Any]:
+        return await _device_call(
+            _device_by_id(device_id),
+            {"type": "set_data", "enabled": body.enabled},
+            timeout=60.0,
+        )
+
+    @router.post("/devices/by-id/{device_id}/roaming-data", dependencies=guard)
+    async def set_device_roaming_data_by_id(
+        device_id: int, body: RoamingDataBody
+    ) -> dict[str, Any]:
+        return await _device_call(
+            _device_by_id(device_id),
+            {"type": "set_roaming_data", "allowed": body.allowed},
+            timeout=60.0,
+        )
+
+    @router.post("/devices/by-id/{device_id}/operators/scan", dependencies=guard)
+    async def scan_device_operators_by_id(device_id: int) -> dict[str, Any]:
+        return await _device_call(
+            _device_by_id(device_id), {"type": "scan_operators"}, timeout=210.0
+        )
+
+    @router.post("/devices/by-id/{device_id}/operator", dependencies=guard)
+    async def select_device_operator_by_id(
+        device_id: int, body: OperatorSelectionBody
+    ) -> dict[str, Any]:
+        return await _device_call(
+            _device_by_id(device_id),
+            {"type": "select_operator", "numeric": body.numeric},
+            timeout=210.0,
+        )
+
+    @router.post("/devices/by-id/{device_id}/network-diagnostics", dependencies=guard)
+    async def device_network_diagnostics_by_id(device_id: int) -> dict[str, Any]:
+        return await _device_call(
+            _device_by_id(device_id),
+            {"type": "network_diagnostics"},
+            timeout=165.0,
+        )
+
+    @router.post("/devices/by-id/{device_id}/ussd", dependencies=guard)
+    async def send_ussd_by_id(
+        device_id: int, body: dict[str, str]
+    ) -> dict[str, Any]:
+        return await _device_call(
+            _device_by_id(device_id),
+            {"type": "ussd", "code": _ussd_code(body)},
+            timeout=60.0,
+        )
+
+    @router.get("/devices/{name}/history", dependencies=guard)
+    def device_history(
+        name: str, hours: int = Query(24, ge=1, le=24 * 30)
+    ) -> list[dict[str, Any]]:
+        return _device_history(_device_by_name(name)["id"], hours)
 
     @router.post("/devices/{name}/refresh", dependencies=guard)
     async def refresh_device(name: str) -> dict[str, Any]:
-        agent_id = state.gateway.agent_for_device(name)
-        if agent_id is None:
-            raise HTTPException(status_code=404, detail="no such device")
-        return await _call(agent_id, {"type": "query", "device": name, "what": "status"})
+        return await _device_call(
+            _device_by_name(name), {"type": "query", "what": "status"}
+        )
 
     @router.post("/devices/{name}/radio", dependencies=guard)
     async def set_device_radio(name: str, body: RadioBody) -> dict[str, Any]:
-        agent_id = state.gateway.agent_for_device(name)
-        if agent_id is None:
-            raise HTTPException(status_code=404, detail="no such device")
-        return await _call(
-            agent_id,
-            {"type": "set_radio", "device": name, "enabled": body.enabled},
+        return await _device_call(
+            _device_by_name(name), {"type": "set_radio", "enabled": body.enabled}
         )
 
     @router.post("/devices/{name}/data", dependencies=guard)
     async def set_device_data(name: str, body: RadioBody) -> dict[str, Any]:
         """Enable or fully disable packet data on the modem."""
-        agent_id = state.gateway.agent_for_device(name)
-        if agent_id is None:
-            raise HTTPException(status_code=404, detail="no such device")
-        return await _call(
-            agent_id,
-            {"type": "set_data", "device": name, "enabled": body.enabled},
+        return await _device_call(
+            _device_by_name(name),
+            {"type": "set_data", "enabled": body.enabled},
             timeout=60.0,
         )
 
@@ -493,48 +730,34 @@ def build_router(state: AppState) -> APIRouter:
         name: str, body: RoamingDataBody
     ) -> dict[str, Any]:
         """Set the local safety policy for data while the SIM is roaming."""
-        agent_id = state.gateway.agent_for_device(name)
-        if agent_id is None:
-            raise HTTPException(status_code=404, detail="no such device")
-        return await _call(
-            agent_id,
-            {"type": "set_roaming_data", "device": name, "allowed": body.allowed},
+        return await _device_call(
+            _device_by_name(name),
+            {"type": "set_roaming_data", "allowed": body.allowed},
             timeout=60.0,
         )
 
     @router.post("/devices/{name}/operators/scan", dependencies=guard)
     async def scan_device_operators(name: str) -> dict[str, Any]:
-        agent_id = state.gateway.agent_for_device(name)
-        if agent_id is None:
-            raise HTTPException(status_code=404, detail="no such device")
         # AT+COPS=? is allowed to take several minutes while the modem scans.
-        return await _call(
-            agent_id,
-            {"type": "scan_operators", "device": name},
-            timeout=210.0,
+        return await _device_call(
+            _device_by_name(name), {"type": "scan_operators"}, timeout=210.0
         )
 
     @router.post("/devices/{name}/operator", dependencies=guard)
     async def select_device_operator(
         name: str, body: OperatorSelectionBody
     ) -> dict[str, Any]:
-        agent_id = state.gateway.agent_for_device(name)
-        if agent_id is None:
-            raise HTTPException(status_code=404, detail="no such device")
-        return await _call(
-            agent_id,
-            {"type": "select_operator", "device": name, "numeric": body.numeric},
+        return await _device_call(
+            _device_by_name(name),
+            {"type": "select_operator", "numeric": body.numeric},
             timeout=210.0,
         )
 
     @router.post("/devices/{name}/network-diagnostics", dependencies=guard)
     async def device_network_diagnostics(name: str) -> dict[str, Any]:
-        agent_id = state.gateway.agent_for_device(name)
-        if agent_id is None:
-            raise HTTPException(status_code=404, detail="no such device")
-        return await _call(
-            agent_id,
-            {"type": "network_diagnostics", "device": name},
+        return await _device_call(
+            _device_by_name(name),
+            {"type": "network_diagnostics"},
             # The agent reads five optional diagnostics serially, each with a
             # 30-second AT timeout. Leave room for all of them before the
             # gateway gives up and drops the pending command: a firmware that
@@ -545,15 +768,9 @@ def build_router(state: AppState) -> APIRouter:
     @router.post("/devices/{name}/ussd", dependencies=guard)
     async def send_ussd(name: str, body: dict[str, str]) -> dict[str, Any]:
         """Send a USSD code and return the raw response."""
-        agent_id = state.gateway.agent_for_device(name)
-        if agent_id is None:
-            raise HTTPException(status_code=404, detail="no such device")
-        code = body.get("code", "")
-        if not code:
-            raise HTTPException(status_code=400, detail="code is required")
-        return await _call(
-            agent_id,
-            {"type": "ussd", "device": name, "code": code},
+        return await _device_call(
+            _device_by_name(name),
+            {"type": "ussd", "code": _ussd_code(body)},
             timeout=60.0,
         )
 
@@ -606,27 +823,44 @@ def build_router(state: AppState) -> APIRouter:
 
     @router.get("/messages", dependencies=guard)
     def list_messages(
+        scope: MessageScopeQuery,
         # 2000, not 500: the thread view reads a conversation back by growing
-        # this window on demand.  Growing one window beats paging a transcript —
-        # an offset page boundary can gap or repeat when an SMS lands mid-scroll.
-        # Only an explicit "load older" raises it; nothing here polls.
+        # this window on demand.  A longer history is walked with `before`
+        # instead — an offset page boundary can gap or repeat when an SMS lands
+        # mid-scroll, while a (ts,id) cursor cannot.
         limit: int = Query(50, ge=1, le=2000),
         offset: int = Query(0, ge=0),
-        sim_id: int | None = None,
-        direction: Literal["in", "out"] | None = None,
-        peer: str | None = None,
-        search: str | None = None,
-        content: Literal["text", "data"] | None = None,
+        before: str | None = Query(
+            None,
+            max_length=160,
+            description="Cursor from a previous page; returns older messages.",
+        ),
+        # The transcript re-reads itself every few seconds for delivery
+        # reports. Counting a 10,000-message history each time buys nothing
+        # once `has_more` answers the only question the view asks.
+        count: bool = True,
     ) -> dict[str, Any]:
+        if before is not None and offset:
+            raise HTTPException(
+                422, detail="before and offset are mutually exclusive"
+            )
+        try:
+            # One row past the page: enough to know whether an older page
+            # exists without counting the rest of the history.
+            rows = state.db.messages(
+                scope, limit=limit + 1, offset=offset, before=before
+            )
+        except BadCursor as exc:
+            raise HTTPException(
+                422, detail=f"invalid cursor ({exc})"
+            ) from exc
+        has_more = len(rows) > limit
+        items = rows[:limit]
         return {
-            "items": state.db.messages(
-                limit=limit, offset=offset, sim_id=sim_id,
-                direction=direction, peer=peer, search=search, content=content,
-            ),
-            "total": state.db.count_messages(
-                sim_id=sim_id, direction=direction, peer=peer, search=search,
-                content=content,
-            ),
+            "items": items,
+            "total": state.db.count_messages(scope) if count else None,
+            "has_more": has_more,
+            "next_cursor": scope.cursor(items[-1]) if has_more and items else None,
         }
 
     @router.get("/conversations", dependencies=guard)
@@ -667,18 +901,15 @@ def build_router(state: AppState) -> APIRouter:
 
     @router.post("/messages/send", dependencies=guard)
     async def send_message(body: SendSmsBody) -> dict[str, Any]:
-        agent_id = state.gateway.agent_for_device(body.device)
-        if agent_id is None:
-            raise HTTPException(status_code=404, detail="no such device")
-        return await _call(agent_id, {
-            "type": "send_sms", "device": body.device,
-            "number": body.number, "body": body.body,
-        })
+        return await _device_call(
+            _body_device(body),
+            {"type": "send_sms", "number": body.number, "body": body.body},
+        )
 
     @router.post("/messages/read", dependencies=guard)
     def mark_read(body: ReadBody) -> dict[str, Any]:
-        """Mark one conversation's incoming messages as read (opening it)."""
-        marked = state.db.mark_read(sim_id=body.sim_id, peer=body.peer)
+        """Mark one thread's incoming messages read, up to what was rendered."""
+        marked = state.db.mark_read(body.scope(), through_id=body.through_id)
         return {"ok": True, "marked": marked}
 
     @router.get("/messages/unread", dependencies=guard)
@@ -687,22 +918,12 @@ def build_router(state: AppState) -> APIRouter:
 
     @router.get("/messages/export", dependencies=guard)
     def export_messages(
+        scope: MessageScopeQuery,
         limit: int | None = Query(None, ge=1, le=1_000_000),
-        sim_id: int | None = None,
-        peer: str | None = None,
-        search: str | None = None,
-        content: Literal["text", "data"] | None = None,
     ) -> StreamingResponse:
         """Stream stored messages as CSV without materialising the export."""
         return StreamingResponse(
-            iter_message_csv(
-                state.db,
-                limit=limit,
-                sim_id=sim_id,
-                peer=peer,
-                search=search,
-                content=content,
-            ),
+            iter_message_csv(state.db, scope, limit=limit),
             media_type="text/csv; charset=utf-8",
             headers={
                 "Content-Disposition": 'attachment; filename="messages.csv"',
@@ -712,12 +933,9 @@ def build_router(state: AppState) -> APIRouter:
 
     @router.post("/at", dependencies=guard)
     async def raw_at(body: RawAtBody) -> dict[str, Any]:
-        agent_id = state.gateway.agent_for_device(body.device)
-        if agent_id is None:
-            raise HTTPException(status_code=404, detail="no such device")
-        return await _call(agent_id, {
-            "type": "raw_at", "device": body.device, "command": body.command,
-        })
+        return await _device_call(
+            _body_device(body), {"type": "raw_at", "command": body.command}
+        )
 
     # -- channels and rules ------------------------------------------------
 
@@ -876,6 +1094,40 @@ def build_router(state: AppState) -> APIRouter:
             offset=offset,
         )
 
+    @router.get("/notify-queue", dependencies=guard)
+    def notify_queue() -> dict[str, Any]:
+        """The push queue as an operator needs to read it.
+
+        ``notify_logs`` records what already happened; this is what has not.
+        The two answer different questions — "did the code arrive" versus "is
+        anything stuck" — and the second one is only visible here.
+        """
+        return {
+            "backlog": state.db.notify_backlog(),
+            "stuck": state.db.stuck_deliveries(),
+        }
+
+    @router.post("/notify-queue/{delivery_id}/retry", dependencies=guard)
+    async def retry_delivery(delivery_id: int, request: Request) -> dict[str, Any]:
+        """Put one given-up push back in the queue.
+
+        Audited because it re-sends a message body to a third party: whoever
+        looks at this later should be able to see that a person asked for it.
+        """
+        if not state.db.retry_delivery(delivery_id):
+            raise HTTPException(
+                status_code=404, detail="no such failed delivery"
+            )
+        state.db.record_audit(
+            "retry notification",
+            target=f"delivery:{delivery_id}",
+            client_ip=request.client.host if request.client else "",
+        )
+        # The worker polls, so this only shortens the wait; without it the
+        # button would look like it did nothing for up to POLL_SECONDS.
+        state.notifier.kick()
+        return {"ok": True}
+
     # -- notify settings ---------------------------------------------------
     # Operator-tunable knobs surfaced on the Notify page: how long SMS are
     # kept before the housekeeping purge deletes them, and whether a module
@@ -907,12 +1159,47 @@ def build_router(state: AppState) -> APIRouter:
             "LEFT JOIN sims s ON s.id = t.sim_id ORDER BY t.id"
         )
 
-    @router.post("/tasks", dependencies=guard)
-    async def create_task(body: TaskBody) -> dict[str, Any]:
+    def _task_fields(body: TaskBody) -> dict[str, Any]:
+        """A task row's columns, with its module pinned to one identity.
+
+        A keep-alive task sends real SMS on a schedule, unattended, so the
+        module it names is resolved at write time: stored as a row id, with the
+        owning agent and the module's name written alongside so a later read
+        never has to guess which host was meant.
+
+        A name the server has not seen yet is kept as a name — tasks are often
+        configured before the agent's first connection, and ``tasks_for`` binds
+        those at push time.  An *ambiguous* name is refused outright: a schedule
+        that fires unattended must not be able to drift onto another host's
+        module.
+        """
+        target: dict[str, Any]
+        if body.device_id is not None:
+            target = _device_by_id(body.device_id)
+        elif not body.device:
+            raise HTTPException(
+                status_code=422, detail="device or device_id is required"
+            )
+        else:
+            rows = _devices_named(body.device)
+            if len(rows) > 1:
+                raise _ambiguous_device(body.device, rows)
+            target = rows[0] if rows else {
+                "id": None, "agent_id": body.agent_id, "name": body.device,
+            }
+
         data = body.model_dump()
         data["enabled"] = int(data["enabled"])
         data["random_suffix"] = int(data["random_suffix"])
         data["notify_on_result"] = int(data["notify_on_result"])
+        data["device_id"] = target["id"]
+        data["device"] = target["name"]
+        data["agent_id"] = target["agent_id"]
+        return data
+
+    @router.post("/tasks", dependencies=guard)
+    async def create_task(body: TaskBody) -> dict[str, Any]:
+        data = _task_fields(body)
         data["created_at"] = utcnow()
         columns = ",".join(data)
         placeholders = ",".join(f":{key}" for key in data)
@@ -924,10 +1211,7 @@ def build_router(state: AppState) -> APIRouter:
 
     @router.put("/tasks/{task_id}", dependencies=guard)
     async def update_task(task_id: int, body: TaskBody) -> dict[str, Any]:
-        data = body.model_dump()
-        data["enabled"] = int(data["enabled"])
-        data["random_suffix"] = int(data["random_suffix"])
-        data["notify_on_result"] = int(data["notify_on_result"])
+        data = _task_fields(body)
         assignments = ",".join(f"{key} = :{key}" for key in data)
         state.db.execute(
             f"UPDATE tasks SET {assignments} WHERE id = :id", {**data, "id": task_id}
@@ -949,7 +1233,14 @@ def build_router(state: AppState) -> APIRouter:
         task = state.db.one("SELECT * FROM tasks WHERE id = ?", (task_id,))
         if task is None:
             raise HTTPException(status_code=404, detail="no such task")
-        agent_id = task.get("agent_id") or state.gateway.agent_for_device(task["device"])
+        # Prefer the identities written with the row; fall back to resolving the
+        # name only for rows that predate them — and refuse an ambiguous one
+        # rather than run it on whichever module answers first.
+        agent_id = str(task.get("agent_id") or "")
+        if not agent_id and task.get("device_id"):
+            agent_id = str(_device_by_id(int(task["device_id"]))["agent_id"])
+        if not agent_id:
+            agent_id = str(_device_by_name(str(task.get("device") or ""))["agent_id"])
         if not agent_id:
             raise HTTPException(status_code=503, detail="task device has no agent")
 
@@ -1030,6 +1321,10 @@ def build_router(state: AppState) -> APIRouter:
                 "agents_connected": len(state.gateway.connections),
                 "pending_commands": state.gateway.pending_command_count,
                 "notifications_inflight": state.notifier.inflight_count,
+                # In-flight counts only what this process is holding; the queue
+                # is what a restart would inherit, which is the number that
+                # says whether pushes are actually moving.
+                "notify_queue": state.db.notify_backlog(),
                 "offline_timers": state.alerter.pending_count,
             },
             "storage": {
@@ -1147,6 +1442,7 @@ def build_router(state: AppState) -> APIRouter:
             audit_days=state.settings.audit_retention_days,
             incident_days=state.settings.incident_retention_days,
             audit_max_rows=state.settings.audit_max_rows,
+            ingested_days=state.settings.ingested_retention_days,
         )
 
     @router.get("/system/backup", dependencies=guard)

@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from hub_server.csv_export import iter_message_csv
-from hub_server.db import Database
+from hub_server.db import Database, MessageScope
 
 DEFAULT_ROWS = 100_000
 DEFAULT_REPEAT = 5
@@ -176,18 +176,20 @@ def run_benchmark(*, rows: int, repeat: int, seed: int) -> dict[str, Any]:
             since_365 = (ANCHOR - timedelta(days=364)).replace(
                 hour=0, minute=0, second=0
             ).isoformat(timespec="seconds")
+            search = MessageScope(search="code 042424")
+            thread = MessageScope(sim=target_sim, peer=target_peer)
             calls: dict[str, Callable[[], Any]] = {
                 "message_list": lambda: (
                     db.messages(limit=50),
                     db.count_messages(),
                 ),
                 "message_search": lambda: (
-                    db.messages(limit=50, search="code 042424"),
-                    db.count_messages(search="code 042424"),
+                    db.messages(search, limit=50),
+                    db.count_messages(search),
                 ),
                 "conversation_thread": lambda: (
-                    db.messages(limit=50, sim_id=target_sim, peer=target_peer),
-                    db.count_messages(sim_id=target_sim, peer=target_peer),
+                    db.messages(thread, limit=50),
+                    db.count_messages(thread),
                 ),
                 "conversation_list": lambda: db.conversations(limit=200),
                 "trend_30_days": lambda: db.message_trend(since=since_30),

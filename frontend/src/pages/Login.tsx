@@ -21,16 +21,46 @@ import type { Mode } from '../tokens'
 interface Props {
   needsSetup: boolean
   onAuthenticated: () => void | Promise<void>
+  /** Why the login form is showing, when it was not a plain first visit. */
+  notice?: string | null
+  /**
+   * Set when the last logout request failed.
+   *
+   * The screen was cleared locally either way; what nobody knows is whether the
+   * server dropped the session. Saying "已退出" here would be a claim about the
+   * server that this client cannot make.
+   */
+  logoutDoubt?: string | null
+  onRetryLogout?: () => void | Promise<void>
   mode: Mode
   onToggleMode: () => void
 }
 
-export function LoginPage({ needsSetup, onAuthenticated, mode, onToggleMode }: Props) {
+export function LoginPage({
+  needsSetup,
+  onAuthenticated,
+  notice,
+  logoutDoubt,
+  onRetryLogout,
+  mode,
+  onToggleMode,
+}: Props) {
   const theme = useTheme()
   const [password, setPassword] = useState('')
   const [confirm, setConfirm] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const [retrying, setRetrying] = useState(false)
+
+  const retryLogout = async () => {
+    if (!onRetryLogout) return
+    setRetrying(true)
+    try {
+      await onRetryLogout()
+    } finally {
+      setRetrying(false)
+    }
+  }
 
   const submit = async (event: FormEvent) => {
     event.preventDefault()
@@ -138,6 +168,27 @@ export function LoginPage({ needsSetup, onAuthenticated, mode, onToggleMode }: P
             }}>
             {needsSetup ? '首次使用,请设置管理员密码' : '请输入管理员密码'}
           </Typography>
+
+          {notice && (
+            <Alert severity="info" sx={{ mb: 3 }}>
+              {notice}
+            </Alert>
+          )}
+          {logoutDoubt && (
+            <Alert
+              severity="warning"
+              sx={{ mb: 3 }}
+              action={
+                onRetryLogout && (
+                  <Button color="inherit" size="small" onClick={retryLogout} disabled={retrying}>
+                    重试退出
+                  </Button>
+                )
+              }
+            >
+              界面数据已在本机清除,但退出请求失败({logoutDoubt}),服务器会话是否已撤销未确认。
+            </Alert>
+          )}
 
           <form onSubmit={submit}>
             <Stack spacing={2}>

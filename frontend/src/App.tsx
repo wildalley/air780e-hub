@@ -2,12 +2,14 @@ import { useCallback, useEffect, useMemo, useState, lazy, Suspense } from 'react
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
 import { CssBaseline, GlobalStyles, ThemeProvider } from '@mui/material'
 import useSWR, { SWRConfig, type SWRConfiguration } from 'swr'
-import { api, ApiError } from './api'
+import { api, errorText, onSessionLapse } from './api'
+import { sessionState, type SessionEnd } from './session'
 import { SWR_OPTIONS } from './swr'
 import { buildTheme } from './theme'
 import { VIZ, type Mode } from './tokens'
 import { Layout } from './components/Layout'
-import { Loading } from './components/common'
+import { ErrorState, Loading } from './components/common'
+import { PageErrorBoundary } from './components/PageErrorBoundary'
 import { LoginPage } from './pages/Login'
 const DashboardPage = lazy(() => import('./pages/Dashboard').then((m) => ({ default: m.DashboardPage })))
 const MessagesPage = lazy(() => import('./pages/Messages').then((m) => ({ default: m.MessagesPage })))
@@ -31,21 +33,24 @@ function initialMode(): Mode {
 
 export default function App() {
   const [mode, setMode] = useState<Mode>(initialMode)
-  // A 401 from *any* request means the cookie is gone. Tracked separately from
-  // the fetched status so the bounce to login is instant and needs no round
-  // trip — the next status revalidation confirms it.
-  const [lapsed, setLapsed] = useState(false)
+  // Why the business UI is down, when it is not simply "never logged in". A 401
+  // from *any* request sets this, so the bounce to login is instant and needs no
+  // round trip — the next status revalidation confirms it.
+  const [ended, setEnded] = useState<SessionEnd | null>(null)
+  // Set when the logout request itself failed. The local screen is cleared
+  // either way; what is not known is whether the server tore the session down.
+  const [logoutDoubt, setLogoutDoubt] = useState<string | null>(null)
 
   const {
     data: fetched,
     error: statusError,
+    isLoading: statusLoading,
     mutate: mutateStatus,
   } = useSWR('/api/auth/status', () => api.auth.status(), SWR_OPTIONS)
 
-  // The status endpoint is the one call that must never fail closed into a
-  // blank screen: if it is unreachable, show the login form rather than an
-  // indefinite spinner.
-  const status = statusError ? { configured: true, authenticated: false } : fetched
+  // This read deliberately stays outside the business cache below: bouncing that
+  // cache on logout must not make the app forget how to ask who it is.
+  const session = sessionState(fetched, statusError, ended)
 
   const theme = useMemo(() => buildTheme(mode), [mode])
   const viz = useMemo(() => VIZ[mode], [mode])
@@ -64,48 +69,65 @@ export default function App() {
   }, [])
 
   const refreshStatus = useCallback(async () => {
-    setLapsed(false)
+    setEnded(null)
+    setLogoutDoubt(null)
     await mutateStatus()
   }, [mutateStatus])
 
   // A lapsed session anywhere in the app returns the whole UI to the login
-  // screen rather than leaving pages showing stale data behind an error.
-  // Covers writes and downloads, which are plain promises; SWR reads are
-  // caught by `onError` in the config below instead.
-  useEffect(() => {
-    const onRejection = (event: PromiseRejectionEvent) => {
-      if (event.reason instanceof ApiError && event.reason.isUnauthenticated) setLapsed(true)
-    }
-    window.addEventListener('unhandledrejection', onRejection)
-    return () => window.removeEventListener('unhandledrejection', onRejection)
-  }, [])
+  // screen rather than leaving pages showing stale data behind an error. The
+  // request layer reports this itself, before the caller sees the rejection, so
+  // it works for the writes and downloads that catch their own failures — those
+  // never became unhandled rejections and so never used to arrive here.
+  useEffect(() => onSessionLapse(() => setEnded('lapsed')), [])
 
   const logout = useCallback(async () => {
-    await api.auth.logout().catch(() => undefined)
-    await refreshStatus()
-  }, [refreshStatus])
+    // Local first, and unconditionally: whatever the server says, the messages
+    // and channel secrets on this screen go away now.
+    setEnded('signed-out')
+    try {
+      await api.auth.logout()
+      setLogoutDoubt(null)
+    } catch (err) {
+      // Not "logged out" — the cookie may still be valid on the server. Say so
+      // instead of implying a revocation that may not have happened.
+      setLogoutDoubt(errorText(err, '退出请求失败'))
+    }
+    await mutateStatus()
+  }, [mutateStatus])
 
-  // Page-level reads share this. `onError` is the read-side half of the
-  // session-lapse handling above: SWR resolves failures into state rather
-  // than rejecting, so an expired cookie would otherwise go unnoticed.
+  // Page-level reads share this, and a fresh cache is built for every login:
+  // `provider` runs when this subtree mounts, so the previous session's
+  // messages and diagnostics cannot be painted back onto the screen by a
+  // re-login. In-memory drafts go the same way — they live in the pages, which
+  // unmount with it.
   const swrConfig: SWRConfiguration = useMemo(
-    () => ({
-      ...SWR_OPTIONS,
-      onError: (error) => {
-        if (error instanceof ApiError && error.isUnauthenticated) setLapsed(true)
-      },
-    }),
+    () => ({ ...SWR_OPTIONS, provider: () => new Map() }),
     [],
   )
 
   let content
-  if (status === undefined) {
-    content = null
-  } else if (!status.authenticated || lapsed) {
+  if (session.phase === 'initializing') {
+    // Never a blank plane: the status read is one request, but a slow one still
+    // has to look like waiting rather than a broken page.
+    content = <Loading />
+  } else if (session.phase === 'unavailable') {
+    content = (
+      <ErrorState
+        title="无法连接服务"
+        message={session.notice ?? '状态接口没有响应。'}
+        onRetry={() => void mutateStatus()}
+        busy={statusLoading}
+      />
+    )
+  } else if (session.phase === 'anonymous') {
     content = (
       <LoginPage
-        needsSetup={!status.configured}
+        needsSetup={session.needsSetup}
         onAuthenticated={refreshStatus}
+        notice={session.notice}
+        logoutDoubt={logoutDoubt}
+        onRetryLogout={logout}
         mode={mode}
         onToggleMode={toggleMode}
       />
@@ -115,22 +137,24 @@ export default function App() {
       <SWRConfig value={swrConfig}>
       <BrowserRouter>
         <Layout mode={mode} onToggleMode={toggleMode} onLogout={logout}>
-          <Suspense fallback={<Loading />}>
-            <Routes>
-              <Route path="/" element={<DashboardPage />} />
-              <Route path="/messages" element={<MessagesPage />} />
-              <Route path="/devices" element={<DevicesPage />} />
-              <Route path="/sims" element={<SimsPage />} />
-              <Route path="/tasks" element={<TasksPage />} />
-              <Route path="/console" element={<ConsolePage />} />
-              <Route path="/notify" element={<NotifyPage />} />
-              <Route path="/operations" element={<OperationsPage />} />
-              <Route path="/logs" element={<LogsPage />} />
-              <Route path="/backup" element={<BackupPage />} />
-              <Route path="/settings" element={<SettingsPage onPasswordChanged={logout} />} />
-              <Route path="*" element={<Navigate to="/" replace />} />
-            </Routes>
-          </Suspense>
+          <PageErrorBoundary>
+            <Suspense fallback={<Loading />}>
+              <Routes>
+                <Route path="/" element={<DashboardPage />} />
+                <Route path="/messages" element={<MessagesPage />} />
+                <Route path="/devices" element={<DevicesPage />} />
+                <Route path="/sims" element={<SimsPage />} />
+                <Route path="/tasks" element={<TasksPage />} />
+                <Route path="/console" element={<ConsolePage />} />
+                <Route path="/notify" element={<NotifyPage />} />
+                <Route path="/operations" element={<OperationsPage />} />
+                <Route path="/logs" element={<LogsPage />} />
+                <Route path="/backup" element={<BackupPage />} />
+                <Route path="/settings" element={<SettingsPage onPasswordChanged={logout} />} />
+                <Route path="*" element={<Navigate to="/" replace />} />
+              </Routes>
+            </Suspense>
+          </PageErrorBoundary>
         </Layout>
       </BrowserRouter>
       </SWRConfig>

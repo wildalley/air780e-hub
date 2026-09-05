@@ -72,6 +72,13 @@ class Settings:
     # middleware runs ahead of authentication, so an unauthenticated caller can
     # append rows; age alone would not bound the table inside the horizon.
     audit_max_rows: int = 200_000
+    # Retention for the event idempotency table, in days; 0 — the default —
+    # keeps every row.  Unlike the tables above, deleting here is not merely a
+    # loss of history: an event whose row is gone can be applied a second time
+    # if the Agent ever replays it, so the horizon has to be longer than the
+    # longest outage an Agent's queue can survive.  Nothing in the protocol
+    # bounds that, which is why this is opt-in and off by default.
+    ingested_retention_days: int = 0
 
     # Push retries *per channel*, on top of the first attempt.  A phone that
     # missed a verification code is the failure mode worth spending time on.
@@ -127,6 +134,9 @@ class Settings:
                 os.environ.get("HUB_INCIDENT_RETENTION_DAYS", "90")
             ),
             audit_max_rows=int(os.environ.get("HUB_AUDIT_MAX_ROWS", "200000")),
+            ingested_retention_days=int(
+                os.environ.get("HUB_INGESTED_RETENTION_DAYS", "0")
+            ),
             notify_retries=int(os.environ.get("HUB_NOTIFY_RETRIES", "2")),
             notify_timeout=float(os.environ.get("HUB_NOTIFY_TIMEOUT", "10")),
             offline_alert_grace=float(
