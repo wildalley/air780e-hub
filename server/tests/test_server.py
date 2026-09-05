@@ -2396,7 +2396,7 @@ def test_status_can_still_set_falsy_state(admin):
         ws.receive_json()
         device = next(d for d in admin.get("/api/devices").json() if d["name"] == "a")
         assert device["registered"] == 0
-        assert device["rssi"] == 0
+    assert device["rssi"] == 0
 
 
 def test_deliberate_flight_mode_is_stored_without_a_network_incident(admin):
@@ -3393,3 +3393,68 @@ def test_ussd_query_returns_the_raw_response(admin):
     assert result["response"] == "余额:50.00元"
 
     assert result_queue.get(timeout=1) == "done"
+
+
+def test_persistent_operation_is_idempotent_and_accepts_result(admin):
+    """A durable command keeps one operation across duplicate HTTP requests."""
+    import threading
+
+    received: list[dict] = []
+
+    def agent_side() -> None:
+        with admin.websocket_connect(
+            "/ws", headers={"Authorization": "Bearer test-token"}
+        ) as ws:
+            hello = {**HELLO, "durable_commands": 1}
+            ws.send_json(hello)
+            assert ws.receive_json()["type"] == "sync_tasks"
+            frame = ws.receive_json()
+            received.append(frame)
+            ws.send_json({
+                "type": "cmd_result", "seq": 1, "cmd_id": frame["cmd_id"],
+                "device": frame["device"], "result_token": frame["result_token"],
+                "status": "succeeded", "ok": True,
+                "data": {"operators": []},
+            })
+            assert ws.receive_json() == {"type": "ack", "seq": 1}
+
+    thread = threading.Thread(target=agent_side, daemon=True)
+    thread.start()
+    time.sleep(0.1)
+    payload = {
+        "command_type": "scan_operators", "device_id": 1,
+        "idempotency_key": "scan-operation-1",
+    }
+    first = admin.post("/api/operations", json=payload)
+    assert first.status_code == 202
+    operation_id = first.json()["operation_id"]
+    duplicate = admin.post("/api/operations", json=payload)
+    assert duplicate.status_code == 202
+    assert duplicate.json()["operation_id"] == operation_id
+    for _ in range(20):
+        if admin.get(f"/api/operations/{operation_id}").json()["status"] == "succeeded":
+            break
+        time.sleep(0.1)
+    assert admin.get(f"/api/operations/{operation_id}").json()["status"] == "succeeded"
+    assert len(received) == 1
+    thread.join(timeout=2)
+
+
+def test_persistent_operation_conflicts_on_reused_key(admin):
+    with _connect(admin) as ws:
+        _greet(ws)
+    payload = {
+        "command_type": "scan_operators", "device_id": 1,
+        "idempotency_key": "scan-operation-2",
+    }
+    # Seed the row directly so this test does not need a live modem session.
+    db = admin.app.state.hub.db
+    db.create_operation(
+        actor="admin", target={"id": 1, "agent_id": "test-agent", "name": "a"},
+        frame={"type": "scan_operators"}, idempotency_key=payload["idempotency_key"],
+        deadline="2027-01-01T00:00:00+00:00", stream_id="", connection_id="",
+    )
+    response = admin.post(
+        "/api/operations", json={**payload, "command_type": "network_diagnostics"}
+    )
+    assert response.status_code == 409

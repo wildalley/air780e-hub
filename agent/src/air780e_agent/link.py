@@ -138,6 +138,7 @@ class ServerLink:
                 "agent_id": self.agent_id,
                 "version": self.version,
                 "protocol_version": PROTOCOL_VERSION,
+                "durable_commands": 1,
                 "last_seq": self.store.last_seq(),
                 # Tells the server which sequence-number space these events
                 # belong to, so a rebuilt local queue is read as a new stream

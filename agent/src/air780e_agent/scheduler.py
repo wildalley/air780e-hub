@@ -122,6 +122,34 @@ class KeepAliveScheduler:
         handle.add_done_callback(lambda _, key=task_id: self._running.pop(key, None))
         return {"task_id": task_id, "status": "started"}
 
+    async def run_manual(self, task_id: int, run_id: str) -> dict[str, Any]:
+        task = self.store.task(task_id)
+        if task is None:
+            raise ValueError(f"no such task: {task_id}")
+        if task_id in self._running:
+            raise ValueError(f"task {task_id} is already running")
+        task = {**task, "run_id": run_id, "retry_max": 0}
+        handle = asyncio.current_task()
+        self._running[task_id] = handle
+        try:
+            # Persist the scheduling advance before the hardware side effect.
+            # A restart must not turn this manual run into an overdue timer run.
+            planned = self._reschedule(task, self.clock(), ran=True)
+            try:
+                detail = await self._perform(task)
+            except TaskSkipped as exc:
+                self._report(task, "skipped", 0, "", str(exc), self.clock(), planned)
+                raise ValueError(str(exc)) from exc
+            except BaseException as exc:
+                self._report(task, "unknown", 1, "", str(exc) or "execution interrupted",
+                             self.clock(), planned)
+                raise
+            self._report(task, "ok", 1, detail, None, self.clock(), planned)
+            return {"task_id": task_id, "run_id": run_id, "status": "ok", "detail": detail}
+        finally:
+            if self._running.get(task_id) is handle:
+                self._running.pop(task_id, None)
+
     # -- the tick ----------------------------------------------------------
 
     async def tick_once(self) -> int:
@@ -315,6 +343,7 @@ class KeepAliveScheduler:
             task["id"], task["name"] or task["action"], status, attempts,
         )
         self.emit("task_result", {
+            "run_id": task.get("run_id"),
             "task_id": int(task["id"]),
             "device": task["device"],
             "ts": _iso(moment),

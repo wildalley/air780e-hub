@@ -202,6 +202,24 @@ outbox 能保证待办不因进程重启消失，但无法普遍保证外部推�
 
 优先迁移长扫描、诊断和短信发送；短期继续支持原同步接口但返回关联 ID，并明确未知状态。验收覆盖断连、服务端重启、代理超时、重复幂等键、迟到结果和不同设备并发。
 
+### 2026-09-06 已实现的第一版
+
+Server schema 已升至 19，新增 `command_operations` 作业表和 `/api/operations`、
+`/api/operations/{id}`、取消及分页查询接口。作业按操作者、设备和幂等键唯一；请求摘要
+不一致返回 409，队列使用全局 200、单设备 16 的有界限制。Server 重启把 `running` 标为
+`unknown`，Agent 断开只把已开始的作业标为 `unknown`，尚未下发的队列在同一事件流重连后
+重新绑定；只有 queued 作业可取消。
+
+新 Agent 在本地 `command_runs` journal 中保存命令请求和最终回执。成功结果可按相同
+`cmd_id` 重放，Agent 重启会为执行中的短信、呼叫等操作生成 `unknown` 回执。回执必须匹配
+Agent、设备、事件流和 `result_token`；Server 不会让旧回执覆盖已确认结果。手动任务的
+`operation_id` 同时作为 `run_id`，任务日志持久化该标识。
+
+原 `/devices/*`、`/messages/send` 和 `/tasks/*/run` 保留兼容入口；连接到新 Agent 时由
+Gateway 自动创建关联作业，连接到旧 Agent 时继续使用原同步等待。前端运维中心已经展示
+最近作业及 `unknown` 状态；旧 Agent 升级后即可使用 202 作业接口。真实短信、呼叫和长扫描
+仍需在部署环境做断连与代理超时演练。
+
 ## 8. B07：恢复维护模式与可回退切换
 
 优先级：P1。定位：[api.py](../server/src/hub_server/api.py) `restore():1181`；[db.py](../server/src/hub_server/db.py) `validate_backup():2165`、`restore_from():2207`；[state.py](../server/src/hub_server/state.py)。

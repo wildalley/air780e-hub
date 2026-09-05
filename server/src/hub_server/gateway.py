@@ -19,7 +19,7 @@ import logging
 import secrets
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
 from anyio import CancelScope
@@ -145,8 +145,9 @@ class AgentUnavailable(RuntimeError):
 
 
 class CommandFailed(RuntimeError):
-    def __init__(self, error: str) -> None:
+    def __init__(self, error: str, *, operation_id: str | None = None) -> None:
         self.error = error
+        self.operation_id = operation_id
         super().__init__(error)
 
 
@@ -175,6 +176,8 @@ class AgentConnection:
     tasks_next_check: float = 0.0
     tasks_sync_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     ready: bool = True
+    durable_commands: bool = False
+    connection_id: str = field(default_factory=lambda: secrets.token_hex(16))
 
     async def send(self, frame: dict[str, Any]) -> None:
         await self.websocket.send_text(json.dumps(frame, ensure_ascii=False))
@@ -398,6 +401,7 @@ class Gateway:
             stream_id=stream_id,
             devices=devices,
             ready=False,
+            durable_commands=frame.get("durable_commands") == 1,
         )
         # Reserve the ID before yielding, so concurrent hellos cannot both win.
         self.connections[agent_id] = connection
@@ -406,6 +410,9 @@ class Gateway:
                 await self.db.run(
                     self._persist_registration, agent_id, version,
                     protocol_version, stream_id, devices,
+                )
+                await self.db.run(
+                    self.db.rebind_operations, agent_id, stream_id, connection.connection_id,
                 )
                 connection.ready = True
                 for device in devices:
@@ -516,6 +523,7 @@ class Gateway:
         self._abandon_pending(connection)
         with CancelScope(shield=True):
             try:
+                await self.db.run(self.db.disconnect_operations, connection.connection_id)
                 going_down = await self.db.run(self._persist_disconnect, agent_id)
                 for row in going_down:
                     self._note_device(agent_id, row["name"], False)
@@ -592,7 +600,7 @@ class Gateway:
                 agent_id,
                 seq,
                 kind,
-                lambda: self._apply(agent_id, kind, frame, event_key),
+                lambda: self._apply(agent_id, kind, frame, event_key, connection.stream_id),
                 stream_id=connection.stream_id,
             )
             if not fresh:
@@ -603,7 +611,8 @@ class Gateway:
         await connection.send({"type": "ack", "seq": seq})
 
     def _apply(
-        self, agent_id: str, kind: str, frame: dict[str, Any], event_key: str = ""
+        self, agent_id: str, kind: str, frame: dict[str, Any], event_key: str = "",
+        stream_id: str = "",
     ) -> AppliedEvent:
         applied = AppliedEvent(event_key=event_key or None)
         if kind == "sms_in":
@@ -621,6 +630,7 @@ class Gateway:
         elif kind == "task_result":
             applied.task_id = self._apply_task_result(agent_id, frame)
         elif kind == "cmd_result":
+            self.db.apply_operation_result(agent_id, stream_id, frame)
             applied.command_result = True
         elif kind == "tasks_applied":
             self._apply_tasks_applied(agent_id, frame)
@@ -970,10 +980,11 @@ class Gateway:
 
     def _apply_task_result(self, agent_id: str, frame: dict[str, Any]) -> int | None:
         self.db.execute(
-            "INSERT INTO task_logs (task_id, ts, status, attempts, detail, error) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO task_logs (task_id, run_id, ts, status, attempts, detail, error) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 frame.get("task_id"),
+                frame.get("run_id"),
                 frame.get("ts") or utcnow(),
                 frame.get("status", "unknown"),
                 int(frame.get("attempts") or 1),
@@ -1016,6 +1027,99 @@ class Gateway:
 
     # -- commands ----------------------------------------------------------
 
+    async def submit_operation(
+        self, target: dict[str, Any], frame: dict[str, Any], *,
+        idempotency_key: str, timeout: float = COMMAND_TIMEOUT, actor: str = "admin",
+    ) -> dict[str, Any]:
+        # Replay lookup precedes availability checks: an offline target still
+        # has the same answer to an already accepted request.
+        existing = await self.db.run(
+            self.db.one,
+            "SELECT id FROM command_operations WHERE actor = ? AND device_id = ? "
+            "AND idempotency_key = ?", (actor, target["id"], idempotency_key),
+        )
+        connection = self.connections.get(target["agent_id"])
+        if existing is None:
+            if connection is None or not connection.ready:
+                raise AgentUnavailable("agent is not connected")
+            if not connection.durable_commands:
+                raise AgentUnavailable("agent upgrade required for persistent commands")
+        operation = await self.db.run(
+            self.db.create_operation, actor=actor, target=target, frame=frame,
+            idempotency_key=idempotency_key,
+            deadline=(datetime.now(UTC) + timedelta(seconds=timeout)).isoformat(timespec="seconds"),
+            stream_id=connection.stream_id if connection else "",
+            connection_id=connection.connection_id if connection else "",
+        )
+        return operation
+
+    async def dispatch_operations_once(self) -> None:
+        await self.db.run(self.db.expire_operations)
+        rows = await self.db.run(
+            self.db.query,
+            "SELECT id FROM command_operations q WHERE status = 'queued' "
+            "AND NOT EXISTS (SELECT 1 FROM command_operations r "
+            "WHERE r.device_id = q.device_id AND r.status = 'running') "
+            "ORDER BY created_at, rowid LIMIT 32",
+        )
+        seen: set[int] = set()
+        for row in rows:
+            operation = await self.db.run(self.db.operation, row["id"])
+            device_id = operation["device_id"]
+            if device_id in seen:
+                continue
+            seen.add(device_id)
+            connection = self.connections.get(operation["agent_id"])
+            if (
+                connection is None or not connection.ready
+                or connection.connection_id != operation["connection_id"]
+            ):
+                # It has not crossed the hardware boundary. Keep it queued so
+                # a reconnect can rebind the same event stream; expiry or an
+                # explicit cancel is what changes it to cancelled.
+                continue
+            if not await self.db.run(self.db.claim_operation, operation["id"]):
+                continue
+            try:
+                async with asyncio.timeout(5):
+                    await connection.send({
+                        **operation["frame"], "device": operation["device"],
+                        "cmd_id": operation["id"], "result_token": operation["result_token"],
+                        "deadline": operation["deadline"], "run_id": operation["id"],
+                        "expected_imei": operation["expected_imei"],
+                        "expected_iccid": operation["expected_iccid"],
+                    })
+            except Exception:
+                await self.db.run(
+                    self.db.execute,
+                    "UPDATE command_operations SET status = 'unknown', "
+                    "error = 'socket send did not complete', updated_at = ? "
+                    "WHERE id = ? AND status = 'running'", (utcnow(), operation["id"]),
+                )
+
+    async def run_operations(self) -> None:
+        while True:
+            try:
+                await self.dispatch_operations_once()
+            except Exception:
+                log.exception("operation dispatch failed")
+            await asyncio.sleep(0.2)
+
+    async def wait_operation(self, operation_id: str) -> dict[str, Any]:
+        while True:
+            operation = await self.db.run(self.db.operation, operation_id)
+            if operation["status"] not in ("queued", "running"):
+                if operation["status"] == "succeeded":
+                    return {
+                        **(operation["result"] or {}), "operation_id": operation_id,
+                        "status_url": f"/api/operations/{operation_id}",
+                    }
+                raise CommandFailed(
+                    f"{operation['status']}: {operation['error'] or 'command failed'}",
+                    operation_id=operation_id,
+                )
+            await asyncio.sleep(0.2)
+
     def _resolve_command(
         self, connection: AgentConnection, frame: dict[str, Any]
     ) -> None:
@@ -1056,6 +1160,24 @@ class Gateway:
         connection = self.connections.get(agent_id)
         if connection is None or not connection.ready:
             raise AgentUnavailable(f"agent {agent_id!r} is not connected")
+
+        if connection.durable_commands and frame.get("type") != "sync_tasks":
+            device = frame.get("device")
+            if frame.get("type") == "run_task":
+                task = await self.db.run(
+                    self.db.one, "SELECT device FROM tasks WHERE id = ?", (frame.get("task_id"),)
+                )
+                device = (task or {}).get("device")
+            target = await self.db.run(
+                self.db.one, "SELECT id, agent_id, name FROM devices "
+                "WHERE agent_id = ? AND name = ?", (agent_id, device),
+            )
+            if target is None:
+                raise AgentUnavailable("command target does not exist")
+            operation = await self.submit_operation(
+                target, frame, idempotency_key=secrets.token_hex(16), timeout=timeout,
+            )
+            return await self.wait_operation(operation["id"])
 
         cmd_id = "c-" + secrets.token_hex(4)
         future: asyncio.Future = asyncio.get_running_loop().create_future()

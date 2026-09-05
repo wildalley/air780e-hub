@@ -35,6 +35,8 @@ from .db import (
     BadCursor,
     MessageScope,
     MigrationFailed,
+    OperationConflict,
+    OperationQueueFull,
     utcnow,
 )
 from .gateway import (
@@ -243,6 +245,29 @@ class DeviceRef(BaseModel):
 class SendSmsBody(DeviceRef):
     number: str = Field(min_length=1, max_length=32)
     body: str = Field(min_length=1, max_length=2000)
+
+
+class OperationBody(BaseModel):
+    command_type: Literal["scan_operators", "network_diagnostics", "send_sms", "run_task"]
+    device_id: int | None = Field(default=None, gt=0)
+    task_id: int | None = Field(default=None, gt=0)
+    number: str | None = Field(default=None, min_length=1, max_length=32, pattern=r"^[+0-9*#]+$")
+    body: str | None = Field(default=None, min_length=1, max_length=2000)
+    idempotency_key: str = Field(min_length=8, max_length=128, pattern=r"^[a-zA-Z0-9_.:-]+$")
+
+    @model_validator(mode="after")
+    def validate_command(self):
+        if self.command_type == "run_task":
+            if self.task_id is None or self.device_id is not None:
+                raise ValueError("run_task requires task_id and no device_id")
+        elif self.device_id is None or self.task_id is not None:
+            raise ValueError("device command requires device_id and no task_id")
+        if self.command_type == "send_sms":
+            if self.number is None or self.body is None:
+                raise ValueError("send_sms requires number and body")
+        elif self.number is not None or self.body is not None:
+            raise ValueError("number and body are only valid for send_sms")
+        return self
 
 
 class RawAtBody(DeviceRef):
@@ -510,7 +535,9 @@ def build_router(state: AppState) -> APIRouter:
 
     def _device_by_id(device_id: int) -> dict[str, Any]:
         row = state.db.one(
-            "SELECT id, agent_id, name FROM devices WHERE id = ?", (device_id,)
+            "SELECT d.id, d.agent_id, d.name, d.imei, s.iccid "
+            "FROM devices d LEFT JOIN sims s ON s.id = d.sim_id WHERE d.id = ?",
+            (device_id,),
         )
         if row is None:
             raise HTTPException(status_code=404, detail="no such device")
@@ -1535,6 +1562,102 @@ def build_router(state: AppState) -> APIRouter:
             _safe_unlink(tmp)
         return {"ok": True}
 
+    # Registered after /operations/diagnostics, /incidents and /audit.
+
+    def _operation_view(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            **{key: row[key] for key in (
+                "id", "device_id", "agent_id", "device", "command_type", "status",
+                "deadline", "result", "error", "created_at", "updated_at",
+            )},
+            "operation_id": row["id"], "status_url": f"/api/operations/{row['id']}",
+            "run_id": row["id"] if row["command_type"] == "run_task" else None,
+        }
+
+    def _operation(operation_id: str) -> dict[str, Any]:
+        row = state.db.operation(operation_id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="no such operation")
+        return _operation_view(row)
+
+    def _operation_target(body: OperationBody) -> tuple[dict[str, Any], dict[str, Any]]:
+        frame: dict[str, Any] = {"type": body.command_type}
+        if body.command_type == "run_task":
+            agent_id = _task_agent(body.task_id)
+            task = state.db.one("SELECT * FROM tasks WHERE id = ?", (body.task_id,))
+            target = state.db.one(
+                "SELECT * FROM devices WHERE agent_id = ? AND name = ?",
+                (agent_id, task["device"]),
+            )
+            if target is None:
+                raise HTTPException(status_code=404, detail="task device does not exist")
+            frame["task_id"] = body.task_id
+        else:
+            target = _device_by_id(body.device_id)
+        if body.command_type == "send_sms":
+            frame.update(number=body.number, body=body.body)
+        return target, frame
+
+    @router.post("/operations", dependencies=guard, status_code=202)
+    async def create_operation(body: OperationBody, response: Response) -> dict[str, Any]:
+        target, frame = await state.db.run(_operation_target, body)
+        timeout = {
+            "scan_operators": 210, "network_diagnostics": 165,
+            "send_sms": 180, "run_task": 210,
+        }[body.command_type]
+        if body.command_type == "run_task":
+            revision = await state.gateway.push_tasks(target["agent_id"])
+            if revision is not None:
+                frame["revision"] = revision
+        try:
+            row = await state.gateway.submit_operation(
+                target, frame, idempotency_key=body.idempotency_key, timeout=timeout,
+            )
+        except OperationConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except OperationQueueFull as exc:
+            raise HTTPException(
+                status_code=429, detail=str(exc), headers={"Retry-After": "2"},
+            ) from exc
+        except AgentUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        view = _operation_view(row)
+        response.headers["Location"] = view["status_url"]
+        response.headers["Cache-Control"] = "no-store"
+        return view
+
+    @router.get("/operations", dependencies=guard)
+    def list_operations(
+        limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0),
+        device_id: int | None = None,
+    ) -> dict[str, Any]:
+        where = "WHERE device_id = ?" if device_id is not None else ""
+        params = (device_id,) if device_id is not None else ()
+        rows = state.db.read_query(
+            f"SELECT id FROM command_operations {where} ORDER BY created_at DESC, rowid DESC "
+            "LIMIT ? OFFSET ?", (*params, limit, offset),
+        )
+        return {
+            "items": [_operation(row["id"]) for row in rows],
+            "total": state.db.read_one(
+                f"SELECT COUNT(*) AS n FROM command_operations {where}", params,
+            )["n"],
+        }
+
+    @router.get("/operations/{operation_id}", dependencies=guard)
+    def get_operation(operation_id: str, response: Response) -> dict[str, Any]:
+        response.headers["Cache-Control"] = "no-store"
+        return _operation(operation_id)
+
+    @router.post("/operations/{operation_id}/cancel", dependencies=guard)
+    async def cancel_operation(operation_id: str) -> dict[str, Any]:
+        await state.db.run(_operation, operation_id)
+        if not await state.db.run(state.db.cancel_operation, operation_id):
+            raise HTTPException(
+                status_code=409, detail="only an undispatched operation can be cancelled",
+            )
+        return await state.db.run(_operation, operation_id)
+
     # -- helpers -----------------------------------------------------------
 
     def _safe_unlink(path: str) -> None:
@@ -1553,7 +1676,13 @@ def build_router(state: AppState) -> APIRouter:
         except CommandFailed as exc:
             # The agent's own error text (a +CMS code, "device offline", …) is
             # far more useful than a generic failure.
-            raise HTTPException(status_code=502, detail=exc.error) from exc
+            headers = None
+            if exc.operation_id:
+                headers = {
+                    "X-Operation-ID": exc.operation_id,
+                    "Location": f"/api/operations/{exc.operation_id}",
+                }
+            raise HTTPException(status_code=502, detail=exc.error, headers=headers) from exc
 
     async def _sync_tasks() -> None:
         """Update desired versions, send online snapshots, and let receipts confirm them."""

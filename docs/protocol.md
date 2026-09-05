@@ -36,7 +36,10 @@ Server 将 `(agent_id, seq)` 幂等标记和该事件产生的业务写入放在
 - **重复必然发生**(ack 丢失时会重放)。server 端按 `(agent_id, seq)` 去重,必须幂等。
 - **乱序不会发生**。agent 按 seq 顺序发送,不并发。队列达到上限时允许只裁剪旧
   `status` 采样,所以接收端不得把 seq 有缺口等同于短信丢失。
-- 下行命令带 `cmd_id`,agent 执行后回 `cmd_result`。命令接收队列**不持久化**:连接断开时丢弃尚未开始的命令,已开始的操作继续执行并将结果写入本地事件队列。Server 超时或断线后不能据此认定硬件未执行,短信和呼叫不得自动重发。
+- 下行命令带 `cmd_id`;支持持久化作业的 Agent 在 `hello` 中声明
+  `durable_commands: 1`。Server 先保存作业再下发,Agent 把 `cmd_id`、请求摘要和结果写入本地
+  journal。连接断开或 Server 重启时,已开始的发送/呼叫为 `unknown`,不能自动重发；迟到回执
+  仍可在同一 `stream_id` 下收敛原作业。
 
 保号任务是唯一例外:它由 `sync_tasks` 全量下发并**在 agent 本地持久化**,断网期间照常执行(决策 D3)。
 
@@ -52,8 +55,8 @@ Agent 收帧循环立即处理 `ack` 和 `resend_from`,硬件命令交给独立�
 
 普通断线不会取消已开始的硬件操作,其结果可随本地事件队列在新连接上补传。Agent 停机则
 先取消并等待命令任务退出,再关闭模块和 SQLite;未开始命令报告未执行,被中断的运行中命令
-报告 `execution result is unknown`。当前 Server 的命令等待仍绑定原连接,补传回执不意味着
-浏览器中的旧请求会自动恢复;跨重启幂等和可查询的持久化命令作业仍属 B06 待办。
+报告 `execution result is unknown`。旧 Agent 仍使用兼容的内存等待接口；新 Agent 使用
+`/api/operations` 的持久化作业接口，浏览器可通过 `status_url` 查询。
 
 ---
 
@@ -70,6 +73,7 @@ Agent 自主重放,正常连接不依赖 Server 根据该值计算范围。
   "agent_id": "site-a",
   "version": "0.1.0",
   "protocol_version": 1,
+  "durable_commands": 1,
   "last_seq": 1420,
   "devices": [
     {
@@ -331,11 +335,19 @@ Server 仅更新当前 Agent、revision、sync_id 均匹配的同步状态,旧�
   "type": "cmd_result",
   "seq": 1425,
   "cmd_id": "c-8f31",
+  "device": "a",
+  "result_token": "server-issued-token",
+  "status": "succeeded",
   "ok": true,
   "data": {"lines": ["+CSQ: 24,99"]},
   "error": null
 }
 ```
+
+持久化作业的 `cmd_id` 就是 `operation_id`，并携带 Server 生成的 `result_token`。
+`status` 可为 `succeeded`、`failed`、`unknown` 或 `cancelled`；`unknown` 表示命令已经
+进入执行边界但硬件结果不可证实。Server 只接受匹配 Agent、`stream_id`、设备和 token 的
+迟到回执，已确认的结果不会被旧事件覆盖。
 
 ### `log`
 

@@ -33,6 +33,7 @@ class AppState:
         db = Database(settings.db_path)
         # Nothing is connected at startup, whatever the last run left behind.
         db.mark_all_agents_disconnected()
+        db.recover_operations()
         auth = Auth(db, session_ttl_hours=settings.session_ttl_hours)
         auth.purge_expired_sessions()
         # The notifier is what makes a stored SMS reach a phone; the gateway

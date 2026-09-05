@@ -245,6 +245,34 @@ export interface NetworkDiagnostics {
   sysinfo?: NetworkDiagnostic
 }
 
+export type OperationStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'unknown' | 'cancelled'
+
+export interface Operation {
+  id: string
+  operation_id: string
+  device_id: number
+  agent_id: string
+  device: string
+  command_type: string
+  status: OperationStatus
+  deadline: string
+  result: Record<string, unknown> | null
+  error: string | null
+  created_at: string
+  updated_at: string
+  status_url: string
+  run_id: string | null
+}
+
+export interface OperationInput {
+  command_type: 'scan_operators' | 'network_diagnostics' | 'send_sms' | 'run_task'
+  device_id?: number
+  task_id?: number
+  number?: string
+  body?: string
+  idempotency_key: string
+}
+
 export type SimBillingType = 'unknown' | 'payg' | 'prepaid' | 'postpaid'
 
 export interface Sim {
@@ -828,6 +856,10 @@ export const api = {
   },
   logs: (query = '') => get<Page<AgentLog>>(`/api/logs?${query}`),
   operations: {
+    create: (body: OperationInput) => post<Operation>('/api/operations', body),
+    get: (id: string) => get<Operation>(`/api/operations/${id}`),
+    list: (query = '') => get<Page<Operation>>(`/api/operations?${query}`),
+    cancel: (id: string) => post<Operation>(`/api/operations/${id}/cancel`),
     diagnostics: () => get<Diagnostics>('/api/operations/diagnostics'),
     audit: (query = '') => get<Page<AuditEvent>>(`/api/operations/audit?${query}`),
     incidents: (status: 'open' | 'all' = 'open', query = '') =>

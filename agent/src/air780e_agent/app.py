@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import UTC, datetime
 from typing import Any
 
 from . import __version__
@@ -276,11 +277,24 @@ class AgentApp:
 
     def reject_command(self, frame: dict[str, Any], error: str) -> None:
         log.warning("command %s rejected: %s", frame.get("type"), error)
+        if frame.get("result_token") and isinstance(frame.get("cmd_id"), str):
+            if self.store.begin_command(frame) == "new":
+                self.store.finish_command(frame, "cancelled", error=error)
+            self.link.wake()
+            return
         self._cmd_result(frame.get("cmd_id"), False, error=error)
 
     async def handle_command(self, frame: dict[str, Any]) -> None:
         kind = frame.get("type")
         cmd_id = frame.get("cmd_id")
+        durable = bool(frame.get("result_token")) and isinstance(cmd_id, str)
+        if durable:
+            claimed = self.store.begin_command(frame)
+            if claimed != "new":
+                if claimed == "conflict":
+                    log.warning("command id reused with another payload: %s", cmd_id)
+                self.link.wake()
+                return
 
         handlers = {
             "send_sms": self._cmd_send_sms,
@@ -299,18 +313,63 @@ class AgentApp:
         handler = handlers.get(kind or "")
         if handler is None:
             log.warning("unknown command from server: %s", kind)
-            self._cmd_result(cmd_id, False, error=f"unknown command {kind!r}")
+            if durable:
+                self.store.finish_command(frame, "failed", error=f"unknown command {kind!r}")
+                self.link.wake()
+            else:
+                self._cmd_result(cmd_id, False, error=f"unknown command {kind!r}")
             return
 
         try:
+            if durable:
+                deadline = datetime.fromisoformat(frame["deadline"])
+                if deadline <= datetime.now(UTC):
+                    self.store.finish_command(frame, "cancelled", error="expired before execution")
+                    self.link.wake()
+                    return
+                worker = self._worker(frame)
+                expected_imei = str(frame.get("expected_imei") or "")
+                expected_iccid = str(frame.get("expected_iccid") or "")
+                identity_changed = (
+                    expected_imei and worker.state.imei and expected_imei != worker.state.imei
+                ) or (
+                    expected_iccid and worker.state.iccid and expected_iccid != worker.state.iccid
+                )
+                if identity_changed:
+                    self.store.finish_command(frame, "failed", error="device identity changed")
+                    self.link.wake()
+                    return
             data = await handler(frame)
+        except asyncio.CancelledError:
+            if durable:
+                self.store.finish_command(frame, "unknown", error="agent stopped during execution")
+                self.link.wake()
+            raise
         except DeviceOffline as exc:
-            self._cmd_result(cmd_id, False, error=str(exc))
+            if durable:
+                self.store.finish_command(frame, "failed", error=str(exc))
+            else:
+                self._cmd_result(cmd_id, False, error=str(exc))
+        except ValueError as exc:
+            if durable:
+                self.store.finish_command(frame, "failed", error=str(exc))
+            else:
+                self._cmd_result(cmd_id, False, error=str(exc))
         except Exception as exc:
             log.exception("command %s failed", kind)
-            self._cmd_result(cmd_id, False, error=str(exc))
+            if durable:
+                # Once execution enters the modem an exception is not proof
+                # that no segment or call reached the network.
+                self.store.finish_command(frame, "unknown", error=str(exc))
+            else:
+                self._cmd_result(cmd_id, False, error=str(exc))
         else:
-            self._cmd_result(cmd_id, True, data=data)
+            if durable:
+                self.store.finish_command(frame, "succeeded", data=data)
+            else:
+                self._cmd_result(cmd_id, True, data=data)
+        if durable:
+            self.link.wake()
 
     def _cmd_result(
         self,
@@ -337,10 +396,10 @@ class AgentApp:
         worker = self._worker(frame)
         number = str(frame.get("number", "")).strip()
         body = str(frame.get("body", ""))
-        if not number:
-            raise ValueError("send_sms needs a number")
-        if not body:
-            raise ValueError("send_sms needs a body")
+        if not number or len(number) > 32 or any(c not in "+0123456789*#" for c in number):
+            raise ValueError("send_sms needs a valid number")
+        if not body or len(body) > 2000:
+            raise ValueError("send_sms needs a body of at most 2000 characters")
         refs = await worker.send_sms(number, body, cmd_id=frame.get("cmd_id"))
         return {"refs": refs}
 
@@ -381,6 +440,13 @@ class AgentApp:
             raise ValueError("run_task needs an integer task_id")
         if "revision" in frame and frame["revision"] != self.store.get(TASK_REVISION_KEY):
             raise ValueError("task configuration has not been applied")
+        if frame.get("result_token"):
+            if frame.get("run_id") != frame.get("cmd_id"):
+                raise ValueError("manual task run_id must equal cmd_id")
+            task = self.store.task(task_id)
+            if task is None or task["device"] != frame.get("device"):
+                raise ValueError("task device does not match command target")
+            return await self.scheduler.run_manual(task_id, frame["run_id"])
         return self.scheduler.run_now(task_id)
 
     async def _cmd_query(self, frame: dict[str, Any]) -> dict[str, Any]:

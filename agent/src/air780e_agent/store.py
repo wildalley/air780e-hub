@@ -83,6 +83,15 @@ CREATE TABLE IF NOT EXISTS kv (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS command_runs (
+    cmd_id TEXT PRIMARY KEY,
+    request_hash TEXT NOT NULL,
+    frame TEXT NOT NULL,
+    status TEXT NOT NULL,
+    result TEXT,
+    updated_at TEXT NOT NULL
+);
 """
 
 TASK_FIELDS = (
@@ -124,9 +133,74 @@ class LocalStore:
         self._db.row_factory = sqlite3.Row
         self._db.executescript(SCHEMA)
         self._ensure_stream_id()
+        self._recover_commands()
 
     def close(self) -> None:
         self._db.close()
+
+    # -- command execution journal ----------------------------------------
+
+    def command(self, cmd_id: str) -> dict[str, Any] | None:
+        row = self._db.execute(
+            "SELECT * FROM command_runs WHERE cmd_id = ?", (cmd_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        result["frame"] = json.loads(result["frame"])
+        result["result"] = json.loads(result["result"]) if result["result"] else None
+        return result
+
+    def begin_command(self, frame: dict[str, Any]) -> str:
+        encoded = json.dumps(frame, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        request_hash = hashlib.sha256(encoded.encode()).hexdigest()
+        existing = self.command(frame["cmd_id"])
+        if existing:
+            if existing["request_hash"] != request_hash:
+                return "conflict"
+            if existing["result"] is not None:
+                self.append_event("cmd_result", existing["result"])
+                return "replayed"
+            return "running"
+        self._db.execute(
+            "INSERT INTO command_runs (cmd_id,request_hash,frame,status,updated_at) "
+            "VALUES (?,?,?,'running',?)", (frame["cmd_id"], request_hash, encoded, utcnow()),
+        )
+        return "new"
+
+    def finish_command(
+        self, frame: dict[str, Any], status: str, *,
+        data: dict[str, Any] | None = None, error: str | None = None,
+    ) -> None:
+        payload = {
+            "cmd_id": frame["cmd_id"], "device": frame.get("device"),
+            "result_token": frame.get("result_token"), "run_id": frame.get("run_id"),
+            "imei": frame.get("expected_imei", ""), "iccid": frame.get("expected_iccid", ""),
+            "status": status, "ok": status == "succeeded", "data": data, "error": error,
+        }
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = self._db.execute(
+                "UPDATE command_runs SET status = ?, result = ?, updated_at = ? "
+                "WHERE cmd_id = ? AND status = 'running'",
+                (status, json.dumps(payload, ensure_ascii=False), utcnow(), frame["cmd_id"]),
+            )
+            if cursor.rowcount:
+                self.append_event("cmd_result", payload)
+            self._db.execute("COMMIT")
+        except BaseException:
+            self._db.execute("ROLLBACK")
+            raise
+
+    def _recover_commands(self) -> None:
+        rows = self._db.execute(
+            "SELECT frame FROM command_runs WHERE status = 'running'"
+        ).fetchall()
+        for row in rows:
+            self.finish_command(
+                json.loads(row["frame"]), "unknown",
+                error="agent restarted after command started; execution result is unknown",
+            )
 
     # -- outbound queue ----------------------------------------------------
 

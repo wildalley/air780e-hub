@@ -19,6 +19,7 @@ import functools
 import hashlib
 import json
 import logging
+import secrets
 import sqlite3
 import threading
 import time
@@ -58,6 +59,8 @@ log = logging.getLogger(__name__)
 # Version 16 makes a notification owed by a stored event durable, so a restart
 # resumes it instead of losing it with the process.
 # Version 17 records desired and acknowledged Agent task configurations.
+# Version 18 persists command operations and their outcomes.
+# Version 19 records durable manual task run identifiers.
 #
 # To add a migration: append one entry to ``MIGRATIONS`` with the next integer
 # and bump this constant, and add the same columns/tables/indexes to SCHEMA so a brand
@@ -67,11 +70,51 @@ log = logging.getLogger(__name__)
 # Never renumber or edit a released entry — a database that already ran it will
 # not run it again, so an edit only affects databases that have not, and the two
 # then disagree about what version N means.
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 19
 
 # Persisted (settings table) key for the SMS retention window, in days.  The
 # operator edits it on the Notify page; when unset the env default applies.
 SETTING_MESSAGE_RETENTION_DAYS = "message_retention_days"
+
+
+class OperationConflict(ValueError):
+    pass
+
+
+class OperationQueueFull(RuntimeError):
+    pass
+
+
+OPERATION_SCHEMA = """
+CREATE TABLE IF NOT EXISTS command_operations (
+    id TEXT PRIMARY KEY,
+    actor TEXT NOT NULL,
+    device_id INTEGER NOT NULL,
+    agent_id TEXT NOT NULL,
+    device TEXT NOT NULL,
+    command_type TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    frame TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued'
+        CHECK(status IN ('queued','running','succeeded','failed','unknown','cancelled')),
+    deadline TEXT NOT NULL,
+    stream_id TEXT NOT NULL,
+    connection_id TEXT NOT NULL,
+    result_token TEXT NOT NULL,
+    expected_imei TEXT NOT NULL DEFAULT '',
+    expected_iccid TEXT NOT NULL DEFAULT '',
+    result TEXT,
+    error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(actor, device_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_operations_status
+    ON command_operations(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_operations_device
+    ON command_operations(device_id, created_at DESC);
+"""
 
 
 class SchemaTooNew(RuntimeError):
@@ -440,6 +483,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE TABLE IF NOT EXISTS task_logs (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id  INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+    run_id   TEXT,
     ts       TEXT NOT NULL,
     status   TEXT NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 1,
@@ -746,6 +790,9 @@ class MessageScope:
         return ts, int(raw_id)
 
 
+SCHEMA += OPERATION_SCHEMA
+
+
 class Database:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
@@ -878,6 +925,8 @@ class Database:
          "_migration_notify_outbox"),
         (17, "track Agent task configuration acknowledgements",
          "_migration_task_sync"),
+        (18, "persist command operations and outcomes", "_migration_operations"),
+        (19, "record durable manual task run identifiers", "_migration_task_run_id"),
     )
 
     def _add_columns_if_missing(self, table: str, columns: dict[str, str]) -> None:
@@ -1271,6 +1320,14 @@ class Database:
             "tasks_synced_at": "TEXT",
         })
 
+    def _migration_operations(self) -> None:
+        for statement in OPERATION_SCHEMA.split(";"):
+            if statement.strip():
+                self._db.execute(statement)
+
+    def _migration_task_run_id(self) -> None:
+        self._add_columns_if_missing("task_logs", {"run_id": "TEXT"})
+
     def _snapshot_before_migration(self, from_version: int) -> Path | None:
         """Copy the database aside before migrating it.
 
@@ -1410,6 +1467,135 @@ class Database:
                 return future.result()
 
     # -- low level ---------------------------------------------------------
+
+    def operation(self, operation_id: str) -> dict[str, Any] | None:
+        row = self.one("SELECT * FROM command_operations WHERE id = ?", (operation_id,))
+        if row is not None:
+            row["frame"] = json.loads(row["frame"])
+            row["result"] = json.loads(row["result"]) if row["result"] else None
+        return row
+
+    def create_operation(
+        self, *, actor: str, target: dict[str, Any], frame: dict[str, Any],
+        idempotency_key: str, deadline: str, stream_id: str, connection_id: str,
+    ) -> dict[str, Any]:
+        encoded = json.dumps(frame, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        request_hash = hashlib.sha256(encoded.encode()).hexdigest()
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self.one(
+                    "SELECT id, request_hash FROM command_operations "
+                    "WHERE actor = ? AND device_id = ? AND idempotency_key = ?",
+                    (actor, target["id"], idempotency_key),
+                )
+                if existing:
+                    if existing["request_hash"] != request_hash:
+                        raise OperationConflict("idempotency key already used with another request")
+                    operation_id = existing["id"]
+                else:
+                    counts = self.one(
+                        "SELECT COUNT(*) AS total, "
+                        "COALESCE(SUM(device_id = ?), 0) AS device_total "
+                        "FROM command_operations WHERE status IN ('queued', 'running')",
+                        (target["id"],),
+                    )
+                    if counts["total"] >= 200 or counts["device_total"] >= 16:
+                        raise OperationQueueFull("command queue is full")
+                    operation_id = "op-" + secrets.token_hex(16)
+                    now = utcnow()
+                    self.execute(
+                        "INSERT INTO command_operations "
+                        "(id,actor,device_id,agent_id,device,command_type,request_hash,"
+                        "idempotency_key,frame,deadline,stream_id,connection_id,result_token,"
+                        "expected_imei,expected_iccid,created_at,updated_at) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (operation_id, actor, target["id"], target["agent_id"], target["name"],
+                         frame["type"], request_hash, idempotency_key, encoded, deadline,
+                         stream_id, connection_id, secrets.token_hex(16),
+                         target.get("imei") or "", target.get("iccid") or "", now, now),
+                    )
+                self._db.execute("COMMIT")
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
+            return self.operation(operation_id)
+
+    def recover_operations(self) -> None:
+        # Only queued work is provably unstarted: claim commits before socket send.
+        self.execute(
+            "UPDATE command_operations SET status = 'unknown', "
+            "error = 'server restarted before result was confirmed', updated_at = ? "
+            "WHERE status = 'running'", (utcnow(),),
+        )
+
+    def disconnect_operations(self, connection_id: str) -> None:
+        self.execute(
+            "UPDATE command_operations SET status = 'unknown', "
+            "error = 'agent disconnected before result was confirmed', updated_at = ? "
+            "WHERE connection_id = ? AND status = 'running'",
+            (utcnow(), connection_id),
+        )
+
+    def rebind_operations(self, agent_id: str, stream_id: str, connection_id: str) -> None:
+        self.execute(
+            "UPDATE command_operations SET connection_id = ?, stream_id = ?, updated_at = ? "
+            "WHERE agent_id = ? AND status = 'queued' AND stream_id = ?",
+            (connection_id, stream_id, utcnow(), agent_id, stream_id),
+        )
+
+    def expire_operations(self) -> None:
+        now = utcnow()
+        self.execute(
+            "UPDATE command_operations SET status = CASE status "
+            "WHEN 'queued' THEN 'cancelled' ELSE 'unknown' END, "
+            "error = 'command deadline elapsed', updated_at = ? "
+            "WHERE deadline <= ? AND status IN ('queued','running')", (now, now),
+        )
+
+    def claim_operation(self, operation_id: str) -> bool:
+        return bool(self.execute(
+            "UPDATE command_operations SET status = 'running', updated_at = ? "
+            "WHERE id = ? AND status = 'queued' AND deadline > ?",
+            (utcnow(), operation_id, utcnow()),
+        ).rowcount)
+
+    def cancel_operation(self, operation_id: str) -> bool:
+        return bool(self.execute(
+            "UPDATE command_operations SET status = 'cancelled', "
+            "error = 'cancelled before dispatch', updated_at = ? "
+            "WHERE id = ? AND status = 'queued'", (utcnow(), operation_id),
+        ).rowcount)
+
+    def apply_operation_result(
+        self, agent_id: str, stream_id: str, frame: dict[str, Any],
+    ) -> None:
+        status = frame.get("status")
+        if status not in ("succeeded", "failed", "unknown", "cancelled"):
+            return
+        if (status == "succeeded") != (frame.get("ok") is True):
+            return
+        if not all(isinstance(frame.get(key), str) for key in (
+            "cmd_id", "device", "result_token",
+        )):
+            return
+        if frame.get("error") is not None and not isinstance(frame["error"], str):
+            return
+        if frame.get("data") is not None and not isinstance(frame["data"], dict):
+            return
+        self.execute(
+            "UPDATE command_operations SET status = ?, result = ?, error = ?, updated_at = ? "
+            "WHERE id = ? AND agent_id = ? AND stream_id = ? AND device = ? "
+            "AND result_token = ? AND status IN ('running','unknown') "
+            "AND (expected_imei = '' OR expected_imei = "
+            "(SELECT imei FROM devices WHERE id = device_id)) "
+            "AND (expected_iccid = '' OR expected_iccid = "
+            "(SELECT s.iccid FROM sims s JOIN devices d ON d.sim_id = s.id "
+            "WHERE d.id = device_id))",
+            (status, json.dumps(frame.get("data"), ensure_ascii=False), frame.get("error"),
+             utcnow(), frame.get("cmd_id"), agent_id, stream_id, frame.get("device"),
+             frame.get("result_token")),
+        )
 
     def query(self, sql: str, params: tuple | dict = ()) -> list[dict[str, Any]]:
         with self._lock:

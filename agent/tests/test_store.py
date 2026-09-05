@@ -199,3 +199,28 @@ def test_kv(store):
     store.set("k", "v")
     store.set("k", "v2")
     assert store.get("k") == "v2"
+
+
+def test_command_journal_replays_completed_result(store):
+    frame = {"cmd_id": "op-1", "type": "send_sms", "device": "a"}
+    assert store.begin_command(frame) == "new"
+    store.finish_command(frame, "succeeded", data={"refs": [4]})
+    assert store.command("op-1")["status"] == "succeeded"
+    assert store.begin_command(frame) == "replayed"
+    assert store.unacked_events()[-1].payload["data"] == {"refs": [4]}
+
+
+def test_command_journal_marks_interrupted_work_unknown_on_reopen(tmp_path):
+    path = tmp_path / "agent.db"
+    store = LocalStore(path)
+    frame = {"cmd_id": "op-2", "type": "send_sms", "device": "a"}
+    assert store.begin_command(frame) == "new"
+    store.close()
+
+    reopened = LocalStore(path)
+    try:
+        command = reopened.command("op-2")
+        assert command["status"] == "unknown"
+        assert reopened.unacked_events()[-1].payload["status"] == "unknown"
+    finally:
+        reopened.close()

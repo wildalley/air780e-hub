@@ -121,6 +121,7 @@ async def test_hello_advertises_the_wire_protocol_version(tmp_path, monkeypatch)
         "agent_id": "site-a",
         "version": "0.1.0",
         "protocol_version": PROTOCOL_VERSION,
+        "durable_commands": 1,
         "last_seq": 0,
         "stream_id": stream,
         "devices": [{"name": "a"}],

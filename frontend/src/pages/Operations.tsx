@@ -31,7 +31,7 @@ import ExpandMoreIcon from '@mui/icons-material/ExpandMore'
 import StorageIcon from '@mui/icons-material/StorageOutlined'
 import useSWR, { useSWRConfig } from 'swr'
 import { successRate } from '../opsStats'
-import { api, ApiError, type ActivityWindow, type Incident } from '../api'
+import { api, ApiError, type ActivityWindow, type Incident, type Operation } from '../api'
 import { formatTs } from '../format'
 import { usePager } from '../swr'
 import { useToast } from '../toast'
@@ -51,6 +51,16 @@ const STATUS_LABEL: Record<Incident['status'], string> = {
   active: '待处理',
   acknowledged: '已确认',
   resolved: '已解决',
+}
+
+const OPERATION_STATUS_LABEL: Record<Operation['status'], string> = {
+  queued: '排队中', running: '执行中', succeeded: '成功', failed: '失败',
+  unknown: '结果未知', cancelled: '已取消',
+}
+
+const OPERATION_TYPE_LABEL: Record<string, string> = {
+  scan_operators: '运营商扫描', network_diagnostics: '网络诊断',
+  send_sms: '发送短信', run_task: '手动任务',
 }
 
 function formatBytes(value: number): string {
@@ -164,6 +174,17 @@ export function OperationsPage() {
   )
   const incidents = incidentPage?.items ?? []
   const audit = auditPage?.items ?? []
+  const {
+    data: operationPage,
+    error: operationError,
+    isLoading: operationLoading,
+    mutate: mutateOperations,
+  } = useSWR(
+    ['/api/operations', 'recent'],
+    () => api.operations.list('limit=50'),
+    { refreshInterval: 1000, keepPreviousData: true },
+  )
+  const operations = operationPage?.items ?? []
 
   // Resolving an incident changes the list, the active-incident tile in
   // diagnostics, and the nav badge that reads the same count endpoint.
@@ -540,6 +561,7 @@ export function OperationsPage() {
         <Tabs value={tab} onChange={(_, next) => setTab(next)} sx={{ px: 2 }}>
           <Tab label={`事件 (${incidents.length})`} />
           <Tab label={`管理审计 (${audit.length})`} />
+          <Tab label={`命令作业 (${operations.length})`} />
         </Tabs>
         <CardContent sx={{ p: 0, '&:last-child': { pb: 0 } }}>
           {tab === 0 ? (
@@ -650,7 +672,7 @@ export function OperationsPage() {
                 <Pager total={incidentPage?.total ?? 0} pager={incidentPager} />
               </TableContainer>
             </>
-          ) : (
+          ) : tab === 1 ? (
             <>
               <RefreshNotice
                 data={auditPage}
@@ -692,6 +714,46 @@ export function OperationsPage() {
               </Table>
               <Pager total={auditPage?.total ?? 0} pager={auditPager} />
             </TableContainer>
+            </>
+          ) : (
+            <>
+              <RefreshNotice
+                data={operationPage}
+                error={operationError}
+                loading={operationLoading}
+                onRetry={mutateOperations}
+                sx={{ mx: 2, mt: 2 }}
+              />
+              <TableContainer>
+                <Table size="small" sx={{ minWidth: 920 }}>
+                  <TableHead>
+                    <TableRow>
+                      <TableCell>创建时间</TableCell>
+                      <TableCell>作业</TableCell>
+                      <TableCell>设备</TableCell>
+                      <TableCell>状态</TableCell>
+                      <TableCell>结果</TableCell>
+                      <TableCell>作业 ID</TableCell>
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {operations.length === 0 ? (
+                      <EmptyRow colSpan={6} py={5}>还没有命令作业</EmptyRow>
+                    ) : operations.map((operation: Operation) => (
+                      <TableRow key={operation.id} hover>
+                        <TableCell sx={{ whiteSpace: 'nowrap' }}>{formatTs(operation.created_at)}</TableCell>
+                        <TableCell>{OPERATION_TYPE_LABEL[operation.command_type] ?? operation.command_type}</TableCell>
+                        <TableCell>{operation.device}</TableCell>
+                        <TableCell sx={{ color: operation.status === 'succeeded' ? STATUS.good : operation.status === 'unknown' ? STATUS.critical : 'text.primary' }}>
+                          {OPERATION_STATUS_LABEL[operation.status]}
+                        </TableCell>
+                        <TableCell>{operation.error || (operation.result ? JSON.stringify(operation.result) : '—')}</TableCell>
+                        <TableCell sx={{ fontFamily: 'monospace', fontSize: 12 }}>{operation.operation_id}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </TableContainer>
             </>
           )}
         </CardContent>
