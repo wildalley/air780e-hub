@@ -225,3 +225,25 @@ revision 和可靠回执，Server 校验回执后更新状态，并后台重试�
 
 schema 从 16 升至 17，需两端同步升级，尚未部署。后续继续推进 B06 持久化命令作业和
 B08 §9.1 数据库执行调度；任务执行的 run_id/跨重启幂等仍计入 B06，配置回执不替代执行回执。
+
+### 2026-09-05：数据库读写隔离与异步调度
+
+接续工作区已有的独立只读连接改动，完成 B08 §9.1 的核心调度：长读与写连接隔离，
+网关完整事务及异步路径的 DB 操作进入有界单线程执行器，连接身份清理与提交后 ACK
+保持原有保证。定期和手动清理按 500 条目标记录分批提交。执行范围及取消语义见
+[后端方案 §9.1](optimization-backend.md#91-server-的同步数据库调用)。
+
+| 验证 | 结果 |
+| --- | --- |
+| Server `.venv/bin/pytest -q -o faulthandler_timeout=20 --tb=short` | 289 passed，44.22 秒；1 条已有 TestClient 弃用警告 |
+| Server `.venv/bin/ruff check src tests benchmarks` | 通过 |
+| `.venv/bin/python benchmarks/messages.py --repeat 3 --json --enforce` | 100k 读路径和 CSV 全部通过；CSV 约 96,915 行/秒，Python 堆峰值 1.037 MiB |
+| `.venv/bin/python benchmarks/concurrency.py --output /tmp/air780e-concurrency-20260905.json` | 相同 SQL/schema 的两种调度各测 3 轮，事件 ACK、CSV 行数和清理计数全部一致 |
+
+组合负载的 loop lag p95 中位数为 153.145 → 4.517 ms，每轮最大 ACK 延迟的中位数为
+272.012 → 6.831 ms；线程切换增加了普通 ACK p95，CSV 并行耗时也略增。完整对照、
+限制和[原始 JSON](benchmarks/2026-09-05-concurrency.json)见[性能文档](performance.md)。
+
+异步测试在沙箱内挂起后，结束相关进程并在获准环境完成验证。本轮只修改 Server 和
+相关文档，未重跑 Agent/前端测试或执行浏览器验收；schema 与协议版本不变，尚未部署。
+下一工作包仍为 B06 持久化命令作业；B07 恢复维护模式和真实部署组合负载验收尚未完成。

@@ -35,8 +35,8 @@ def gateway(tmp_path):
         db.close()
 
 
-def register(gateway, agent_id="site-a"):
-    return gateway._register(agent_id, Socket(), {
+async def register(gateway, agent_id="site-a"):
+    return await gateway._register(agent_id, Socket(), {
         "version": __version__, "protocol_version": PROTOCOL_VERSION,
         "devices": [{"name": "a", "online": True}],
     })
@@ -54,7 +54,7 @@ async def receipt(gateway, connection, frame, seq=1, **changes):
 
 
 async def test_tasks_are_pending_until_the_current_receipt_is_committed(gateway):
-    connection = register(gateway)
+    connection = await register(gateway)
     await gateway.push_tasks(connection.agent_id)
     frame = connection.websocket.frames[-1]
     assert frame["revision"] == task_revision(frame["tasks"])
@@ -70,7 +70,7 @@ async def test_tasks_are_pending_until_the_current_receipt_is_committed(gateway)
 
 
 async def test_receipt_transaction_failure_does_not_ack_or_confirm(gateway, monkeypatch):
-    connection = register(gateway)
+    connection = await register(gateway)
     await gateway.push_tasks(connection.agent_id)
     frame = connection.websocket.frames[-1]
     finish = gateway.db.finish_task_sync
@@ -91,7 +91,7 @@ async def test_receipt_transaction_failure_does_not_ack_or_confirm(gateway, monk
 
 
 async def test_unconfirmed_snapshot_retries_without_changing_its_identity(gateway):
-    connection = register(gateway)
+    connection = await register(gateway)
     await gateway.push_tasks(connection.agent_id)
     frame = connection.websocket.frames[-1]
     await gateway.retry_task_sync()
@@ -106,7 +106,7 @@ async def test_unconfirmed_snapshot_retries_without_changing_its_identity(gatewa
 
 
 async def test_failed_snapshot_can_be_retried_and_confirmed(gateway):
-    connection = register(gateway)
+    connection = await register(gateway)
     await gateway.push_tasks(connection.agent_id)
     frame = connection.websocket.frames[-1]
     await receipt(gateway, connection, frame, ok=False, error="apply_failed")
@@ -123,7 +123,7 @@ async def test_failed_snapshot_can_be_retried_and_confirmed(gateway):
 
 
 async def test_send_failure_remains_visible_and_retryable(gateway):
-    connection = register(gateway)
+    connection = await register(gateway)
     connection.websocket.fail = True
     await gateway.push_tasks(connection.agent_id)
     assert state(gateway)["tasks_sync_status"] == "failed"
@@ -137,8 +137,8 @@ async def test_send_failure_remains_visible_and_retryable(gateway):
 
 
 async def test_another_agent_cannot_confirm_the_snapshot(gateway):
-    owner = register(gateway)
-    other = register(gateway, "site-b")
+    owner = await register(gateway)
+    other = await register(gateway, "site-b")
     await gateway.push_tasks(owner.agent_id)
     await gateway.push_tasks(other.agent_id)
     frame = owner.websocket.frames[-1]
@@ -148,11 +148,11 @@ async def test_another_agent_cannot_confirm_the_snapshot(gateway):
 
 
 async def test_receipt_from_previous_connection_cannot_confirm_a_reconnect(gateway):
-    old = register(gateway)
+    old = await register(gateway)
     await gateway.push_tasks(old.agent_id)
     frame = old.websocket.frames[-1]
-    gateway._unregister(old)
-    current = register(gateway)
+    await gateway._unregister(old)
+    current = await register(gateway)
     await gateway.push_tasks(current.agent_id)
     new_frame = current.websocket.frames[-1]
     assert new_frame["revision"] == frame["revision"]
@@ -164,7 +164,7 @@ async def test_receipt_from_previous_connection_cannot_confirm_a_reconnect(gatew
 
 
 async def test_old_receipt_cannot_confirm_a_change_back_to_the_same_content(gateway, monkeypatch):
-    connection = register(gateway)
+    connection = await register(gateway)
     tasks = []
     monkeypatch.setattr(gateway, "tasks_for", lambda _agent_id: list(tasks))
     await gateway.push_tasks(connection.agent_id)
@@ -183,10 +183,10 @@ async def test_old_receipt_cannot_confirm_a_change_back_to_the_same_content(gate
 
 
 async def test_offline_edits_invalidate_the_previous_confirmation(gateway, monkeypatch):
-    connection = register(gateway)
+    connection = await register(gateway)
     await gateway.push_tasks(connection.agent_id)
     await receipt(gateway, connection, connection.websocket.frames[-1])
-    gateway._unregister(connection)
+    await gateway._unregister(connection)
     monkeypatch.setattr(gateway, "tasks_for", lambda _agent_id: [{"id": 1}])
     await gateway.push_tasks(connection.agent_id)
     row = state(gateway)
@@ -196,7 +196,7 @@ async def test_offline_edits_invalidate_the_previous_confirmation(gateway, monke
 
 
 async def test_retry_loop_runs_independently_of_receipt_processing(gateway, monkeypatch):
-    connection = register(gateway)
+    connection = await register(gateway)
     await gateway.push_tasks(connection.agent_id)
     connection.tasks_next_check = 0
     retried = asyncio.Event()

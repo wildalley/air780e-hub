@@ -792,7 +792,8 @@ class Notifier:
                 log.exception("notification queue pass failed")
             self._wake.clear()
             with contextlib.suppress(TimeoutError, asyncio.TimeoutError):
-                await asyncio.wait_for(self._wake.wait(), timeout=self._idle_seconds())
+                idle_seconds = await self.db.run(self._idle_seconds)
+                await asyncio.wait_for(self._wake.wait(), timeout=idle_seconds)
 
     def _idle_seconds(self) -> float:
         """How long to wait before looking again, absent a kick.
@@ -858,7 +859,9 @@ class Notifier:
         the same key, so this insert is a no-op there and the queue cannot hold
         the same push twice — including after a replay of a lost ack.
         """
-        self._queue("message", ref_id=message_id, frame=frame, event_key=event_key)
+        await self._queue(
+            "message", ref_id=message_id, frame=frame, event_key=event_key
+        )
 
     async def on_task_result(
         self, task_id: int, frame: dict[str, Any], *, event_key: str | None = None
@@ -869,7 +872,9 @@ class Notifier:
         expanded, not here: reading ``tasks`` is a query, and this runs on the
         path that owes the agent an ack.
         """
-        self._queue("task_result", ref_id=task_id, frame=frame, event_key=event_key)
+        await self._queue(
+            "task_result", ref_id=task_id, frame=frame, event_key=event_key
+        )
 
     async def on_call(
         self, call_id: int, frame: dict[str, Any], *, event_key: str | None = None
@@ -883,9 +888,11 @@ class Notifier:
         for it, and on a card kept alive for one service it is the only sign
         someone is trying to reach the number.
         """
-        self._queue("call", ref_id=call_id, frame=frame, event_key=event_key)
+        await self._queue(
+            "call", ref_id=call_id, frame=frame, event_key=event_key
+        )
 
-    def _queue(
+    async def _queue(
         self,
         kind: str,
         *,
@@ -893,8 +900,12 @@ class Notifier:
         frame: dict[str, Any],
         event_key: str | None,
     ) -> int | None:
-        outbox_id = self.db.enqueue_notification(
-            kind, ref_id=ref_id, frame=frame, event_key=event_key
+        outbox_id = await self.db.run(
+            self.db.enqueue_notification,
+            kind,
+            ref_id=ref_id,
+            frame=frame,
+            event_key=event_key,
         )
         self.kick()
         return outbox_id
@@ -909,8 +920,9 @@ class Notifier:
         is written back to the row, so the next pass — in this process or in the
         one that replaces it — starts from the same place.
         """
-        self._expand_intents()
-        claimed = self.db.claim_deliveries(
+        await self.db.run(self._expand_intents)
+        claimed = await self.db.run(
+            self.db.claim_deliveries,
             owner=self._owner, lease_seconds=LEASE_SECONDS, limit=CLAIM_BATCH
         )
         if not claimed:
@@ -1054,26 +1066,26 @@ class Notifier:
     async def _attempt_claimed(self, row: dict[str, Any]) -> None:
         delivery_id = int(row["id"])
         channel_id = int(row["channel_id"])
-        rule_id = row.get("rule_id")
-        kind = str(row.get("kind") or "")
-        message_id = int(row["ref_id"]) if kind == "message" and row.get("ref_id") else None
         attempts = int(row.get("attempts") or 0) + 1
 
-        channel = self.db.one(
+        channel = await self.db.run(
+            self.db.one,
             "SELECT * FROM channels WHERE id = ? AND enabled = 1", (channel_id,)
         )
         if channel is None:
             # Turned off after the push was queued.  Nothing was attempted, so
             # this is not a delivery failure and must not raise an incident.
-            self.db.settle_delivery(
+            await self.db.run(
+                self.db.settle_delivery,
                 delivery_id, status="failed", attempts=attempts - 1,
                 error_code="channel_disabled", safe_detail="渠道已停用",
             )
             return
 
-        payload = self._payload_for(row, channel)
+        payload = await self.db.run(self._payload_for, row, channel)
         if payload is None:
-            self.db.settle_delivery(
+            await self.db.run(
+                self.db.settle_delivery,
                 delivery_id, status="failed", attempts=attempts - 1,
                 error_code="source_gone", safe_detail="来源记录已不存在",
             )
@@ -1090,17 +1102,17 @@ class Notifier:
                 scrub(f"{type(exc).__name__}: {exc}"), kind="network"
             )
         else:
-            self.db.settle_delivery(
-                delivery_id, status="ok", attempts=attempts, safe_detail=detail
+            await self.db.run(
+                self._finish_claimed, row, "ok", attempts, detail
             )
-            self._record(message_id, channel_id, rule_id, "ok", attempts, detail)
             return
 
         code = _error_code(failure)
         expired = _past(row.get("expires_at"))
         if _transient(failure) and attempts < self.retries + 1 and not expired:
             delay = self._retry_delay(attempts - 1, failure.retry_after)
-            self.db.settle_delivery(
+            await self.db.run(
+                self.db.settle_delivery,
                 delivery_id, status="pending", attempts=attempts,
                 error_code=code, safe_detail=failure.detail,
                 next_attempt_at=_shift(utcnow(), delay),
@@ -1115,13 +1127,26 @@ class Notifier:
             "channel %s (%s) gave up after %d attempt(s): %s",
             channel_id, channel.get("type"), attempts, failure.detail,
         )
-        self.db.settle_delivery(
-            delivery_id, status="expired" if expired else "failed",
-            attempts=attempts, error_code="expired" if expired else code,
-            safe_detail=failure.detail,
+        await self.db.run(
+            self._finish_claimed, row, "expired" if expired else "failed",
+            attempts, failure.detail, "expired" if expired else code,
         )
+
+    def _finish_claimed(
+        self, row: dict[str, Any], status: str, attempts: int,
+        detail: str, error_code: str = "",
+    ) -> None:
+        # Keep settlement and its audit together across coroutine cancellation.
+        self.db.settle_delivery(
+            int(row["id"]), status=status, attempts=attempts,
+            safe_detail=detail, error_code=error_code,
+        )
+        message_id = int(row["ref_id"]) if row.get("kind") == "message" and row.get(
+            "ref_id"
+        ) else None
         self._record(
-            message_id, channel_id, rule_id, "failed", attempts, failure.detail
+            message_id, int(row["channel_id"]), row.get("rule_id"),
+            "ok" if status == "ok" else "failed", attempts, detail,
         )
 
     def _payload_for(
@@ -1260,7 +1285,8 @@ class Notifier:
     ) -> list[dict[str, Any]]:
         """Match rules for one stored message and push to every matched channel."""
         frame = frame or {}
-        message = self.db.one(
+        message = await self.db.run(
+            self.db.one,
             "SELECT m.*, s.label AS sim_label, s.phone_number, "
             "s.iccid AS sim_iccid, d.label AS device_label FROM messages m "
             "LEFT JOIN sims s ON s.id = m.sim_id "
@@ -1277,7 +1303,9 @@ class Notifier:
         # keyword rule for "GitHub" should fire when the recovered fragment says
         # GitHub, and must not fire on mojibake the reader never sees.
         body = notification_body(message, frame)
-        targets = match_rules(self.db, sim_id=message.get("sim_id"), body=body)
+        targets = await self.db.run(
+            match_rules, self.db, sim_id=message.get("sim_id"), body=body
+        )
         if not targets:
             log.debug("no rule matched message %s", message_id)
             return []
@@ -1293,7 +1321,9 @@ class Notifier:
         self, text: str, *, title: str = "air780e-hub", channel_ids: list[int] | None = None
     ) -> list[dict[str, Any]]:
         """Push a plain message not tied to an SMS — task results (M5) use this."""
-        channels = self.db.query("SELECT * FROM channels WHERE enabled = 1 ORDER BY id")
+        channels = await self.db.run(
+            self.db.query, "SELECT * FROM channels WHERE enabled = 1 ORDER BY id"
+        )
         if channel_ids is not None:
             channels = [c for c in channels if c["id"] in set(channel_ids)]
         if not channels:
@@ -1386,7 +1416,9 @@ class Notifier:
                 # some of these, and a Telegram URL carries the bot token.
                 detail = scrub(f"{type(exc).__name__}: {exc}")
             else:
-                self._record(message_id, channel["id"], rule_id, "ok", attempts, detail)
+                await self.db.run(
+                    self._record, message_id, channel["id"], rule_id, "ok", attempts, detail
+                )
                 return {"channel_id": channel["id"], "status": "ok",
                         "attempts": attempts, "detail": detail}
 
@@ -1397,7 +1429,9 @@ class Notifier:
             "channel %s (%s) failed after %d attempt(s): %s",
             channel["id"], channel.get("type"), attempts, detail,
         )
-        self._record(message_id, channel["id"], rule_id, "failed", attempts, detail)
+        await self.db.run(
+            self._record, message_id, channel["id"], rule_id, "failed", attempts, detail
+        )
         return {"channel_id": channel["id"], "status": "failed",
                 "attempts": attempts, "detail": detail}
 

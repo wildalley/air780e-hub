@@ -59,7 +59,7 @@ class AuditMiddleware:
         try:
             await self.app(scope, receive, capture_status)
         except Exception:
-            self._record(method, path, "error", "unhandled server error", scope)
+            await self._record(method, path, "error", "unhandled server error", scope)
             raise
 
         # This middleware sits ahead of authentication, so anyone who can reach
@@ -73,7 +73,7 @@ class AuditMiddleware:
         if not matched.startswith("/api/"):
             return
 
-        self._record(
+        await self._record(
             method,
             path,
             "ok" if status_code < 400 else "rejected",
@@ -81,9 +81,10 @@ class AuditMiddleware:
             scope,
         )
 
-    def _record(self, method, path, status, detail, scope) -> None:
+    async def _record(self, method, path, status, detail, scope) -> None:
         client = scope.get("client")
-        self.state.db.record_audit(
+        await self.state.db.run(
+            self.state.db.record_audit,
             f"{method} {path}",
             status=status,
             detail=detail,
@@ -96,8 +97,9 @@ async def _housekeeping(state: AppState) -> None:
     while True:
         await asyncio.sleep(PURGE_INTERVAL)
         try:
-            removed = state.db.purge(
-                message_days=state.message_retention_days,
+            message_days = await state.db.run(lambda: state.message_retention_days)
+            removed = await state.db.purge_async(
+                message_days=message_days,
                 status_days=state.settings.status_retention_days,
                 log_days=state.settings.log_retention_days,
                 audit_days=state.settings.audit_retention_days,
@@ -105,9 +107,9 @@ async def _housekeeping(state: AppState) -> None:
                 audit_max_rows=state.settings.audit_max_rows,
                 ingested_days=state.settings.ingested_retention_days,
             )
-            state.auth.purge_expired_sessions()
-            state.db.reconcile_sim_incidents(
-                state.settings.calendar_today()
+            await state.db.run(state.auth.purge_expired_sessions)
+            await state.db.run(
+                state.db.reconcile_sim_incidents, state.settings.calendar_today()
             )
             if any(removed.values()):
                 log.info("housekeeping removed %s", removed)
@@ -122,8 +124,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         try:
-            state.db.reconcile_sim_incidents(
-                state.settings.calendar_today()
+            await state.db.run(
+                state.db.reconcile_sim_incidents, state.settings.calendar_today()
             )
         except Exception:
             log.exception("initial SIM incident reconciliation failed")

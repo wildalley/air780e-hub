@@ -83,8 +83,6 @@ class OfflineAlerter:
             self._note_offline(key)
 
     def _note_offline(self, key: Key) -> None:
-        if not self.enabled:
-            return
         if key in self._pending or key in self._alerted:
             return  # already counting down, or already paged
         self._pending[key] = self._spawn(
@@ -95,29 +93,41 @@ class OfflineAlerter:
         pending = self._pending.pop(key, None)
         if pending is not None:
             pending.cancel()  # recovered inside the grace window — stay quiet
-        self.db.resolve_incident(
+        alerted = key in self._alerted
+        self._alerted.discard(key)
+        self._spawn(self._recover(key, alerted), label=f"online {key[0]}/{key[1]}")
+
+    async def _recover(self, key: Key, alerted: bool) -> None:
+        await self.db.run(
+            self.db.resolve_incident,
             self._fingerprint(key), detail="设备已恢复在线"
         )
-        if key in self._alerted:
-            self._alerted.discard(key)
-            self._spawn(
-                self._deliver(
-                    key, title="模块恢复", tag="恢复",
-                    phrase="已恢复在线", time_label="恢复时间",
-                ),
-                label=f"online {key[0]}/{key[1]}",
+        if alerted:
+            await self._deliver(
+                key, title="模块恢复", tag="恢复",
+                phrase="已恢复在线", time_label="恢复时间",
             )
 
     async def _fire_after_grace(self, key: Key) -> None:
-        await asyncio.sleep(self.grace)
-        # We now own this key: past the sleep, a cancel can no longer reach us.
-        self._pending.pop(key, None)
-        # Re-read the store rather than trust the timer — the module may have
-        # come back in a way that raced the cancel, and the toggle may have
-        # been flipped off while we waited.
+        try:
+            if not await self.db.run(lambda: self.enabled):
+                return
+            await asyncio.sleep(self.grace)
+            if not await self.db.run(self._record_offline, key):
+                return
+            self._alerted.add(key)
+            self._pending.pop(key, None)
+            await self._deliver(
+                key, title="模块掉线", tag="掉线", phrase="已离线", time_label="掉线时间"
+            )
+        finally:
+            if self._pending.get(key) is asyncio.current_task():
+                self._pending.pop(key, None)
+
+    def _record_offline(self, key: Key) -> bool:
+        # Re-read after the grace period; both state and settings can change.
         if not self.enabled or self.db.device_online(*key):
-            return
-        self._alerted.add(key)
+            return False
         label = self._device_label(*key)
         self.db.open_incident(
             self._fingerprint(key),
@@ -127,14 +137,12 @@ class OfflineAlerter:
             title=f"{label} 离线",
             detail=f"超过 {self.grace:.0f} 秒未恢复",
         )
-        await self._deliver(
-            key, title="模块掉线", tag="掉线", phrase="已离线", time_label="掉线时间"
-        )
+        return True
 
     async def _deliver(
         self, key: Key, *, title: str, tag: str, phrase: str, time_label: str
     ) -> None:
-        label = self._device_label(*key)
+        label = await self.db.run(self._device_label, *key)
         text = f"【{tag}】{label} {phrase}\n{time_label}:{self.notifier._local(utcnow())}"
         try:
             await self.notifier.notify_text(text, title=title)

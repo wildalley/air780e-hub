@@ -1,0 +1,299 @@
+{
+  "environment": {
+    "python": "3.13.14",
+    "sqlite": "3.53.1",
+    "platform": "Linux-7.1.8-arch1-3-x86_64-with-glibc2.44",
+    "cpu_count": 16
+  },
+  "workload": {
+    "rows": 100000,
+    "readers": 4,
+    "iterations": 8,
+    "events": 200,
+    "repeat": 3
+  },
+  "runs": [
+    {
+      "mode": "shared_sync_reference",
+      "elapsed_seconds": 2.633,
+      "ack": {
+        "count": 200,
+        "p50_ms": 0.269,
+        "p95_ms": 0.629,
+        "max_ms": 296.081
+      },
+      "loop_lag": {
+        "count": 106,
+        "p50_ms": 0.887,
+        "p95_ms": 113.93,
+        "max_ms": 292.4
+      },
+      "query": {
+        "count": 32,
+        "p50_ms": 120.487,
+        "p95_ms": 296.387,
+        "max_ms": 303.369
+      },
+      "shared_lock_wait": {
+        "count": 242,
+        "p50_ms": 0.005,
+        "p95_ms": 139.215,
+        "max_ms": 296.417
+      },
+      "shared_lock_hold": {
+        "count": 242,
+        "p50_ms": 0.2,
+        "p95_ms": 57.05,
+        "max_ms": 120.332
+      },
+      "csv": {
+        "count": 1,
+        "p50_ms": 1470.759,
+        "p95_ms": 1470.759,
+        "max_ms": 1470.759,
+        "rows": 100000
+      },
+      "purge": {
+        "count": 1,
+        "p50_ms": 1.305,
+        "p95_ms": 1.305,
+        "max_ms": 1.305
+      }
+    },
+    {
+      "mode": "wal_readers_async_writer",
+      "elapsed_seconds": 1.685,
+      "ack": {
+        "count": 200,
+        "p50_ms": 0.923,
+        "p95_ms": 2.574,
+        "max_ms": 6.831
+      },
+      "loop_lag": {
+        "count": 141,
+        "p50_ms": 1.505,
+        "p95_ms": 4.517,
+        "max_ms": 5.37
+      },
+      "query": {
+        "count": 32,
+        "p50_ms": 36.047,
+        "p95_ms": 171.165,
+        "max_ms": 171.398
+      },
+      "shared_lock_wait": {
+        "count": 204,
+        "p50_ms": 0.005,
+        "p95_ms": 0.008,
+        "max_ms": 0.015
+      },
+      "shared_lock_hold": {
+        "count": 204,
+        "p50_ms": 0.479,
+        "p95_ms": 1.565,
+        "max_ms": 6.207
+      },
+      "csv": {
+        "count": 1,
+        "p50_ms": 1685.114,
+        "p95_ms": 1685.114,
+        "max_ms": 1685.114,
+        "rows": 100000
+      },
+      "purge": {
+        "count": 1,
+        "p50_ms": 5.005,
+        "p95_ms": 5.005,
+        "max_ms": 5.005
+      }
+    },
+    {
+      "mode": "wal_readers_async_writer",
+      "elapsed_seconds": 1.623,
+      "ack": {
+        "count": 200,
+        "p50_ms": 0.827,
+        "p95_ms": 2.226,
+        "max_ms": 7.079
+      },
+      "loop_lag": {
+        "count": 135,
+        "p50_ms": 2.167,
+        "p95_ms": 3.889,
+        "max_ms": 4.457
+      },
+      "query": {
+        "count": 32,
+        "p50_ms": 33.468,
+        "p95_ms": 160.083,
+        "max_ms": 172.093
+      },
+      "shared_lock_wait": {
+        "count": 204,
+        "p50_ms": 0.005,
+        "p95_ms": 0.009,
+        "max_ms": 0.014
+      },
+      "shared_lock_hold": {
+        "count": 204,
+        "p50_ms": 0.443,
+        "p95_ms": 1.32,
+        "max_ms": 6.565
+      },
+      "csv": {
+        "count": 1,
+        "p50_ms": 1623.165,
+        "p95_ms": 1623.165,
+        "max_ms": 1623.165,
+        "rows": 100000
+      },
+      "purge": {
+        "count": 1,
+        "p50_ms": 4.369,
+        "p95_ms": 4.369,
+        "max_ms": 4.369
+      }
+    },
+    {
+      "mode": "shared_sync_reference",
+      "elapsed_seconds": 2.703,
+      "ack": {
+        "count": 200,
+        "p50_ms": 0.263,
+        "p95_ms": 0.699,
+        "max_ms": 253.06
+      },
+      "loop_lag": {
+        "count": 106,
+        "p50_ms": 0.88,
+        "p95_ms": 153.145,
+        "max_ms": 248.851
+      },
+      "query": {
+        "count": 32,
+        "p50_ms": 140.209,
+        "p95_ms": 257.61,
+        "max_ms": 262.529
+      },
+      "shared_lock_wait": {
+        "count": 242,
+        "p50_ms": 0.005,
+        "p95_ms": 146.274,
+        "max_ms": 252.499
+      },
+      "shared_lock_hold": {
+        "count": 242,
+        "p50_ms": 0.217,
+        "p95_ms": 61.859,
+        "max_ms": 123.819
+      },
+      "csv": {
+        "count": 1,
+        "p50_ms": 1428.136,
+        "p95_ms": 1428.136,
+        "max_ms": 1428.136,
+        "rows": 100000
+      },
+      "purge": {
+        "count": 1,
+        "p50_ms": 1.244,
+        "p95_ms": 1.244,
+        "max_ms": 1.244
+      }
+    },
+    {
+      "mode": "shared_sync_reference",
+      "elapsed_seconds": 2.687,
+      "ack": {
+        "count": 200,
+        "p50_ms": 0.292,
+        "p95_ms": 0.653,
+        "max_ms": 272.012
+      },
+      "loop_lag": {
+        "count": 106,
+        "p50_ms": 0.92,
+        "p95_ms": 172.764,
+        "max_ms": 272.172
+      },
+      "query": {
+        "count": 32,
+        "p50_ms": 150.826,
+        "p95_ms": 253.209,
+        "max_ms": 279.016
+      },
+      "shared_lock_wait": {
+        "count": 242,
+        "p50_ms": 0.006,
+        "p95_ms": 152.789,
+        "max_ms": 271.378
+      },
+      "shared_lock_hold": {
+        "count": 242,
+        "p50_ms": 0.218,
+        "p95_ms": 58.901,
+        "max_ms": 121.418
+      },
+      "csv": {
+        "count": 1,
+        "p50_ms": 1382.026,
+        "p95_ms": 1382.026,
+        "max_ms": 1382.026,
+        "rows": 100000
+      },
+      "purge": {
+        "count": 1,
+        "p50_ms": 1.104,
+        "p95_ms": 1.104,
+        "max_ms": 1.104
+      }
+    },
+    {
+      "mode": "wal_readers_async_writer",
+      "elapsed_seconds": 1.66,
+      "ack": {
+        "count": 200,
+        "p50_ms": 0.908,
+        "p95_ms": 2.897,
+        "max_ms": 6.035
+      },
+      "loop_lag": {
+        "count": 137,
+        "p50_ms": 2.141,
+        "p95_ms": 4.599,
+        "max_ms": 5.902
+      },
+      "query": {
+        "count": 32,
+        "p50_ms": 34.955,
+        "p95_ms": 157.313,
+        "max_ms": 157.866
+      },
+      "shared_lock_wait": {
+        "count": 204,
+        "p50_ms": 0.005,
+        "p95_ms": 0.009,
+        "max_ms": 0.028
+      },
+      "shared_lock_hold": {
+        "count": 204,
+        "p50_ms": 0.467,
+        "p95_ms": 1.743,
+        "max_ms": 5.615
+      },
+      "csv": {
+        "count": 1,
+        "p50_ms": 1659.288,
+        "p95_ms": 1659.288,
+        "max_ms": 1659.288,
+        "rows": 100000
+      },
+      "purge": {
+        "count": 1,
+        "p50_ms": 4.626,
+        "p95_ms": 4.626,
+        "max_ms": 4.626
+      }
+    }
+  ]
+}

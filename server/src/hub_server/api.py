@@ -23,6 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 from starlette.background import BackgroundTask
+from starlette.concurrency import run_in_threadpool
 
 from . import PROTOCOL_VERSION, __version__
 from .alerts import SETTING_ENABLED
@@ -197,11 +198,11 @@ def paged(
     across it would give the same number for more work.
     """
     clause = f" {where}" if where else ""
-    items = db.query(
+    items = db.read_query(
         f"SELECT {select} FROM {source}{clause} ORDER BY {order} LIMIT ? OFFSET ?",
         (*params, limit, offset),
     )
-    row = db.one(f"SELECT COUNT(*) AS n FROM {count_source or source}{clause}", params)
+    row = db.read_one(f"SELECT COUNT(*) AS n FROM {count_source or source}{clause}", params)
     return {"items": items, "total": int(row["n"]) if row else 0}
 
 
@@ -480,10 +481,10 @@ def build_router(state: AppState) -> APIRouter:
             "devices": devices,
             "sims": db.query("SELECT * FROM sims ORDER BY id"),
             "counters": {
-                "messages_total": db.one(
+                "messages_total": db.read_one(
                     "SELECT COUNT(*) AS n FROM messages"
                 )["n"],
-                "messages_today": db.one(
+                "messages_today": db.read_one(
                     "SELECT COUNT(*) AS n FROM messages WHERE ts >= ?",
                     (today,),
                 )["n"],
@@ -596,7 +597,7 @@ def build_router(state: AppState) -> APIRouter:
         grouped: dict[str, list[dict[str, Any]]] = {
             str(row["id"]): [] for row in state.db.query("SELECT id FROM devices")
         }
-        rows = state.db.query(
+        rows = state.db.read_query(
             f"SELECT s.device_id, {bucket} AS ts, {history_columns('s.')} "
             "FROM device_status s WHERE s.ts >= ? "
             f"GROUP BY s.device_id, CAST(strftime('%s', s.ts) / {width} AS INTEGER) "
@@ -616,7 +617,7 @@ def build_router(state: AppState) -> APIRouter:
         ).isoformat(timespec="seconds")
         width = history_bucket_seconds(hours)
         bucket = _BUCKET_TS.format(ts="ts", width=width)
-        return state.db.query(
+        return state.db.read_query(
             f"SELECT {bucket} AS ts, {history_columns()} "
             "FROM device_status WHERE device_id = ? AND ts >= ? "
             f"GROUP BY CAST(strftime('%s', ts) / {width} AS INTEGER) "
@@ -633,7 +634,7 @@ def build_router(state: AppState) -> APIRouter:
     @router.post("/devices/by-id/{device_id}/refresh", dependencies=guard)
     async def refresh_device_by_id(device_id: int) -> dict[str, Any]:
         return await _device_call(
-            _device_by_id(device_id), {"type": "query", "what": "status"}
+            await state.db.run(_device_by_id, device_id), {"type": "query", "what": "status"}
         )
 
     @router.post("/devices/by-id/{device_id}/radio", dependencies=guard)
@@ -641,7 +642,8 @@ def build_router(state: AppState) -> APIRouter:
         device_id: int, body: RadioBody
     ) -> dict[str, Any]:
         return await _device_call(
-            _device_by_id(device_id), {"type": "set_radio", "enabled": body.enabled}
+            await state.db.run(_device_by_id, device_id),
+            {"type": "set_radio", "enabled": body.enabled},
         )
 
     @router.post("/devices/by-id/{device_id}/data", dependencies=guard)
@@ -649,7 +651,7 @@ def build_router(state: AppState) -> APIRouter:
         device_id: int, body: RadioBody
     ) -> dict[str, Any]:
         return await _device_call(
-            _device_by_id(device_id),
+            await state.db.run(_device_by_id, device_id),
             {"type": "set_data", "enabled": body.enabled},
             timeout=60.0,
         )
@@ -659,7 +661,7 @@ def build_router(state: AppState) -> APIRouter:
         device_id: int, body: RoamingDataBody
     ) -> dict[str, Any]:
         return await _device_call(
-            _device_by_id(device_id),
+            await state.db.run(_device_by_id, device_id),
             {"type": "set_roaming_data", "allowed": body.allowed},
             timeout=60.0,
         )
@@ -667,7 +669,7 @@ def build_router(state: AppState) -> APIRouter:
     @router.post("/devices/by-id/{device_id}/operators/scan", dependencies=guard)
     async def scan_device_operators_by_id(device_id: int) -> dict[str, Any]:
         return await _device_call(
-            _device_by_id(device_id), {"type": "scan_operators"}, timeout=210.0
+            await state.db.run(_device_by_id, device_id), {"type": "scan_operators"}, timeout=210.0
         )
 
     @router.post("/devices/by-id/{device_id}/operator", dependencies=guard)
@@ -675,7 +677,7 @@ def build_router(state: AppState) -> APIRouter:
         device_id: int, body: OperatorSelectionBody
     ) -> dict[str, Any]:
         return await _device_call(
-            _device_by_id(device_id),
+            await state.db.run(_device_by_id, device_id),
             {"type": "select_operator", "numeric": body.numeric},
             timeout=210.0,
         )
@@ -683,7 +685,7 @@ def build_router(state: AppState) -> APIRouter:
     @router.post("/devices/by-id/{device_id}/network-diagnostics", dependencies=guard)
     async def device_network_diagnostics_by_id(device_id: int) -> dict[str, Any]:
         return await _device_call(
-            _device_by_id(device_id),
+            await state.db.run(_device_by_id, device_id),
             {"type": "network_diagnostics"},
             timeout=165.0,
         )
@@ -693,7 +695,7 @@ def build_router(state: AppState) -> APIRouter:
         device_id: int, body: dict[str, str]
     ) -> dict[str, Any]:
         return await _device_call(
-            _device_by_id(device_id),
+            await state.db.run(_device_by_id, device_id),
             {"type": "ussd", "code": _ussd_code(body)},
             timeout=60.0,
         )
@@ -707,20 +709,21 @@ def build_router(state: AppState) -> APIRouter:
     @router.post("/devices/{name}/refresh", dependencies=guard)
     async def refresh_device(name: str) -> dict[str, Any]:
         return await _device_call(
-            _device_by_name(name), {"type": "query", "what": "status"}
+            await state.db.run(_device_by_name, name), {"type": "query", "what": "status"}
         )
 
     @router.post("/devices/{name}/radio", dependencies=guard)
     async def set_device_radio(name: str, body: RadioBody) -> dict[str, Any]:
         return await _device_call(
-            _device_by_name(name), {"type": "set_radio", "enabled": body.enabled}
+            await state.db.run(_device_by_name, name),
+            {"type": "set_radio", "enabled": body.enabled},
         )
 
     @router.post("/devices/{name}/data", dependencies=guard)
     async def set_device_data(name: str, body: RadioBody) -> dict[str, Any]:
         """Enable or fully disable packet data on the modem."""
         return await _device_call(
-            _device_by_name(name),
+            await state.db.run(_device_by_name, name),
             {"type": "set_data", "enabled": body.enabled},
             timeout=60.0,
         )
@@ -731,7 +734,7 @@ def build_router(state: AppState) -> APIRouter:
     ) -> dict[str, Any]:
         """Set the local safety policy for data while the SIM is roaming."""
         return await _device_call(
-            _device_by_name(name),
+            await state.db.run(_device_by_name, name),
             {"type": "set_roaming_data", "allowed": body.allowed},
             timeout=60.0,
         )
@@ -740,7 +743,7 @@ def build_router(state: AppState) -> APIRouter:
     async def scan_device_operators(name: str) -> dict[str, Any]:
         # AT+COPS=? is allowed to take several minutes while the modem scans.
         return await _device_call(
-            _device_by_name(name), {"type": "scan_operators"}, timeout=210.0
+            await state.db.run(_device_by_name, name), {"type": "scan_operators"}, timeout=210.0
         )
 
     @router.post("/devices/{name}/operator", dependencies=guard)
@@ -748,7 +751,7 @@ def build_router(state: AppState) -> APIRouter:
         name: str, body: OperatorSelectionBody
     ) -> dict[str, Any]:
         return await _device_call(
-            _device_by_name(name),
+            await state.db.run(_device_by_name, name),
             {"type": "select_operator", "numeric": body.numeric},
             timeout=210.0,
         )
@@ -756,7 +759,7 @@ def build_router(state: AppState) -> APIRouter:
     @router.post("/devices/{name}/network-diagnostics", dependencies=guard)
     async def device_network_diagnostics(name: str) -> dict[str, Any]:
         return await _device_call(
-            _device_by_name(name),
+            await state.db.run(_device_by_name, name),
             {"type": "network_diagnostics"},
             # The agent reads five optional diagnostics serially, each with a
             # 30-second AT timeout. Leave room for all of them before the
@@ -769,14 +772,14 @@ def build_router(state: AppState) -> APIRouter:
     async def send_ussd(name: str, body: dict[str, str]) -> dict[str, Any]:
         """Send a USSD code and return the raw response."""
         return await _device_call(
-            _device_by_name(name),
+            await state.db.run(_device_by_name, name),
             {"type": "ussd", "code": _ussd_code(body)},
             timeout=60.0,
         )
 
     @router.get("/sims", dependencies=guard)
     def list_sims() -> list[dict[str, Any]]:
-        return state.db.query(
+        return state.db.read_query(
             "SELECT s.*, "
             "(SELECT COUNT(*) FROM messages m WHERE m.sim_id = s.id) AS message_count, "
             "(SELECT ts FROM calls WHERE sim_id = s.id AND reached_network = 1 "
@@ -902,7 +905,7 @@ def build_router(state: AppState) -> APIRouter:
     @router.post("/messages/send", dependencies=guard)
     async def send_message(body: SendSmsBody) -> dict[str, Any]:
         return await _device_call(
-            _body_device(body),
+            await state.db.run(_body_device, body),
             {"type": "send_sms", "number": body.number, "body": body.body},
         )
 
@@ -934,7 +937,7 @@ def build_router(state: AppState) -> APIRouter:
     @router.post("/at", dependencies=guard)
     async def raw_at(body: RawAtBody) -> dict[str, Any]:
         return await _device_call(
-            _body_device(body), {"type": "raw_at", "command": body.command}
+            await state.db.run(_body_device, body), {"type": "raw_at", "command": body.command}
         )
 
     # -- channels and rules ------------------------------------------------
@@ -969,7 +972,9 @@ def build_router(state: AppState) -> APIRouter:
     @router.post("/channels/{channel_id}/test", dependencies=guard)
     async def test_channel(channel_id: int) -> dict[str, Any]:
         """Really send a sample message, and report what the provider said."""
-        row = state.db.one("SELECT * FROM channels WHERE id = ?", (channel_id,))
+        row = await state.db.run(
+            state.db.one, "SELECT * FROM channels WHERE id = ?", (channel_id,)
+        )
         if row is None:
             raise HTTPException(status_code=404, detail="no such channel")
         result = await state.notifier.test_channel(row)
@@ -1114,6 +1119,13 @@ def build_router(state: AppState) -> APIRouter:
         Audited because it re-sends a message body to a third party: whoever
         looks at this later should be able to see that a person asked for it.
         """
+        await state.db.run(
+            _retry_delivery, delivery_id, request.client.host if request.client else ""
+        )
+        state.notifier.kick()
+        return {"ok": True}
+
+    def _retry_delivery(delivery_id: int, client_ip: str) -> None:
         if not state.db.retry_delivery(delivery_id):
             raise HTTPException(
                 status_code=404, detail="no such failed delivery"
@@ -1121,12 +1133,8 @@ def build_router(state: AppState) -> APIRouter:
         state.db.record_audit(
             "retry notification",
             target=f"delivery:{delivery_id}",
-            client_ip=request.client.host if request.client else "",
+            client_ip=client_ip,
         )
-        # The worker polls, so this only shortens the wait; without it the
-        # button would look like it did nothing for up to POLL_SECONDS.
-        state.notifier.kick()
-        return {"ok": True}
 
     # -- notify settings ---------------------------------------------------
     # Operator-tunable knobs surfaced on the Notify page: how long SMS are
@@ -1199,6 +1207,11 @@ def build_router(state: AppState) -> APIRouter:
 
     @router.post("/tasks", dependencies=guard)
     async def create_task(body: TaskBody) -> dict[str, Any]:
+        row = await state.db.run(_create_task, body)
+        await _sync_tasks()
+        return row
+
+    def _create_task(body: TaskBody) -> dict[str, Any]:
         data = _task_fields(body)
         data["created_at"] = utcnow()
         columns = ",".join(data)
@@ -1206,11 +1219,15 @@ def build_router(state: AppState) -> APIRouter:
         cursor = state.db.execute(
             f"INSERT INTO tasks ({columns}) VALUES ({placeholders})", data
         )
-        await _sync_tasks()
         return state.db.one("SELECT * FROM tasks WHERE id = ?", (cursor.lastrowid,))
 
     @router.put("/tasks/{task_id}", dependencies=guard)
     async def update_task(task_id: int, body: TaskBody) -> dict[str, Any]:
+        row = await state.db.run(_update_task, task_id, body)
+        await _sync_tasks()
+        return row
+
+    def _update_task(task_id: int, body: TaskBody) -> dict[str, Any]:
         data = _task_fields(body)
         assignments = ",".join(f"{key} = :{key}" for key in data)
         state.db.execute(
@@ -1219,17 +1236,25 @@ def build_router(state: AppState) -> APIRouter:
         row = state.db.one("SELECT * FROM tasks WHERE id = ?", (task_id,))
         if row is None:
             raise HTTPException(status_code=404, detail="no such task")
-        await _sync_tasks()
         return row
 
     @router.delete("/tasks/{task_id}", dependencies=guard)
     async def delete_task(task_id: int) -> dict[str, Any]:
-        state.db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        await state.db.run(state.db.execute, "DELETE FROM tasks WHERE id = ?", (task_id,))
         await _sync_tasks()
         return {"ok": True}
 
     @router.post("/tasks/{task_id}/run", dependencies=guard)
     async def run_task(task_id: int) -> dict[str, Any]:
+        agent_id = await state.db.run(_task_agent, task_id)
+        # Send the authoritative definition before the immediate run.
+        revision = await state.gateway.push_tasks(agent_id)
+        frame: dict[str, Any] = {"type": "run_task", "task_id": task_id}
+        if revision is not None:
+            frame["revision"] = revision
+        return await _call(agent_id, frame)
+
+    def _task_agent(task_id: int) -> str:
         task = state.db.one("SELECT * FROM tasks WHERE id = ?", (task_id,))
         if task is None:
             raise HTTPException(status_code=404, detail="no such task")
@@ -1244,13 +1269,7 @@ def build_router(state: AppState) -> APIRouter:
         if not agent_id:
             raise HTTPException(status_code=503, detail="task device has no agent")
 
-        # Re-send the authoritative definition first. This keeps an immediate
-        # run correct even when it follows an edit before the agent reconnects.
-        revision = await state.gateway.push_tasks(agent_id)
-        frame: dict[str, Any] = {"type": "run_task", "task_id": task_id}
-        if revision is not None:
-            frame["revision"] = revision
-        return await _call(agent_id, frame)
+        return agent_id
 
     @router.get("/task-logs", dependencies=guard)
     def task_logs(
@@ -1291,14 +1310,14 @@ def build_router(state: AppState) -> APIRouter:
         wal_path = db_path.with_name(db_path.name + "-wal")
         disk = shutil.disk_usage(state.settings.data_dir)
         counts = {
-            "messages": state.db.one("SELECT COUNT(*) AS n FROM messages")["n"],
-            "status_samples": state.db.one(
+            "messages": state.db.read_one("SELECT COUNT(*) AS n FROM messages")["n"],
+            "status_samples": state.db.read_one(
                 "SELECT COUNT(*) AS n FROM device_status"
             )["n"],
-            "active_incidents": state.db.one(
+            "active_incidents": state.db.read_one(
                 "SELECT COUNT(*) AS n FROM incidents WHERE status != 'resolved'"
             )["n"],
-            "audit_events": state.db.one(
+            "audit_events": state.db.read_one(
                 "SELECT COUNT(*) AS n FROM audit_events"
             )["n"],
         }
@@ -1437,9 +1456,10 @@ def build_router(state: AppState) -> APIRouter:
         }
 
     @router.post("/system/purge", dependencies=guard)
-    def purge() -> dict[str, Any]:
-        return state.db.purge(
-            message_days=state.message_retention_days,
+    async def purge() -> dict[str, Any]:
+        message_days = await state.db.run(lambda: state.message_retention_days)
+        return await state.db.purge_async(
+            message_days=message_days,
             status_days=state.settings.status_retention_days,
             log_days=state.settings.log_retention_days,
             audit_days=state.settings.audit_retention_days,
@@ -1491,15 +1511,16 @@ def build_router(state: AppState) -> APIRouter:
             with os.fdopen(fd, "wb") as out:
                 async for chunk in request.stream():
                     size += len(chunk)
-                    out.write(chunk)
+                    await run_in_threadpool(out.write, chunk)
+                await run_in_threadpool(out.flush)
             if size == 0:
                 raise HTTPException(status_code=400, detail="未收到备份文件")
             try:
-                state.db.validate_backup(tmp)
+                await run_in_threadpool(state.db.validate_backup, tmp)
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             try:
-                state.db.restore_from(tmp)
+                await state.db.run(state.db.restore_from, tmp)
             except MigrationFailed as exc:
                 # The backup's data is already in place by now; only bringing it
                 # to the current schema failed.  The snapshot path is the way
@@ -1536,7 +1557,7 @@ def build_router(state: AppState) -> APIRouter:
 
     async def _sync_tasks() -> None:
         """Update desired versions, send online snapshots, and let receipts confirm them."""
-        for agent in state.db.query("SELECT id FROM agents"):
+        for agent in await state.db.run(state.db.query, "SELECT id FROM agents"):
             await state.gateway.push_tasks(agent["id"])
 
     router.sync_tasks = _sync_tasks  # type: ignore[attr-defined]

@@ -1,9 +1,9 @@
 """Server database.
 
-SQLite, one file under the data volume.  Sync ``sqlite3`` guarded by a lock:
-FastAPI runs ``def`` endpoints in a threadpool, and the WebSocket gateway's
-writes are sub-millisecond, so an async driver would add moving parts without
-buying throughput at this scale.
+SQLite, one file under the data volume. Sync ``sqlite3`` writes and transactional
+reads share a lock; long reads use separate read-only connections so WAL readers
+do not hold up gateway writes. Async callers submit complete DB operations to a
+bounded single-worker executor; synchronous REST endpoints run in a threadpool.
 
 Schema invariant: messages, tasks and rules all hang off
 ``sims``, not off devices.  Swapping a card into the other module must not
@@ -13,18 +13,25 @@ single-modem model.
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import functools
 import hashlib
 import json
 import logging
 import sqlite3
 import threading
-from collections.abc import Callable, Iterable, Mapping
+import time
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Literal
+
+from anyio import CancelScope
 
 log = logging.getLogger(__name__)
 
@@ -754,6 +761,12 @@ class Database:
         )
         self._db.row_factory = sqlite3.Row
         self._lock = threading.RLock()
+        # Admit at most 64 operations, including the one running. Submit whole
+        # transactions so a cancelled caller cannot leave half an event behind.
+        self._async_slots = asyncio.Semaphore(64)
+        self._async_writer = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="hub-db"
+        )
         with self._lock:
             self._prepare_schema(pre_existing=pre_existing)
 
@@ -1360,8 +1373,41 @@ class Database:
         self._db.execute("COMMIT")
 
     def close(self) -> None:
+        # Drain the controlled async writer before closing its connection.  A
+        # cancelled HTTP request may still have a transaction finishing there.
+        self._async_writer.shutdown(wait=True, cancel_futures=False)
         with self._lock:
             self._db.close()
+
+    async def run(
+        self, operation: Callable[..., Any], /, *args: Any, **kwargs: Any
+    ) -> Any:
+        """Run one complete synchronous DB operation off the event loop.
+
+        The operation must own its transaction boundary when it writes.  If the
+        caller is cancelled, the worker is still awaited before propagating the
+        cancellation, which keeps a committed event and its ACK in order.
+        """
+        async with self._async_slots:
+            with CancelScope(shield=True):
+                loop = asyncio.get_running_loop()
+                call = functools.partial(operation, *args, **kwargs)
+                future = loop.run_in_executor(self._async_writer, call)
+                cancelled = None
+                while not future.done():
+                    try:
+                        await asyncio.shield(future)
+                    except asyncio.CancelledError as exc:
+                        cancelled = exc
+                    except Exception:
+                        break  # retrieve the worker's exception below
+                if cancelled is not None:
+                    # Retrieve failures too, without replacing cancellation.
+                    if future.exception() is not None:
+                        log.error("database operation failed during cancellation",
+                                  exc_info=future.exception())
+                    raise cancelled
+                return future.result()
 
     # -- low level ---------------------------------------------------------
 
@@ -1376,6 +1422,36 @@ class Database:
     def execute(self, sql: str, params: tuple | dict = ()) -> sqlite3.Cursor:
         with self._lock:
             return self._db.execute(sql, params)
+
+    @contextmanager
+    def _readonly_connection(self) -> Iterator[sqlite3.Connection]:
+        """Own a WAL reader for a query or stream, closing it on every exit."""
+        if str(self.path) == ":memory:":
+            with self._lock:
+                yield self._db
+            return
+        connection = sqlite3.connect(
+            # as_uri escapes '?' and '#' in actual filenames. StreamingResponse
+            # may advance its iterator from different threadpool workers.
+            f"{self.path.resolve().as_uri()}?mode=ro",
+            uri=True, check_same_thread=False,
+        )
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("PRAGMA busy_timeout = 5000")
+            yield connection
+        finally:
+            connection.close()
+
+    def read_query(self, sql: str, params: tuple | dict = ()) -> list[dict[str, Any]]:
+        """Run one read outside the shared write connection when possible."""
+        with self._readonly_connection() as connection:
+            return [dict(row) for row in connection.execute(sql, params).fetchall()]
+
+    def read_one(self, sql: str, params: tuple | dict = ()) -> dict[str, Any] | None:
+        rows = self.read_query(sql, params)
+        return rows[0] if rows else None
 
     # -- idempotency -------------------------------------------------------
 
@@ -2223,7 +2299,7 @@ class Database:
             summary_filter = "WHERE m.is_binary = :is_binary"
             recent_filter = "AND recent.is_binary = :is_binary"
             unread_filter = "AND unread.is_binary = :is_binary"
-        return self.query(
+        return self.read_query(
             "WITH summary AS ("
             "  SELECT m.sim_id, m.peer, MAX(m.ts) AS last_ts, "
             "         COUNT(*) AS message_count "
@@ -2288,7 +2364,7 @@ class Database:
         return cur.rowcount
 
     def unread_total(self) -> int:
-        row = self.one(
+        row = self.read_one(
             "SELECT COUNT(*) AS n FROM messages "
             "WHERE direction = 'in' AND read_at IS NULL"
         )
@@ -2326,7 +2402,7 @@ class Database:
         if limit is not None:
             sql += " LIMIT ? OFFSET ?"
             params.extend([limit, offset])
-        return self.query(sql, tuple(params))
+        return self.read_query(sql, tuple(params))
 
     def iter_messages(
         self,
@@ -2356,28 +2432,22 @@ class Database:
             sql += " LIMIT ?"
             params.append(limit)
 
-        connection = sqlite3.connect(
-            f"file:{self.path.resolve()}?mode=ro", uri=True
-        )
-        connection.row_factory = sqlite3.Row
-        try:
+        with self._readonly_connection() as connection:
             cursor = connection.execute(sql, tuple(params))
             while rows := cursor.fetchmany(batch_size):
                 for row in rows:
                     yield dict(row)
-        finally:
-            connection.close()
 
     def count_messages(self, scope: MessageScope | None = None) -> int:
         where, params = (scope or MessageScope()).where()
-        row = self.one(
+        row = self.read_one(
             f"SELECT COUNT(*) AS n FROM messages m {where}", tuple(params)
         )
         return int(row["n"]) if row else 0
 
     def message_trend(self, *, since: str) -> list[dict[str, Any]]:
         """Daily per-card counts since a normalized UTC timestamp."""
-        return self.query(
+        return self.read_query(
             "SELECT date(ts) AS day, sim_id, "
             "       SUM(CASE WHEN direction = 'in' THEN 1 ELSE 0 END) AS received, "
             "       SUM(CASE WHEN direction = 'out' THEN 1 ELSE 0 END) AS sent "
@@ -2659,8 +2729,8 @@ class Database:
 
         def window(sql: str) -> dict[str, int]:
             return {
-                "day": int(self.one(sql, (day,))["n"]),
-                "week": int(self.one(sql, (week,))["n"]),
+                "day": int(self.read_one(sql, (day,))["n"]),
+                "week": int(self.read_one(sql, (week,))["n"]),
             }
 
         messages = {
@@ -2709,7 +2779,7 @@ class Database:
         }
         # Table names are a fixed private tuple, never caller input.
         rows = {
-            table: int(self.one(f"SELECT COUNT(*) AS n FROM {table}")["n"])
+            table: int(self.read_one(f"SELECT COUNT(*) AS n FROM {table}")["n"])
             for table in self._ROW_COUNT_TABLES
         }
         return {
@@ -2721,7 +2791,20 @@ class Database:
 
     # -- retention ---------------------------------------------------------
 
-    def purge(
+    def purge(self, **retention: int) -> dict[str, int]:
+        removed = {}
+        for batch in self.purge_batches(**retention):
+            removed = batch
+        return removed
+
+    async def purge_async(self, **retention: int) -> dict[str, int]:
+        batches = self.purge_batches(**retention)
+        removed = {}
+        while (batch := await self.run(next, batches, None)) is not None:
+            removed = batch
+        return removed
+
+    def purge_batches(
         self,
         *,
         message_days: int,
@@ -2731,55 +2814,42 @@ class Database:
         incident_days: int = 0,
         audit_max_rows: int = 0,
         ingested_days: int = 0,
-    ) -> dict[str, int]:
-        """Delete aged rows.  Verification codes should not live forever.
+        batch_size: int = 500,
+    ) -> Iterator[dict[str, int]]:
+        """Commit bounded deletes, yielding cumulative counts after each batch.
 
         Every append-only table needs a horizon of its own.  Only notify_logs
         tied to a message disappear with it (ON DELETE CASCADE); rows from task
         receipts and channel tests carry no message_id and would otherwise
         outlive every other trace of the event.
         """
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
         removed = {
             "messages": 0, "status": 0, "ingested": 0,
             "agent_logs": 0, "task_logs": 0, "notify_logs": 0,
             "audit_events": 0, "incidents": 0,
         }
-        if message_days > 0:
-            cutoff = (
-                datetime.now(UTC) - timedelta(days=message_days)
-            ).isoformat()
-            removed["messages"] = self.execute(
-                "DELETE FROM messages WHERE ts < ?", (cutoff,)
-            ).rowcount
-            # Matched rows cascade with messages. Unmatched reports have no
-            # parent, so give them the same retention horizon explicitly.
-            self.execute(
-                "DELETE FROM sms_delivery_segments "
-                "WHERE message_id IS NULL AND created_at < ?",
-                (cutoff,),
-            )
-        if status_days > 0:
-            cutoff = (
-                datetime.now(UTC) - timedelta(days=status_days)
-            ).isoformat()
-            removed["status"] = self.execute(
-                "DELETE FROM device_status WHERE ts < ?", (cutoff,)
-            ).rowcount
-        if log_days > 0:
-            cutoff = (
-                datetime.now(UTC) - timedelta(days=log_days)
-            ).isoformat()
-            for table in ("agent_logs", "task_logs", "notify_logs"):
-                removed[table] = self.execute(
-                    f"DELETE FROM {table} WHERE ts < ?", (cutoff,)
-                ).rowcount
-        if audit_days > 0:
-            cutoff = (
-                datetime.now(UTC) - timedelta(days=audit_days)
-            ).isoformat()
-            removed["audit_events"] = self.execute(
-                "DELETE FROM audit_events WHERE ts < ?", (cutoff,)
-            ).rowcount
+        now = datetime.now(UTC)
+        specs = []
+        # Identifiers and predicates are private constants. Cutoffs stay fixed
+        # throughout a pass, even while newer events arrive between batches.
+        for key, table, days, predicate in (
+            ("messages", "messages", message_days, "ts < ?"),
+            (None, "sms_delivery_segments", message_days,
+             "message_id IS NULL AND created_at < ?"),
+            ("status", "device_status", status_days, "ts < ?"),
+            ("agent_logs", "agent_logs", log_days, "ts < ?"),
+            ("task_logs", "task_logs", log_days, "ts < ?"),
+            ("notify_logs", "notify_logs", log_days, "ts < ?"),
+            ("audit_events", "audit_events", audit_days, "ts < ?"),
+            ("incidents", "incidents", incident_days,
+             "status = 'resolved' AND resolved_at < ?"),
+            # Opt-in only: expiring dedupe rows permits older event replays.
+            ("ingested", "ingested", ingested_days, "at < ?"),
+        ):
+            if days > 0:
+                specs.append((key, table, predicate, (now - timedelta(days=days)).isoformat()))
         if audit_max_rows > 0:
             # Keep the newest rows.  id is monotonic, so the cutoff id is the
             # one audit_max_rows back from the newest.
@@ -2788,37 +2858,24 @@ class Database:
                 (audit_max_rows - 1,),
             )
             if row is not None:
-                removed["audit_events"] += self.execute(
-                    "DELETE FROM audit_events WHERE id < ?", (row["id"],)
+                specs.append(("audit_events", "audit_events", "id < ?", row["id"]))
+        for key, table, predicate, cutoff in specs:
+            while True:
+                started = time.monotonic()
+                count = self.execute(
+                    f"DELETE FROM {table} WHERE rowid IN "
+                    f"(SELECT rowid FROM {table} WHERE {predicate} LIMIT ?)",
+                    (cutoff, batch_size),
                 ).rowcount
-        if incident_days > 0:
-            # Only closed incidents age out; an unresolved one stays until it
-            # recovers or an admin acts on it, however old it is.
-            cutoff = (
-                datetime.now(UTC) - timedelta(days=incident_days)
-            ).isoformat()
-            removed["incidents"] = self.execute(
-                "DELETE FROM incidents "
-                "WHERE status = 'resolved' AND resolved_at IS NOT NULL "
-                "AND resolved_at < ?",
-                (cutoff,),
-            ).rowcount
-        if ingested_days > 0:
-            # Deleting an idempotency row un-claims its sequence number: the
-            # agent replays anything it never saw acked, and a replay of an
-            # event whose row is gone applies a second time — a duplicate SMS,
-            # a duplicate call record.  The old fixed 7-day horizon assumed the
-            # protocol bounds how long an unacked event can wait, and nothing
-            # does: an agent offline over a holiday still holds its queue.  So
-            # this is opt-in, and an operator who turns it on is choosing a
-            # window they believe covers their worst outage.
-            cutoff = (
-                datetime.now(UTC) - timedelta(days=ingested_days)
-            ).isoformat()
-            removed["ingested"] = self.execute(
-                "DELETE FROM ingested WHERE at < ?", (cutoff,)
-            ).rowcount
-        return removed
+                if key is not None:
+                    removed[key] += count
+                log.debug("purge table=%s removed=%d duration_ms=%.3f batch_full=%s",
+                          table, count, (time.monotonic() - started) * 1000,
+                          count == batch_size)
+                yield dict(removed)
+                if count < batch_size:
+                    break
+        yield dict(removed)
 
     # -- backup and restore ------------------------------------------------
     # Tables a genuine hub backup must contain.  A sanity gate so an arbitrary

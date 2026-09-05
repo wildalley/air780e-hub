@@ -1738,7 +1738,7 @@ async def test_cleanup_of_a_superseded_connection_spares_the_incumbent(tmp_path)
         )
         gateway.connections["agent-a"] = incumbent
 
-        gateway._unregister(
+        await gateway._unregister(
             AgentConnection(
                 agent_id="agent-a", websocket=_AckSocket(), generation=2
             )
@@ -1749,7 +1749,7 @@ async def test_cleanup_of_a_superseded_connection_spares_the_incumbent(tmp_path)
             "connected"
         ] == 1
 
-        gateway._unregister(incumbent)
+        await gateway._unregister(incumbent)
         assert gateway.connections == {}
         assert db.one("SELECT connected FROM agents WHERE id = 'agent-a'")[
             "connected"
@@ -1776,7 +1776,7 @@ async def test_a_disconnect_reports_pending_commands_as_unknown(tmp_path):
         gateway._pending["cmd-1"] = _PendingCommand("agent-a", 1, mine)
         gateway._pending["cmd-2"] = _PendingCommand("agent-b", 9, theirs)
 
-        gateway._unregister(connection)
+        await gateway._unregister(connection)
 
         with pytest.raises(CommandFailed, match="the result is unknown"):
             mine.result()

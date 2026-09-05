@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
+from anyio import CancelScope
+
 from . import PROTOCOL_VERSION, __version__
 from .auth import verify_agent_token, verify_agent_token_hash
 from .config import Settings
@@ -172,6 +174,7 @@ class AgentConnection:
     tasks_sync_id: str = ""
     tasks_next_check: float = 0.0
     tasks_sync_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    ready: bool = True
 
     async def send(self, frame: dict[str, Any]) -> None:
         await self.websocket.send_text(json.dumps(frame, ensure_ascii=False))
@@ -279,7 +282,7 @@ class Gateway:
         """
         await websocket.accept()
 
-        if not self.authenticate(websocket.headers.get("authorization")):
+        if not await self.db.run(self.authenticate, websocket.headers.get("authorization")):
             log.warning("agent connection rejected: bad token")
             await websocket.close(code=CLOSE_AUTH_FAILED, reason="bad token")
             return
@@ -336,7 +339,7 @@ class Gateway:
                             code=CLOSE_AGENT_CONFLICT, reason="already connected"
                         )
                         return
-                    registered = self._register(candidate, websocket, frame)
+                    registered = await self._register(candidate, websocket, frame)
                     # Keep-alive tasks are the one piece of state the agent
                     # persists on its own (D3), so a task edited or deleted
                     # while it was offline would otherwise keep running
@@ -371,9 +374,9 @@ class Gateway:
                     pass
         finally:
             if registered is not None:
-                self._unregister(registered)
+                await self._unregister(registered)
 
-    def _register(
+    async def _register(
         self, agent_id: str, websocket: Any, frame: dict[str, Any]
     ) -> AgentConnection:
         version = str(frame.get("version", ""))
@@ -394,8 +397,36 @@ class Gateway:
             protocol_version=protocol_version,
             stream_id=stream_id,
             devices=devices,
+            ready=False,
         )
+        # Reserve the ID before yielding, so concurrent hellos cannot both win.
         self.connections[agent_id] = connection
+        try:
+            with CancelScope(shield=True):
+                await self.db.run(
+                    self._persist_registration, agent_id, version,
+                    protocol_version, stream_id, devices,
+                )
+                connection.ready = True
+                for device in devices:
+                    if "online" in device:
+                        self._note_device(agent_id, device.get("name", ""),
+                                          bool(device.get("online")))
+        except BaseException:
+            await self._unregister(connection)
+            raise
+        log.info(
+            "agent %s connected (v%s, protocol=%s, stream=%s, %d device(s), "
+            "last_seq=%s)",
+            agent_id, version or "?", protocol_version or "?", stream_id or "-",
+            len(devices), frame.get("last_seq"),
+        )
+        return connection
+
+    def _persist_registration(
+        self, agent_id: str, version: str, protocol_version: int,
+        stream_id: str, devices: list[dict[str, Any]],
+    ) -> None:
         self._note_stream(agent_id, stream_id)
         self.db.upsert_agent(
             agent_id, version, protocol_version, connected=True, stream_id=stream_id
@@ -421,16 +452,6 @@ class Gateway:
             self.db.resolve_incident(fingerprint, detail="Agent 与 Server 版本已一致")
         for device in devices:
             self.db.upsert_device(agent_id, device)
-            if "online" in device:
-                self._note_device(agent_id, device.get("name", ""),
-                                  bool(device.get("online")))
-        log.info(
-            "agent %s connected (v%s, protocol=%s, stream=%s, %d device(s), "
-            "last_seq=%s)",
-            agent_id, version or "?", protocol_version or "?", stream_id or "-",
-            len(devices), frame.get("last_seq"),
-        )
-        return connection
 
     def _note_stream(self, agent_id: str, stream_id: str) -> None:
         """Record a change of the agent's local event-store epoch.
@@ -477,7 +498,7 @@ class Gateway:
             ),
         )
 
-    def _unregister(self, connection: AgentConnection) -> None:
+    async def _unregister(self, connection: AgentConnection) -> None:
         """Release this connection's registration, if it still holds one.
 
         Guarded by object identity rather than by agent id: a refused duplicate
@@ -491,8 +512,21 @@ class Gateway:
                 "skipping cleanup for a superseded %s connection", agent_id
             )
             return
-        del self.connections[agent_id]
+        connection.ready = False
         self._abandon_pending(connection)
+        with CancelScope(shield=True):
+            try:
+                going_down = await self.db.run(self._persist_disconnect, agent_id)
+                for row in going_down:
+                    self._note_device(agent_id, row["name"], False)
+            finally:
+                # Hold the reservation through the DB write, otherwise an old
+                # disconnect could mark a newly registered session offline.
+                if self.connections.get(agent_id) is connection:
+                    del self.connections[agent_id]
+        log.info("agent %s disconnected", agent_id)
+
+    def _persist_disconnect(self, agent_id: str) -> list[dict[str, Any]]:
         self.db.set_agent_connected(agent_id, False)
         # Capture which modules were up *before* flipping them: the agent's link
         # dropping takes all of them offline at once, and each such edge is what
@@ -502,9 +536,7 @@ class Gateway:
             "SELECT name FROM devices WHERE agent_id = ? AND online = 1", (agent_id,)
         )
         self.db.set_devices_offline(agent_id)
-        for row in going_down:
-            self._note_device(agent_id, row["name"], False)
-        log.info("agent %s disconnected", agent_id)
+        return going_down
 
     def _abandon_pending(self, connection: AgentConnection) -> None:
         """Fail every command still waiting on a connection that has gone.
@@ -554,17 +586,19 @@ class Gateway:
         # already owes a push; sending it is a queue the notifier drains.
         # Delivery and alert hooks still run only after COMMIT below.
         event_key = f"{agent_id}|{connection.stream_id}|{seq}"
-        fresh, applied = self.db.apply_event(
-            agent_id,
-            seq,
-            kind,
-            lambda: self._apply(agent_id, kind, frame, event_key),
-            stream_id=connection.stream_id,
-        )
-        if not fresh:
-            log.debug("duplicate %s seq=%d from %s, skipped", kind, seq, agent_id)
-        else:
-            await self._after_apply(connection, kind, frame, applied)
+        with CancelScope(shield=True):
+            fresh, applied = await self.db.run(
+                self.db.apply_event,
+                agent_id,
+                seq,
+                kind,
+                lambda: self._apply(agent_id, kind, frame, event_key),
+                stream_id=connection.stream_id,
+            )
+            if not fresh:
+                log.debug("duplicate %s seq=%d from %s, skipped", kind, seq, agent_id)
+            else:
+                await self._after_apply(connection, kind, frame, applied)
         # Ack either way: a duplicate is still safely delivered.
         await connection.send({"type": "ack", "seq": seq})
 
@@ -1020,7 +1054,7 @@ class Gateway:
     ) -> dict[str, Any]:
         """Send a command and wait for the agent's ``cmd_result``."""
         connection = self.connections.get(agent_id)
-        if connection is None:
+        if connection is None or not connection.ready:
             raise AgentUnavailable(f"agent {agent_id!r} is not connected")
 
         cmd_id = "c-" + secrets.token_hex(4)
@@ -1069,11 +1103,8 @@ class Gateway:
                 device_name, len(rows),
             )
             return None
-        # Not in the table yet: a module reported in a hello that has not been
-        # persisted is still addressable while its connection is up.
-        for agent_id, connection in self.connections.items():
-            if any(d.get("name") == device_name for d in connection.devices):
-                return agent_id
+        # Registration persists the devices before task synchronization starts.
+        # This resolver can run on the DB worker without reading the registry.
         return None
 
     # -- keep-alive tasks --------------------------------------------------
@@ -1139,36 +1170,22 @@ class Gateway:
         """Send a versioned snapshot; its durable receipt arrives through ingest."""
         connection = self.connections.get(agent_id)
         if connection is None:
-            revision = task_revision(self.tasks_for(agent_id))
-            state = self.db.one("SELECT tasks_revision FROM agents WHERE id = ?", (agent_id,))
-            if state is not None and revision != state["tasks_revision"]:
-                self.db.begin_task_sync(agent_id, revision, secrets.token_hex(16))
+            _, revision, _, _ = await self.db.run(self._prepare_task_sync, agent_id, None)
             return revision
         async with connection.tasks_sync_lock:
-            if self.connections.get(agent_id) is not connection:
+            if self.connections.get(agent_id) is not connection or not connection.ready:
                 return
             connection.tasks_next_check = (
                 asyncio.get_running_loop().time() + TASK_SYNC_RETRY_SECONDS
             )
-            tasks = self.tasks_for(agent_id)
-            revision = task_revision(tasks)
-            state = self.db.one("SELECT * FROM agents WHERE id = ?", (agent_id,)) or {}
-            if (
-                revision != state.get("tasks_revision")
-                or not connection.tasks_sync_id
-                or connection.tasks_sync_id != state.get("tasks_sync_id")
-            ):
-                connection.tasks_sync_id = secrets.token_hex(16)
-                self.db.begin_task_sync(
-                    agent_id, revision, connection.tasks_sync_id, sent_at=utcnow()
-                )
-            elif state.get("tasks_sync_status") == "applied":
+            tasks, revision, sync_id, should_send = await self.db.run(
+                self._prepare_task_sync, agent_id, connection.tasks_sync_id,
+            )
+            if self.connections.get(agent_id) is not connection or not connection.ready:
+                return
+            connection.tasks_sync_id = sync_id
+            if not should_send:
                 return revision
-            else:
-                self.db.execute(
-                    "UPDATE agents SET tasks_sync_sent_at = ? WHERE id = ?",
-                    (utcnow(), agent_id),
-                )
             try:
                 async with asyncio.timeout(TASK_SYNC_SEND_TIMEOUT):
                     await connection.send({
@@ -1176,7 +1193,8 @@ class Gateway:
                         "sync_id": connection.tasks_sync_id,
                     })
             except Exception:
-                self.db.finish_task_sync(
+                await self.db.run(
+                    self.db.finish_task_sync,
                     agent_id, revision, connection.tasks_sync_id,
                     ok=False, error="任务配置下发失败",
                 )
@@ -1184,6 +1202,32 @@ class Gateway:
                 return revision
             log.info("pushed %d keep-alive task(s) to %s", len(tasks), agent_id)
             return revision
+
+    def _prepare_task_sync(
+        self, agent_id: str, sync_id: str | None,
+    ) -> tuple[list[dict[str, Any]], str, str, bool]:
+        """Prepare a DB snapshot using only copied connection identifiers."""
+        tasks = self.tasks_for(agent_id)
+        revision = task_revision(tasks)
+        state = self.db.one("SELECT * FROM agents WHERE id = ?", (agent_id,)) or {}
+        if sync_id is None:
+            if state and revision != state.get("tasks_revision"):
+                self.db.begin_task_sync(agent_id, revision, secrets.token_hex(16))
+            return tasks, revision, "", False
+        if (
+            revision != state.get("tasks_revision")
+            or not sync_id or sync_id != state.get("tasks_sync_id")
+        ):
+            sync_id = secrets.token_hex(16)
+            self.db.begin_task_sync(agent_id, revision, sync_id, sent_at=utcnow())
+        elif state.get("tasks_sync_status") == "applied":
+            return tasks, revision, sync_id, False
+        else:
+            self.db.execute(
+                "UPDATE agents SET tasks_sync_sent_at = ? WHERE id = ?",
+                (utcnow(), agent_id),
+            )
+        return tasks, revision, sync_id, True
 
     async def retry_task_sync(self) -> None:
         now = asyncio.get_running_loop().time()
