@@ -790,6 +790,8 @@ class Notifier:
                 # A pass that raises must not end the worker: the next one has
                 # a fresh claim and the failed rows kept their leases.
                 log.exception("notification queue pass failed")
+            if self._closing:
+                break
             self._wake.clear()
             with contextlib.suppress(TimeoutError, asyncio.TimeoutError):
                 idle_seconds = await self.db.run(self._idle_seconds)
@@ -831,6 +833,20 @@ class Notifier:
                 break
         while self._inflight:
             await asyncio.gather(*list(self._inflight), return_exceptions=True)
+
+    async def pause(self, timeout: float = 30.0) -> None:
+        """Stop claiming work, settle current sends, and leave retries durable."""
+        self._closing = True
+        worker, self._worker = self._worker, None
+        self._wake.set()
+        tasks = set(self._inflight)
+        if worker is not None:
+            tasks.add(worker)
+        if tasks:
+            _, pending = await asyncio.wait(tasks, timeout=timeout)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def aclose(self) -> None:
         self._closing = True

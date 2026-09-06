@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .api import build_router
 from .config import Settings
+from .restore import RestoreMiddleware
 from .state import AppState
 
 log = logging.getLogger(__name__)
@@ -82,6 +83,8 @@ class AuditMiddleware:
         )
 
     async def _record(self, method, path, status, detail, scope) -> None:
+        if self.state.restore.outcome == "manual_recovery":
+            return
         client = scope.get("client")
         await self.state.db.run(
             self.state.db.record_audit,
@@ -129,25 +132,28 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         except Exception:
             log.exception("initial SIM incident reconciliation failed")
-        task = asyncio.create_task(_housekeeping(state), name="housekeeping")
-        task_sync = asyncio.create_task(state.gateway.run_task_sync(), name="task-sync")
-        operations = asyncio.create_task(state.gateway.run_operations(), name="operations")
+        state.background_factories = [
+            lambda: _housekeeping(state), lambda: state.gateway.run_task_sync(),
+            lambda: state.gateway.run_operations(),
+        ]
         # Anything the last run left owed in the outbox goes out now: the queue
         # is what makes a push survive a restart, and nothing else drains it.
-        state.notifier.start()
+        state.start_background()
         try:
             yield
         finally:
-            task.cancel()
-            task_sync.cancel()
-            operations.cancel()
-            await asyncio.gather(task, task_sync, operations, return_exceptions=True)
-            await state.db.run(state.db.recover_operations)
+            async with state.restore.lock:
+                await state.stop_background()
+                await state.db.run(state.db.recover_operations)
             # Cancel any armed offline timers, then let pushes already on the
             # wire finish before the HTTP client closes — AppState.close() is
             # synchronous and cannot await them.
             await state.alerter.aclose()
-            await state.notifier.aclose()
+            if state.restore.outcome == "manual_recovery":
+                await state.notifier.pause(timeout=0)
+                await state.notifier.client.aclose()
+            else:
+                await state.notifier.aclose()
             state.close()
 
     app = FastAPI(
@@ -161,6 +167,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.hub = state
 
     app.add_middleware(AuditMiddleware, state=state)
+    app.add_middleware(RestoreMiddleware, state=state)
 
     router = build_router(state)
     app.include_router(router)

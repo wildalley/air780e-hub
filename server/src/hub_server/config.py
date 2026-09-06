@@ -93,6 +93,10 @@ class Settings:
     timezone: str = "Asia/Shanghai"
     # Trust X-Forwarded-* headers when running behind a trusted reverse proxy.
     behind_proxy: bool = True
+    restore_max_bytes: int = 512 * 1024 * 1024
+    restore_min_free_bytes: int = 64 * 1024 * 1024
+    restore_upload_timeout: float = 300.0
+    restore_drain_timeout: float = 30.0
 
     @property
     def db_path(self) -> Path:
@@ -144,6 +148,12 @@ class Settings:
             ),
             timezone=os.environ.get("HUB_TZ", "Asia/Shanghai"),
             behind_proxy=_bool("HUB_BEHIND_PROXY", True),
+            restore_max_bytes=int(os.environ.get("HUB_RESTORE_MAX_BYTES", 512 * 1024 * 1024)),
+            restore_min_free_bytes=int(
+                os.environ.get("HUB_RESTORE_MIN_FREE_BYTES", 64 * 1024 * 1024)
+            ),
+            restore_upload_timeout=float(os.environ.get("HUB_RESTORE_UPLOAD_TIMEOUT", "300")),
+            restore_drain_timeout=float(os.environ.get("HUB_RESTORE_DRAIN_TIMEOUT", "30")),
         )
         settings.data_dir.mkdir(parents=True, exist_ok=True)
         settings.ensure_agent_token()

@@ -241,10 +241,23 @@ class Gateway:
         # Connection generations are handed out from here.  Monotonic and never
         # reset, so no two sessions in this process share one.
         self._generations = itertools.count(1)
+        self.maintenance = False
+        # Once a database restore starts, this gateway is retired permanently.
+        # Old WebSocket tasks may finish later, but their cleanup must not write
+        # stale offline state after the replacement gateway is serving again.
+        self.retiring_for_restore = False
 
     @property
     def pending_command_count(self) -> int:
         return len(self._pending)
+
+    def retire_for_restore(self) -> None:
+        """Invalidate this gateway before an online database replacement."""
+        self.retiring_for_restore = True
+        for connection in list(self.connections.values()):
+            connection.ready = False
+            self._abandon_pending(connection)
+        self.connections.clear()
 
     # -- connection lifecycle ---------------------------------------------
 
@@ -284,6 +297,10 @@ class Gateway:
         and not on the id it asked for.
         """
         await websocket.accept()
+
+        if self.maintenance:
+            await websocket.close(code=1013, reason="database restore in progress")
+            return
 
         if not await self.db.run(self.authenticate, websocket.headers.get("authorization")):
             log.warning("agent connection rejected: bad token")
@@ -342,6 +359,11 @@ class Gateway:
                             code=CLOSE_AGENT_CONFLICT, reason="already connected"
                         )
                         return
+                    if self.maintenance or self.retiring_for_restore:
+                        await websocket.close(
+                            code=1013, reason="database restore in progress"
+                        )
+                        return
                     registered = await self._register(candidate, websocket, frame)
                     # Keep-alive tasks are the one piece of state the agent
                     # persists on its own (D3), so a task edited or deleted
@@ -361,7 +383,7 @@ class Gateway:
         except Exception as exc:
             # A disconnect surfaces as WebSocketDisconnect; anything else is
             # worth a look but must not take the server down.
-            if type(exc).__name__ != "WebSocketDisconnect":
+            if type(exc).__name__ != "WebSocketDisconnect" and not self.retiring_for_restore:
                 log.exception(
                     "agent %s connection failed",
                     registered.agent_id if registered else "?",
@@ -382,6 +404,8 @@ class Gateway:
     async def _register(
         self, agent_id: str, websocket: Any, frame: dict[str, Any]
     ) -> AgentConnection:
+        if self.maintenance or self.retiring_for_restore:
+            raise AgentUnavailable("database restore is in progress")
         version = str(frame.get("version", ""))
         protocol_version = _optional_int(frame.get("protocol_version")) or 0
         stream_id = str(frame.get("stream_id") or "").strip()[:MAX_ID_CHARS]
@@ -409,11 +433,10 @@ class Gateway:
             with CancelScope(shield=True):
                 await self.db.run(
                     self._persist_registration, agent_id, version,
-                    protocol_version, stream_id, devices,
+                    protocol_version, stream_id, devices, connection.connection_id,
                 )
-                await self.db.run(
-                    self.db.rebind_operations, agent_id, stream_id, connection.connection_id,
-                )
+                if self.retiring_for_restore:
+                    raise AgentUnavailable("database restore is in progress")
                 connection.ready = True
                 for device in devices:
                     if "online" in device:
@@ -432,8 +455,10 @@ class Gateway:
 
     def _persist_registration(
         self, agent_id: str, version: str, protocol_version: int,
-        stream_id: str, devices: list[dict[str, Any]],
+        stream_id: str, devices: list[dict[str, Any]], connection_id: str,
     ) -> None:
+        if self.retiring_for_restore:
+            raise AgentUnavailable("database restore is in progress")
         self._note_stream(agent_id, stream_id)
         self.db.upsert_agent(
             agent_id, version, protocol_version, connected=True, stream_id=stream_id
@@ -459,6 +484,7 @@ class Gateway:
             self.db.resolve_incident(fingerprint, detail="Agent 与 Server 版本已一致")
         for device in devices:
             self.db.upsert_device(agent_id, device)
+        self.db.rebind_operations(agent_id, stream_id, connection_id)
 
     def _note_stream(self, agent_id: str, stream_id: str) -> None:
         """Record a change of the agent's local event-store epoch.
@@ -514,6 +540,13 @@ class Gateway:
         offline with no way back until it happened to reconnect.
         """
         agent_id = connection.agent_id
+        if self.retiring_for_restore:
+            # Restore already retired this registry and will persist a clean
+            # runtime state before taking its snapshot.  A delayed ASGI task
+            # must not mark a newly restored/reconnected agent offline.
+            connection.ready = False
+            self._abandon_pending(connection)
+            return
         if self.connections.get(agent_id) is not connection:
             log.debug(
                 "skipping cleanup for a superseded %s connection", agent_id
@@ -523,8 +556,7 @@ class Gateway:
         self._abandon_pending(connection)
         with CancelScope(shield=True):
             try:
-                await self.db.run(self.db.disconnect_operations, connection.connection_id)
-                going_down = await self.db.run(self._persist_disconnect, agent_id)
+                going_down = await self.db.run(self._persist_disconnect, connection)
                 for row in going_down:
                     self._note_device(agent_id, row["name"], False)
             finally:
@@ -534,7 +566,18 @@ class Gateway:
                     del self.connections[agent_id]
         log.info("agent %s disconnected", agent_id)
 
-    def _persist_disconnect(self, agent_id: str) -> list[dict[str, Any]]:
+    def _persist_disconnect(self, connection: AgentConnection) -> list[dict[str, Any]]:
+        """Persist one disconnect unless this gateway was retired for restore.
+
+        This entire check-and-write operation runs in the database's single
+        worker. Therefore a cleanup that was already queued either finishes
+        before restore's following runtime reset, or sees the retirement flag
+        and leaves the replacement database alone.
+        """
+        if self.retiring_for_restore:
+            return []
+        agent_id = connection.agent_id
+        self.db.disconnect_operations(connection.connection_id)
         self.db.set_agent_connected(agent_id, False)
         # Capture which modules were up *before* flipping them: the agent's link
         # dropping takes all of them offline at once, and each such edge is what
@@ -575,6 +618,8 @@ class Gateway:
     # -- ingest ------------------------------------------------------------
 
     async def _ingest(self, connection: AgentConnection, frame: dict[str, Any]) -> None:
+        if self.retiring_for_restore or not connection.ready:
+            return
         agent_id = connection.agent_id
         kind = frame["type"]
         seq = frame.get("seq")
@@ -606,7 +651,11 @@ class Gateway:
             if not fresh:
                 log.debug("duplicate %s seq=%d from %s, skipped", kind, seq, agent_id)
             else:
+                if self.retiring_for_restore or not connection.ready:
+                    return
                 await self._after_apply(connection, kind, frame, applied)
+        if self.retiring_for_restore or not connection.ready:
+            return
         # Ack either way: a duplicate is still safely delivered.
         await connection.send({"type": "ack", "seq": seq})
 
@@ -1039,6 +1088,8 @@ class Gateway:
             "AND idempotency_key = ?", (actor, target["id"], idempotency_key),
         )
         connection = self.connections.get(target["agent_id"])
+        if self.maintenance:
+            raise AgentUnavailable("database restore is in progress")
         if existing is None:
             if connection is None or not connection.ready:
                 raise AgentUnavailable("agent is not connected")
@@ -1160,6 +1211,8 @@ class Gateway:
         connection = self.connections.get(agent_id)
         if connection is None or not connection.ready:
             raise AgentUnavailable(f"agent {agent_id!r} is not connected")
+        if self.maintenance:
+            raise AgentUnavailable("database restore is in progress")
 
         if connection.durable_commands and frame.get("type") != "sync_tasks":
             device = frame.get("device")
@@ -1290,6 +1343,8 @@ class Gateway:
 
     async def push_tasks(self, agent_id: str) -> str | None:
         """Send a versioned snapshot; its durable receipt arrives through ingest."""
+        if self.retiring_for_restore:
+            return None
         connection = self.connections.get(agent_id)
         if connection is None:
             _, revision, _, _ = await self.db.run(self._prepare_task_sync, agent_id, None)
@@ -1329,6 +1384,8 @@ class Gateway:
         self, agent_id: str, sync_id: str | None,
     ) -> tuple[list[dict[str, Any]], str, str, bool]:
         """Prepare a DB snapshot using only copied connection identifiers."""
+        if self.retiring_for_restore:
+            return [], "", "", False
         tasks = self.tasks_for(agent_id)
         revision = task_revision(tasks)
         state = self.db.one("SELECT * FROM agents WHERE id = ?", (agent_id,)) or {}

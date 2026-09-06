@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from .alerts import OfflineAlerter
@@ -13,6 +15,7 @@ from .config import Settings
 from .db import SETTING_MESSAGE_RETENTION_DAYS, Database
 from .gateway import Gateway
 from .notify import Notifier
+from .restore import RestoreController
 
 log = logging.getLogger(__name__)
 
@@ -27,6 +30,9 @@ class AppState:
     alerter: OfflineAlerter
     started_at: str
     started_monotonic: float
+    restore: RestoreController = field(default_factory=RestoreController)
+    background_factories: list[Callable[[], Awaitable[None]]] = field(default_factory=list)
+    background_tasks: list[asyncio.Task] = field(default_factory=list)
 
     @classmethod
     def build(cls, settings: Settings) -> AppState:
@@ -55,6 +61,7 @@ class AppState:
             notifier=notifier, alerter=alerter,
             started_at=datetime.now(UTC).isoformat(timespec="seconds"),
             started_monotonic=time.monotonic(),
+            restore=RestoreController(),
         )
         log.info("data dir %s, timezone %s", settings.data_dir, settings.timezone)
         if not auth.is_configured:
@@ -66,6 +73,40 @@ class AppState:
 
     def close(self) -> None:
         self.db.close()
+
+    async def stop_background(self) -> None:
+        self.gateway.maintenance = True
+        tasks, self.background_tasks = self.background_tasks, []
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    def start_background(self) -> None:
+        self.gateway.maintenance = False
+        self.background_tasks = [
+            asyncio.create_task(factory()) for factory in self.background_factories
+        ]
+        self.notifier.start()
+
+    def rebuild_services(self) -> None:
+        self.auth = Auth(self.db, session_ttl_hours=self.settings.session_ttl_hours)
+        self.notifier = Notifier(self.db, self.settings)
+        self.alerter = OfflineAlerter(
+            self.db, self.notifier, grace=self.settings.offline_alert_grace,
+        )
+        self.gateway = Gateway(
+            self.db, self.settings, on_message=self.notifier.on_message,
+            on_task_result=self.notifier.on_task_result, on_call=self.notifier.on_call,
+            on_device_change=self.alerter.note,
+        )
+
+    def rebuild_gateway(self) -> None:
+        """Replace a restore-retired registry without replacing live services."""
+        self.gateway = Gateway(
+            self.db, self.settings, on_message=self.notifier.on_message,
+            on_task_result=self.notifier.on_task_result, on_call=self.notifier.on_call,
+            on_device_change=self.alerter.note,
+        )
 
     @property
     def message_retention_days(self) -> int:
