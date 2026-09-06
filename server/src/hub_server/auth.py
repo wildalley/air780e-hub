@@ -33,6 +33,10 @@ class AuthError(Exception):
     pass
 
 
+class AlreadyConfigured(AuthError):
+    """The first-run password was claimed by another request."""
+
+
 @dataclass
 class PasswordPolicy:
     min_length: int = MIN_PASSWORD_LENGTH
@@ -89,6 +93,18 @@ class Auth:
             PASSWORD_KEY, {"salt": salt.hex(), "hash": digest.hex(), "at": utcnow()}
         )
         # Any existing login is invalidated by a password change.
+        self.revoke_all_sessions()
+
+    def claim_password(self, password: str) -> None:
+        """Atomically claim the first-run password slot."""
+        self.policy.check(password)
+        salt = secrets.token_bytes(SALT_BYTES)
+        digest = _hash(password, salt)
+        inserted = self.db.insert_setting_if_absent(
+            PASSWORD_KEY, {"salt": salt.hex(), "hash": digest.hex(), "at": utcnow()}
+        )
+        if not inserted:
+            raise AlreadyConfigured("already configured")
         self.revoke_all_sessions()
 
     def verify_password(self, password: str) -> bool:

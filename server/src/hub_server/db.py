@@ -3259,6 +3259,20 @@ class Database:
             (key, json.dumps(value, ensure_ascii=False)),
         )
 
+    def insert_setting_if_absent(self, key: str, value: Any) -> bool:
+        """Insert a setting only when no value exists yet.
+
+        The conditional write is the ownership boundary for first-run setup;
+        checking ``get_setting`` before an ordinary upsert would let two
+        concurrent setup requests replace one another.
+        """
+        cursor = self.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO NOTHING",
+            (key, json.dumps(value, ensure_ascii=False)),
+        )
+        return cursor.rowcount == 1
+
     # -- operations -------------------------------------------------------
 
     def record_audit(

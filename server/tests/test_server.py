@@ -2156,6 +2156,48 @@ def test_channel_and_rule_crud(admin):
     assert admin.get("/api/rules").json() == []
 
 
+def test_channel_credentials_are_redacted_and_updates_preserve_them(admin):
+    channel = admin.post("/api/channels", json={
+        "name": "Telegram", "type": "telegram",
+        "config": {"token": "bot-secret", "chat_id": "123"},
+    }).json()
+    assert channel["config"] == '{"chat_id":"123"}'
+    assert channel["secret_fields"] == ["token"]
+    assert "bot-secret" not in admin.get("/api/channels").text
+
+    updated = admin.put(f"/api/channels/{channel['id']}", json={
+        "name": "Telegram", "type": "telegram",
+        "config": {"chat_id": "456"},
+    })
+    assert updated.status_code == 200
+    assert updated.json()["secret_fields"] == ["token"]
+    raw = admin.app.state.hub.db.one(
+        "SELECT config FROM channels WHERE id = ?", (channel["id"],)
+    )
+    assert json.loads(raw["config"]) == {"token": "bot-secret", "chat_id": "456"}
+
+    masked = admin.put(f"/api/channels/{channel['id']}", json={
+        "name": "Telegram", "type": "telegram",
+        "config": {"token": "***", "chat_id": "789"},
+    })
+    assert masked.status_code == 200
+    raw = admin.app.state.hub.db.one(
+        "SELECT config FROM channels WHERE id = ?", (channel["id"],)
+    )
+    assert json.loads(raw["config"])["token"] == "bot-secret"
+
+    cleared = admin.put(f"/api/channels/{channel['id']}", json={
+        "name": "Telegram", "type": "telegram",
+        "config": {"chat_id": "789"}, "clear_secrets": ["token"],
+    })
+    assert cleared.status_code == 200
+    assert cleared.json()["secret_fields"] == []
+    raw = admin.app.state.hub.db.one(
+        "SELECT config FROM channels WHERE id = ?", (channel["id"],)
+    )
+    assert json.loads(raw["config"]) == {"chat_id": "789"}
+
+
 def test_task_crud_defaults_match_the_plan(admin):
     task = admin.post("/api/tasks", json={"device": "a", "name": "移动保号"}).json()
     assert task["target_number"] == "10086"
@@ -3200,6 +3242,8 @@ def test_restore_migrates_the_candidate_before_touching_online_data(
         raise sqlite3.OperationalError("boom")
 
     monkeypatch.setattr(Database, "_migration_data_messages", explode)
+    db = admin.app.state.hub.db
+    db.set_setting("after-backup", "survives")
 
     response = admin.post(
         "/api/system/restore",
@@ -3243,8 +3287,6 @@ def test_restore_rejects_garbage_and_empty_uploads(admin):
 
 def _seed_agent_logs(admin, count: int, *, ts: str | None = None) -> None:
     """Insert *count* agent log rows, newest message last.
-    db = admin.app.state.hub.db
-    db.set_setting("after-backup", "survives")
 
     When *ts* is given every row shares it, which is the case that exposes an
     unstable sort: without a tiebreak, SQLite may return equal-``ts`` rows in

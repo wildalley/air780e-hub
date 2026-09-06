@@ -882,7 +882,8 @@ def test_channel_can_be_updated_and_disabled(admin):
     assert updated.status_code == 200
     assert updated.json()["enabled"] == 0
     assert updated.json()["name"] == "Bark 备用"
-    assert json.loads(updated.json()["config"])["url"].endswith("other")
+    assert updated.json()["secret_fields"] == ["url"]
+    assert "other" not in updated.json()["config"]
 
 
 def test_rule_can_be_updated(admin):

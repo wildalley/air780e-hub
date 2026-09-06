@@ -938,9 +938,15 @@ function ChannelDialog({
   const [values, setValues] = useState<Record<string, string>>(
     channel ? parseConfig(channel) : {},
   )
+  const [clearSecrets, setClearSecrets] = useState<string[]>([])
 
   const spec = CHANNEL_TYPES.find((t) => t.value === type) ?? CHANNEL_TYPES[0]
-  const missing = spec.fields.some((field) => !field.optional && !values[field.key]?.trim())
+  const missing = spec.fields.some(
+    (field) =>
+      !field.optional &&
+      !values[field.key]?.trim() &&
+      !channel?.secret_fields?.includes(field.key),
+  )
 
   const save = async () => {
     // Only send what was filled in — an empty string would look like "signing
@@ -951,7 +957,13 @@ function ChannelDialog({
       if (value) config[field.key] = value
     })
 
-    const body: ChannelInput = { name, type, config, enabled: channel ? Boolean(channel.enabled) : true }
+    const body: ChannelInput = {
+      name,
+      type,
+      config,
+      enabled: channel ? Boolean(channel.enabled) : true,
+      clear_secrets: clearSecrets,
+    }
     try {
       if (channel) await api.channels.update(channel.id, body)
       else await api.channels.create(body)
@@ -990,15 +1002,40 @@ function ChannelDialog({
             ))}
           </TextField>
           {spec.fields.map((field) => (
-            <TextField
-              key={field.key}
-              label={field.optional ? `${field.label}(可选)` : field.label}
-              value={values[field.key] ?? ''}
-              onChange={(e) => setValues((v) => ({ ...v, [field.key]: e.target.value }))}
-              helperText={field.hint}
-              type={field.password ? 'password' : 'text'}
-              fullWidth
-            />
+            <Stack key={field.key} spacing={0.5}>
+              <TextField
+                label={field.optional ? `${field.label}(可选)` : field.label}
+                value={values[field.key] ?? ''}
+                onChange={(e) => {
+                  setValues((v) => ({ ...v, [field.key]: e.target.value }))
+                  setClearSecrets((current) => current.filter((key) => key !== field.key))
+                }}
+                helperText={
+                  channel?.secret_fields?.includes(field.key)
+                    ? `${field.hint ? `${field.hint}；` : ''}已保存，留空保持不变`
+                    : field.hint
+                }
+                type={field.password ? 'password' : 'text'}
+                fullWidth
+              />
+              {channel?.secret_fields?.includes(field.key) && (
+                <Stack direction="row" spacing={1} sx={{ alignItems: 'center' }}>
+                  <Switch
+                    size="small"
+                    checked={clearSecrets.includes(field.key)}
+                    onChange={(e) =>
+                      setClearSecrets((current) =>
+                        e.target.checked
+                          ? [...current, field.key]
+                          : current.filter((key) => key !== field.key),
+                      )
+                    }
+                    slotProps={{ input: { 'aria-label': `清除${field.label}` } }}
+                  />
+                  <Typography variant="caption">清除已保存的{field.label}</Typography>
+                </Stack>
+              )}
+            </Stack>
           ))}
         </Stack>
       </DialogContent>

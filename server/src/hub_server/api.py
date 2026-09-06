@@ -26,7 +26,7 @@ from starlette.background import BackgroundTask
 
 from . import PROTOCOL_VERSION, __version__
 from .alerts import SETTING_ENABLED
-from .auth import SESSION_COOKIE, AuthError, hash_agent_token
+from .auth import SESSION_COOKIE, AlreadyConfigured, AuthError, hash_agent_token
 from .config import ConfigError
 from .csv_export import iter_message_csv
 from .db import (
@@ -318,6 +318,10 @@ class ChannelBody(BaseModel):
     type: str = Field(min_length=1, max_length=32)
     config: dict[str, Any] = Field(default_factory=dict)
     enabled: bool = True
+    # Omitted secrets are retained on update.  Null values and this explicit
+    # list are the only ways to clear one, so a redacted GET can be edited
+    # without accidentally deleting the credential.
+    clear_secrets: list[str] = Field(default_factory=list, max_length=32)
 
 
 class RuleBody(BaseModel):
@@ -454,7 +458,9 @@ def build_router(state: AppState) -> APIRouter:
         if state.auth.is_configured:
             raise HTTPException(status_code=409, detail="already configured")
         try:
-            state.auth.set_password(body.password)
+            state.auth.claim_password(body.password)
+        except AlreadyConfigured as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except AuthError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         _issue_session(request, response)
@@ -967,9 +973,77 @@ def build_router(state: AppState) -> APIRouter:
 
     # -- channels and rules ------------------------------------------------
 
+    def _is_sensitive_channel_key(key: Any) -> bool:
+        normalized = str(key).strip().lower().replace("-", "_")
+        return normalized in {
+            "token", "bot_token", "access_token", "api_key", "password", "secret",
+            "webhook", "authorization", "headers", "url",
+        } or normalized.endswith(("_token", "_password", "_secret", "_api_key"))
+
+    def _channel_public(row: dict[str, Any]) -> dict[str, Any]:
+        """Return a channel without credentials or auth-bearing headers."""
+        result = dict(row)
+        try:
+            config = json.loads(row.get("config") or "{}")
+        except (TypeError, ValueError):
+            config = {}
+        if not isinstance(config, dict):
+            config = {}
+        public: dict[str, Any] = {}
+        secret_fields: list[str] = []
+        for key, value in config.items():
+            if _is_sensitive_channel_key(key):
+                secret_fields.append(str(key))
+            else:
+                public[str(key)] = value
+        result["config"] = json.dumps(public, ensure_ascii=False, separators=(",", ":"))
+        result["secret_fields"] = sorted(secret_fields)
+        return result
+
+    def _channel_config_for_update(
+        existing: dict[str, Any], incoming: dict[str, Any], clear_secrets: list[str]
+    ) -> dict[str, Any]:
+        try:
+            old = json.loads(existing.get("config") or "{}")
+        except (TypeError, ValueError):
+            old = {}
+        if not isinstance(old, dict):
+            old = {}
+        merged = dict(incoming)
+        # Older clients sometimes echoed a masked value back on save.  Treat
+        # that as "unchanged" instead of replacing a working credential.
+        for key, value in list(merged.items()):
+            if _is_sensitive_channel_key(key) and isinstance(value, str):
+                if value.strip() and set(value.strip()) <= {"*", "•"}:
+                    merged.pop(key)
+        provided_keys = set(merged)
+        sensitive_names = {
+            str(key).strip().lower().replace("-", "_")
+            for key in old
+            if _is_sensitive_channel_key(key)
+        }
+        sensitive_names.update(str(key).strip().lower().replace("-", "_") for key in clear_secrets)
+        for key, value in old.items():
+            normalized = str(key).strip().lower().replace("-", "_")
+            if normalized not in sensitive_names:
+                continue
+            if key in clear_secrets or normalized in {
+                str(item).strip().lower().replace("-", "_") for item in clear_secrets
+            }:
+                merged.pop(key, None)
+            elif key not in provided_keys:
+                merged[key] = value
+        for key, value in list(merged.items()):
+            if _is_sensitive_channel_key(key) and value is None:
+                merged.pop(key)
+        return merged
+
     @router.get("/channels", dependencies=guard)
     def list_channels() -> list[dict[str, Any]]:
-        return state.db.query("SELECT * FROM channels ORDER BY id")
+        return [
+            _channel_public(row)
+            for row in state.db.query("SELECT * FROM channels ORDER BY id")
+        ]
 
     @router.post("/channels", dependencies=guard)
     def create_channel(body: ChannelBody) -> dict[str, Any]:
@@ -979,20 +1053,25 @@ def build_router(state: AppState) -> APIRouter:
             (body.name, body.type, json.dumps(body.config), int(body.enabled),
              utcnow()),
         )
-        return state.db.one("SELECT * FROM channels WHERE id = ?", (cursor.lastrowid,))
+        row = state.db.one("SELECT * FROM channels WHERE id = ?", (cursor.lastrowid,))
+        assert row is not None
+        return _channel_public(row)
 
     @router.put("/channels/{channel_id}", dependencies=guard)
     def update_channel(channel_id: int, body: ChannelBody) -> dict[str, Any]:
+        existing = state.db.one("SELECT * FROM channels WHERE id = ?", (channel_id,))
+        if existing is None:
+            raise HTTPException(status_code=404, detail="no such channel")
+        config = _channel_config_for_update(existing, body.config, body.clear_secrets)
         state.db.execute(
             "UPDATE channels SET name = ?, type = ?, config = ?, enabled = ? "
             "WHERE id = ?",
-            (body.name, body.type, json.dumps(body.config), int(body.enabled),
+            (body.name, body.type, json.dumps(config), int(body.enabled),
              channel_id),
         )
         row = state.db.one("SELECT * FROM channels WHERE id = ?", (channel_id,))
-        if row is None:
-            raise HTTPException(status_code=404, detail="no such channel")
-        return row
+        assert row is not None
+        return _channel_public(row)
 
     @router.post("/channels/{channel_id}/test", dependencies=guard)
     async def test_channel(channel_id: int) -> dict[str, Any]:

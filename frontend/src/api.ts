@@ -437,6 +437,7 @@ export interface Channel {
   name: string
   type: string
   config: string
+  secret_fields?: string[]
   enabled: number
 }
 
@@ -445,6 +446,7 @@ export interface ChannelInput {
   type: string
   config: Record<string, unknown>
   enabled?: boolean
+  clear_secrets?: string[]
 }
 
 export interface Rule {
