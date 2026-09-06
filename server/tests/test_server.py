@@ -3152,7 +3152,10 @@ def test_backup_restore_round_trip(admin):
     assert restored.status_code == 200, restored.text
     assert restored.json()["ok"] is True
 
-    # The session and the data survive the swap.
+    assert restored.json()["outcome"] == "restored"
+    assert admin.get("/api/overview").status_code == 401
+    assert admin.get("/api/system/restore/status").json()["outcome"] == "restored"
+    assert admin.post("/api/auth/login", json={"password": "hunter2hunter"}).status_code == 200
     assert admin.get("/api/overview").status_code == 200
 
 
@@ -3175,15 +3178,10 @@ def test_restore_rejects_unrelated_sqlite(admin, tmp_path):
     assert "缺少表" in response.json()["detail"]
 
 
-def test_restore_reports_the_snapshot_when_migrating_the_backup_fails(
+def test_restore_migrates_the_candidate_before_touching_online_data(
     admin, monkeypatch, tmp_path
 ):
-    """A failed post-restore migration must name the copy that can undo it.
-
-    By this point the uploaded data already overwrote the live database, so a
-    bare 500 would leave the operator with a half-migrated file and no hint
-    that a recoverable snapshot exists.
-    """
+    """Failed candidate migrations must not overwrite post-backup online data."""
     import sqlite3
 
     from hub_server.db import Database
@@ -3208,12 +3206,13 @@ def test_restore_reports_the_snapshot_when_migrating_the_backup_fails(
         content=legacy.read_bytes(),
         headers={"Content-Type": "application/octet-stream"},
     )
-    assert response.status_code == 500
+    assert response.status_code == 400
     detail = response.json()["detail"]
     assert "迁移失败" in detail
-    expected = admin.app.state.hub.db.path.with_name("hub.db.v4.bak")
-    assert str(expected) in detail
-    assert expected.exists()
+    assert "未修改" in detail
+    assert db.get_setting("after-backup") == "survives"
+    assert admin.get("/api/overview").status_code == 200
+    assert not list(tmp_path.glob("restore-upload-*"))
 
 
 def test_restore_rejects_garbage_and_empty_uploads(admin):
@@ -3244,6 +3243,8 @@ def test_restore_rejects_garbage_and_empty_uploads(admin):
 
 def _seed_agent_logs(admin, count: int, *, ts: str | None = None) -> None:
     """Insert *count* agent log rows, newest message last.
+    db = admin.app.state.hub.db
+    db.set_setting("after-backup", "survives")
 
     When *ts* is given every row shares it, which is the case that exposes an
     unstable sort: without a tiebreak, SQLite may return equal-``ts`` rows in

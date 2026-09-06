@@ -222,18 +222,19 @@ Gateway 自动创建关联作业，连接到旧 Agent 时继续使用原同步�
 
 ## 8. B07：恢复维护模式与可回退切换
 
-优先级：P1。定位：[api.py](../server/src/hub_server/api.py) `restore():1181`；[db.py](../server/src/hub_server/db.py) `validate_backup():2165`、`restore_from():2207`；[state.py](../server/src/hub_server/state.py)。
+优先级：P1。实现位于 [restore.py](../server/src/hub_server/restore.py)、[api.py](../server/src/hub_server/api.py)、[db.py](../server/src/hub_server/db.py) 与 [state.py](../server/src/hub_server/state.py)。
 
-### 现状与缺口
+### 2026-09-06 实现状态
 
-已有流式临时文件、SQLite 完整性检查、必要表检查、schema 版本校验和旧版本迁移，不能视为“未验证直接覆盖”。但：
+已实现恢复维护协调，而不是直接把上传内容复制到在线数据库：
 
-- 上传累计 size 仅用于空文件判断，没有服务端最大字节数与最低剩余空间预算。
-- 分析基线中 `async def restore` 同步写文件、验证和执行 backup；这些操作已随 B08 §9.1 移出事件循环，恢复维护协调仍未完成。
-- 当前将备份内容写入 live DB 后再迁移，迁移失败返回快照位置；该迁移前快照属于恢复进去的数据，不是恢复前在线库的完整回退保障。
-- 成功后没有协调内存连接、pending、离线告警 timer、通知任务及 Agent 本地任务；旧备份的在线标志和 session 数据也可能与当前运行时不符。
+- `Content-Length` 和流式累计字节均受 `HUB_RESTORE_MAX_BYTES` 限制，上传超时和最低可用空间由 `HUB_RESTORE_UPLOAD_TIMEOUT`、`HUB_RESTORE_MIN_FREE_BYTES` 控制；临时上传文件随失败或取消清理。
+- 候选库在维护前完成迁移、`integrity_check`、外键、schema 形状和任务/设备业务引用校验。在线库直到候选完成后才进入切换。
+- `RestoreController` 以互斥锁、阶段和最终状态协调一次恢复；维护中阻断新 API 和 WebSocket，保留健康检查及恢复状态查询。已连接 Agent 收到 `1012`，旧 Gateway 退休，延迟 task 不会写回离线状态。
+- 停止后台任务、暂停告警和通知、等待已准入 HTTP 请求后，创建权限为 0600 的恢复前快照。快照包含已断开的 Agent、已收敛的运行中作业，成功恢复仅保留最近 3 份。
+- 预备库切换和快速校验失败时从快照回退；双重失败维持维护模式，状态端点返回 `manual_recovery` 与快照位置。成功后重建 Auth、Notifier、OfflineAlerter 和 Gateway，清除 session、旧 Token 宽限、在线状态、任务同步状态和通知 lease。
 
-### 建议流程
+### 已实现流程
 
 ```mermaid
 flowchart TD
@@ -248,7 +249,14 @@ flowchart TD
     Verify -->|失败| Rollback[恢复原快照与原运行时]
 ```
 
-实施要求：
+自动化验收已覆盖上传限额、磁盘不足、空文件、坏引用、候选迁移失败、切换及回退失败、取消、
+维护请求阻断、session/Token 清理、快照保留及 Agent 重连。Server 全量为 305 passed（含 1 条
+既有 TestClient 弃用警告），Ruff 和 `git diff --check` 通过。
+
+仍需在隔离部署完成实际上传、真实 Agent 断连、通知渠道和回退演练；测试没有向外部通知渠道
+发送消息，也不能证明生产卷、磁盘速度或反向代理超时配置。
+
+设计约束：
 
 1. 从 Content-Length 提前拒绝超限，同时对实际流累计字节设限，兼容无 Content-Length；设置上传超时、取消清理和磁盘空间预检。
 2. 在候选库上先做迁移和业务引用检查，避免迁移失败影响当前在线库。
@@ -285,7 +293,7 @@ flowchart TD
 - `Database.run()` 使用一个线程，最多允许 64 个已提交操作（含正在执行的操作），其余调用异步等待名额。整个入站事务一次提交，保留去重、业务数据、outbox 同事务及提交后 ACK。请求取消会等待已提交操作完成；尚未取得名额的调用可以取消。
 - 网关认证、连接持久化、任务同步、通知后台、离线告警、审计、异步设备/任务接口与定期维护的 DB 操作均通过该执行器。连接注册前占用 ID，注销完成前保留占用；准备或关闭中的连接不接受硬件命令。连接字典、Future、告警计时器和异步 hook 留在事件循环，DB worker 使用复制出的连接标识。
 - 保留清理每批最多删除 500 条目标记录（不含级联删除），批次之间释放写锁并重新排队。返回累计清理数，DEBUG 日志记录表名、批次耗时、删除数和是否满批；精确剩余量、WAL 和磁盘监控仍属 B09。普通 `def` 路由继续由 FastAPI 线程池运行，并与执行器共享写锁。
-- 恢复上传写入、备份验证与恢复 DB 操作已移出事件循环；这不代表 B07 维护模式、完整回退和运行时重建已完成。
+- 恢复上传写入、候选验证与切换 DB 操作已移出事件循环；B07 现已补齐维护锁、回退与运行时重建，真实部署演练仍待完成。
 
 验收：Server 全量 289 项测试通过（新增 17 项并发测试），Ruff 通过，既有 100k 读路径基准 `--enforce` 全通过。覆盖重复取消、事务回滚、连接取消清理、慢读期间 ACK、慢写期间健康检查、hook 线程归属、内存库、CSV 跨线程和分批清理续跑。
 

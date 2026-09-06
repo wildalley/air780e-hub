@@ -19,6 +19,7 @@ import functools
 import hashlib
 import json
 import logging
+import os
 import secrets
 import sqlite3
 import threading
@@ -814,8 +815,13 @@ class Database:
         self._async_writer = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="hub-db"
         )
-        with self._lock:
-            self._prepare_schema(pre_existing=pre_existing)
+        try:
+            with self._lock:
+                self._prepare_schema(pre_existing=pre_existing)
+        except BaseException:
+            self._db.close()
+            self._async_writer.shutdown(wait=True)
+            raise
 
     def _has_schema(self) -> bool:
         """True if the file exists and already contains hub tables."""
@@ -3094,7 +3100,7 @@ class Database:
         over live data.  Opened read-only — validation never mutates the upload.
         """
         try:
-            conn = sqlite3.connect(f"file:{Path(path)}?mode=ro", uri=True)
+            conn = sqlite3.connect(f"{Path(path).resolve().as_uri()}?mode=ro", uri=True)
         except sqlite3.Error as exc:  # pragma: no cover - connect rarely fails
             raise ValueError(f"无法打开备份文件: {exc}") from exc
         try:
@@ -3146,6 +3152,94 @@ class Database:
                 self._prepare_schema(pre_existing=True)
         finally:
             source.close()
+
+    @classmethod
+    def prepare_restore(cls, path: str | Path) -> None:
+        """Migrate and validate the private candidate before entering maintenance."""
+        candidate = cls(path)
+        try:
+            candidate.verify_restored()
+        finally:
+            candidate.close()
+
+    def verify_restored(self) -> None:
+        with self._lock:
+            if self._db.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise ValueError("备份文件未通过完整性校验，在线数据库未修改")
+            if self._db.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise ValueError("备份存在无效数据引用")
+            if self._user_version() != SCHEMA_VERSION:
+                raise ValueError("备份迁移后的 schema 版本不正确")
+            # An index may touch only a subset of the columns a route needs.
+            # Check the full current shape before any HTTP handler sees it.
+            reference = sqlite3.connect(":memory:")
+            try:
+                reference.executescript(SCHEMA)
+                for (table,) in reference.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' "
+                    "AND name != 'sqlite_sequence'"
+                ):
+                    expected = {r[1] for r in reference.execute(f'PRAGMA table_info("{table}")')}
+                    actual = {r[1] for r in self._db.execute(f'PRAGMA table_info("{table}")')}
+                    if not expected <= actual:
+                        raise ValueError(f"备份表 {table} 缺少必要字段")
+            finally:
+                reference.close()
+            if self.one(
+                "SELECT t.id FROM tasks t JOIN devices d ON d.id = t.device_id "
+                "WHERE (t.agent_id <> '' AND t.agent_id <> d.agent_id) "
+                "OR (t.device <> '' AND t.device <> d.name) LIMIT 1"
+            ):
+                raise ValueError("备份任务与设备身份不一致")
+
+    @staticmethod
+    def sync_snapshot(path: Path) -> None:
+        with path.open("rb") as handle:
+            os.fsync(handle.fileno())
+        descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def replace_prepared(self, path: Path) -> None:
+        source = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            if source.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+                raise ValueError("candidate has not been migrated")
+            with self._lock:
+                source.backup(self._db)
+        finally:
+            source.close()
+
+    def reset_restored_runtime(self) -> None:
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                self.execute("DELETE FROM sessions")
+                self.mark_all_agents_disconnected()
+                self.execute(
+                    "DELETE FROM settings WHERE key IN "
+                    "('previous_agent_token_hash', 'previous_agent_token_expires_at')"
+                )
+                self.execute(
+                    "UPDATE agents SET tasks_revision = '', tasks_applied_revision = '', "
+                    "tasks_sync_id = '', tasks_sync_status = 'pending', tasks_sync_error = '', "
+                    "tasks_sync_sent_at = NULL, tasks_synced_at = NULL"
+                )
+                self.execute(
+                    "UPDATE command_operations SET status = CASE status WHEN 'queued' "
+                    "THEN 'cancelled' ELSE 'unknown' END, "
+                    "error = 'database restored', updated_at = ? "
+                    "WHERE status IN ('queued', 'running')", (utcnow(),),
+                )
+                self.execute(
+                    "UPDATE notify_deliveries SET lease_owner = NULL, lease_until = NULL"
+                )
+                self._db.execute("COMMIT")
+            except BaseException:
+                self._db.execute("ROLLBACK")
+                raise
 
     # -- settings ----------------------------------------------------------
 

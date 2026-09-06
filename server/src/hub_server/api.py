@@ -23,7 +23,6 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, model_validator
 from starlette.background import BackgroundTask
-from starlette.concurrency import run_in_threadpool
 
 from . import PROTOCOL_VERSION, __version__
 from .alerts import SETTING_ENABLED
@@ -34,7 +33,6 @@ from .db import (
     SETTING_MESSAGE_RETENTION_DAYS,
     BadCursor,
     MessageScope,
-    MigrationFailed,
     OperationConflict,
     OperationQueueFull,
     utcnow,
@@ -1525,42 +1523,20 @@ def build_router(state: AppState) -> APIRouter:
 
     @router.post("/system/restore", dependencies=guard)
     async def restore(request: Request) -> dict[str, Any]:
-        """Restore the database from an uploaded backup.
+        return await state.restore.restore(state, request)
 
-        The body is the raw backup file (``application/octet-stream``).  It is
-        streamed to a temp file, validated as a genuine hub database, then
-        copied over the live data — no restart required.  A malformed or
-        unrelated file is rejected before anything is overwritten.
-        """
-        fd, tmp = tempfile.mkstemp(prefix="hub-restore-", suffix=".db")
-        try:
-            size = 0
-            with os.fdopen(fd, "wb") as out:
-                async for chunk in request.stream():
-                    size += len(chunk)
-                    await run_in_threadpool(out.write, chunk)
-                await run_in_threadpool(out.flush)
-            if size == 0:
-                raise HTTPException(status_code=400, detail="未收到备份文件")
-            try:
-                await run_in_threadpool(state.db.validate_backup, tmp)
-            except ValueError as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            try:
-                await state.db.run(state.db.restore_from, tmp)
-            except MigrationFailed as exc:
-                # The backup's data is already in place by now; only bringing it
-                # to the current schema failed.  The snapshot path is the way
-                # back, so it has to reach the operator rather than dying in the
-                # log behind a bare 500.
-                log.exception("restore failed while migrating the restored data")
-                detail = f"备份已写入但迁移失败: {exc}"
-                if exc.snapshot is not None:
-                    detail += f";迁移前的副本保存在 {exc.snapshot}"
-                raise HTTPException(status_code=500, detail=detail) from exc
-        finally:
-            _safe_unlink(tmp)
-        return {"ok": True}
+    @router.get("/system/restore/status")
+    async def restore_status(request: Request, response: Response) -> dict[str, Any]:
+        # The initiating session may read this one outcome after its sessions
+        # table was replaced. Never consult the switching DB for that poll.
+        if not state.restore.owns_status(request.cookies.get(SESSION_COOKIE)):
+            if state.restore.active:
+                raise HTTPException(status_code=401, detail="not authenticated")
+            await state.db.run(require_session, request)
+        response.headers["Cache-Control"] = "no-store"
+        return {
+            **state.restore.view(), "max_bytes": state.settings.restore_max_bytes,
+        }
 
     # Registered after /operations/diagnostics, /incidents and /audit.
 
