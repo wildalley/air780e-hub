@@ -764,6 +764,11 @@ class Notifier:
 
     # -- lifecycle ---------------------------------------------------------
 
+    @property
+    def running(self) -> bool:
+        worker = self._worker
+        return not self._closing and worker is not None and not worker.done()
+
     def start(self) -> None:
         """Begin draining the queue.  Idempotent; needs a running event loop."""
         if self._worker is not None and not self._worker.done():
@@ -1079,6 +1084,31 @@ class Notifier:
             gate = self._channel_gates[channel_id] = asyncio.Semaphore(MAX_PER_CHANNEL)
         return gate
 
+    async def _send_with_metrics(
+        self, channel: dict[str, Any], payload: Payload
+    ) -> str:
+        """Send once and measure only the provider-facing portion.
+
+        Database lookup, queueing and settlement have their own timings.  This
+        boundary is intentionally just the channel call, so a slow provider can
+        be distinguished from local queue or SQLite contention.
+        """
+        started = time.perf_counter()
+        self.db.metrics.increment("notify_attempts")
+        try:
+            detail = await send_via_channel(self.client, channel, payload)
+        except asyncio.CancelledError:
+            self.db.metrics.increment("notify_cancelled")
+            raise
+        except Exception:
+            self.db.metrics.increment("notify_failed")
+            raise
+        else:
+            self.db.metrics.increment("notify_succeeded")
+            return detail
+        finally:
+            self.db.metrics.observe("notify_send", time.perf_counter() - started)
+
     async def _attempt_claimed(self, row: dict[str, Any]) -> None:
         delivery_id = int(row["id"])
         channel_id = int(row["channel_id"])
@@ -1108,7 +1138,7 @@ class Notifier:
             return
 
         try:
-            detail = await send_via_channel(self.client, channel, payload)
+            detail = await self._send_with_metrics(channel, payload)
         except SendError as exc:
             failure = exc
         except Exception as exc:
@@ -1133,6 +1163,7 @@ class Notifier:
                 error_code=code, safe_detail=failure.detail,
                 next_attempt_at=_shift(utcnow(), delay),
             )
+            self.db.metrics.increment("notify_retry_scheduled")
             log.info(
                 "channel %s attempt %d failed (%s); retrying in %.1fs",
                 channel_id, attempts, code, delay,
@@ -1424,7 +1455,7 @@ class Notifier:
         for attempt in range(retries + 1):
             attempts = attempt + 1
             try:
-                detail = await send_via_channel(self.client, channel, payload)
+                detail = await self._send_with_metrics(channel, payload)
             except SendError as exc:
                 detail = exc.detail
             except Exception as exc:
@@ -1439,6 +1470,7 @@ class Notifier:
                         "attempts": attempts, "detail": detail}
 
             if attempt < retries:
+                self.db.metrics.increment("notify_retry_scheduled")
                 await asyncio.sleep(self._delay(attempt))
 
         log.warning(

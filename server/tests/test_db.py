@@ -892,13 +892,57 @@ def test_message_read_paths_use_the_new_indexes(tmp_path):
         assert "USE TEMP B-TREE" not in thread_details
 
         trend_plan = database.query(
-            "EXPLAIN QUERY PLAN SELECT date(ts), sim_id, COUNT(*) FROM messages "
-            "WHERE ts >= ? GROUP BY date(ts), sim_id",
+            "EXPLAIN QUERY PLAN SELECT ts, sim_id, direction FROM messages WHERE ts >= ?",
             ("2026-08-15T00:00:00+00:00",),
         )
         trend_details = " ".join(row["detail"] for row in trend_plan)
         assert "idx_messages_ts" in trend_details
         assert "ts>?" in trend_details
+    finally:
+        database.close()
+
+
+def test_message_trend_buckets_in_iana_timezone_across_dst(tmp_path):
+    database = Database(tmp_path / "hub.db")
+    try:
+        database.insert_message(
+            agent_id="agent-a", device="a", direction="in", peer="10086",
+            body="before midnight", ts="2024-03-10T04:59:00+00:00",
+            iccid="8986000000000000001",
+        )
+        database.insert_message(
+            agent_id="agent-a", device="a", direction="in", peer="10086",
+            body="spring start", ts="2024-03-10T05:00:00+00:00",
+            iccid="8986000000000000001",
+        )
+        database.insert_message(
+            agent_id="agent-a", device="a", direction="out", peer="10086",
+            body="spring end", ts="2024-03-11T03:59:00+00:00",
+            iccid="8986000000000000001",
+        )
+        database.insert_message(
+            agent_id="agent-a", device="a", direction="in", peer="10010",
+            body="unassigned", ts="2024-03-10T06:00:00+00:00",
+        )
+        rows = database.message_trend(
+            since="2024-03-10T05:00:00+00:00",
+            until="2024-03-11T04:00:00+00:00",
+            timezone="America/New_York",
+        )
+        assert rows == [
+            {
+                "day": "2024-03-10",
+                "sim_id": None,
+                "received": 1,
+                "sent": 0,
+            },
+            {
+                "day": "2024-03-10",
+                "sim_id": 1,
+                "received": 1,
+                "sent": 1,
+            },
+        ]
     finally:
         database.close()
 

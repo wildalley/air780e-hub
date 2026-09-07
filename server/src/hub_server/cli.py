@@ -49,6 +49,8 @@ def _serve(args: argparse.Namespace) -> int:
         app,
         host=settings.host,
         port=settings.port,
+        # Gateway connections and command routing belong to this process.
+        workers=1,
         # Trust forwarding headers only when deployment enables proxy mode.
         proxy_headers=settings.behind_proxy,
         forwarded_allow_ips="*" if settings.behind_proxy else None,

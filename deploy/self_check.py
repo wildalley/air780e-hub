@@ -19,7 +19,6 @@ from collections.abc import Mapping
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-
 USER_AGENT = "air780e-hub-self-check/0.1"
 WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MAX_HTTP_HEADER = 64 * 1024
@@ -65,6 +64,9 @@ def validate_environment(environ: Mapping[str, str], *, using_https: bool) -> li
     _bounded_int(environ, "HUB_HOST_PORT", default=8090, minimum=1, maximum=65535)
     _bounded_int(environ, "HUB_MESSAGE_RETENTION_DAYS", default=90, minimum=0)
     _bounded_int(environ, "HUB_STATUS_RETENTION_DAYS", default=30, minimum=0)
+    for name in ("WEB_CONCURRENCY", "UVICORN_WORKERS"):
+        if name in environ:
+            _bounded_int(environ, name, default=1, minimum=1, maximum=1)
 
     behind_proxy = _boolean(environ, "HUB_BEHIND_PROXY", default=True)
     if using_https and not behind_proxy:
@@ -134,8 +136,10 @@ def read_token(args: argparse.Namespace, environ: Mapping[str, str]) -> str:
     return token
 
 
-def check_health(base_url: str, *, timeout: float) -> dict[str, object]:
-    url = f"{base_url}/healthz"
+def check_health(
+    base_url: str, *, timeout: float, path: str = "/healthz"
+) -> dict[str, object]:
+    url = f"{base_url}{path}"
     request = urllib.request.Request(
         url,
         headers={"Accept": "application/json", "User-Agent": USER_AGENT},
@@ -325,7 +329,7 @@ def _decode_close(payload: bytes) -> tuple[int, str]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="check deployment settings, /healthz, WebSocket proxying and token"
+        description="check deployment settings, /healthz, /readyz, WebSocket proxying and token"
     )
     parser.add_argument("--url", required=True, help="public base URL, normally https://...")
     token = parser.add_mutually_exclusive_group()
@@ -387,6 +391,15 @@ def main(argv: list[str] | None = None) -> int:
     except CheckError as exc:
         failures += 1
         _report(f"[FAIL] health endpoint: {exc}", failure=True)
+
+    try:
+        readiness = check_health(base_url, timeout=args.timeout, path="/readyz")
+        if readiness.get("ready") is not True:
+            raise CheckError("readiness response does not contain ready=true")
+        _report("[PASS] readiness endpoint")
+    except CheckError as exc:
+        failures += 1
+        _report(f"[FAIL] readiness endpoint: {exc}", failure=True)
 
     try:
         check_websocket(base_url, token, timeout=args.timeout)

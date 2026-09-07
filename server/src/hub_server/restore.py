@@ -166,7 +166,7 @@ class RestoreController:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             return await finish_before_cancel(self._switch(state, candidate))
 
-    async def _disconnect(self) -> None:
+    async def _disconnect(self, state: AppState | None = None) -> None:
         sessions = list(self.sockets.items())
         # The close frame and synthetic disconnect wake each application task,
         # but TestClient (and a real peer that ignores the frame) may keep the
@@ -176,6 +176,8 @@ class RestoreController:
         for _, socket in sessions:
             try:
                 async with asyncio.timeout(1):
+                    if state is not None:
+                        state.db.metrics.note_gateway_close("maintenance", 1012)
                     await socket.close()
             except Exception:
                 log.debug("socket already closed during restore")
@@ -203,7 +205,7 @@ class RestoreController:
         try:
             state.gateway.retire_for_restore()
             await state.stop_background()
-            await self._disconnect()
+            await self._disconnect(state)
             try:
                 async with asyncio.timeout(state.settings.restore_drain_timeout):
                     await self.idle.wait()
@@ -350,6 +352,7 @@ class RestoreMiddleware:
             return
         if control.active:
             if kind == "websocket":
+                self.state.db.metrics.note_gateway_close("maintenance", 1013)
                 await send({"type": "websocket.close", "code": 1013})
             else:
                 await JSONResponse(

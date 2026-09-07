@@ -255,8 +255,7 @@ def run_benchmark(*, rows: int, repeat: int, seed: int) -> dict[str, Any]:
                 ),
                 "trend_30_days": explain(
                     db,
-                    "SELECT date(ts), sim_id, COUNT(*) FROM messages "
-                    "WHERE ts >= ? GROUP BY date(ts), sim_id",
+                    "SELECT ts, sim_id, direction FROM messages WHERE ts >= ?",
                     (since_30,),
                 ),
             }

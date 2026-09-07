@@ -1,0 +1,87 @@
+{
+  "environment": {
+    "machine": "x86_64",
+    "platform": "Linux-7.1.8-arch1-3-x86_64-with-glibc2.44",
+    "processor": "",
+    "python": "3.13.14",
+    "sqlite": "3.53.1"
+  },
+  "fixture": {
+    "anchor": "2030-01-01T12:00:00+00:00",
+    "build_seconds": 1.772,
+    "database_bytes": 38223872,
+    "possible_conversations": 6000,
+    "rows": 100000,
+    "seed": 780,
+    "sims": 12
+  },
+  "metrics": {
+    "conversation_list": {
+      "budget_ms": 300.0,
+      "max_ms": 38.252,
+      "median_ms": 30.689,
+      "min_ms": 29.734,
+      "passed": true
+    },
+    "conversation_thread": {
+      "budget_ms": 75.0,
+      "max_ms": 2.263,
+      "median_ms": 2.126,
+      "min_ms": 1.746,
+      "passed": true
+    },
+    "csv_export": {
+      "encoded_bytes": 12774063,
+      "max_ms": 1130.679,
+      "max_python_peak_mib": 32.0,
+      "median_ms": 1020.283,
+      "min_ms": 1020.249,
+      "min_rows_per_second": 15000.0,
+      "passed": true,
+      "python_peak_mib": 1.038,
+      "rows_per_second": 98012.0
+    },
+    "message_list": {
+      "budget_ms": 75.0,
+      "max_ms": 4.827,
+      "median_ms": 4.342,
+      "min_ms": 3.942,
+      "passed": true
+    },
+    "message_search": {
+      "budget_ms": 300.0,
+      "max_ms": 55.138,
+      "median_ms": 54.621,
+      "min_ms": 54.545,
+      "passed": true
+    },
+    "trend_30_days": {
+      "budget_ms": 150.0,
+      "max_ms": 20.746,
+      "median_ms": 20.363,
+      "min_ms": 20.344,
+      "passed": true
+    },
+    "trend_365_days": {
+      "budget_ms": 750.0,
+      "max_ms": 227.59,
+      "median_ms": 223.885,
+      "min_ms": 221.808,
+      "passed": true
+    }
+  },
+  "passed": true,
+  "query_plans": {
+    "conversation_summary": [
+      "SCAN messages USING COVERING INDEX idx_messages_conversation",
+      "USE TEMP B-TREE FOR ORDER BY"
+    ],
+    "conversation_thread": [
+      "SEARCH messages USING COVERING INDEX idx_messages_conversation (sim_id=? AND peer=?)"
+    ],
+    "trend_30_days": [
+      "SEARCH messages USING INDEX idx_messages_ts (ts>?)"
+    ]
+  },
+  "repeat": 3
+}

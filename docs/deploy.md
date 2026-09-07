@@ -176,6 +176,17 @@ server {
 curl --fail https://sms.example.com/healthz
 ```
 
+容器编排使用 `/readyz` 作为就绪检查。它会确认数据库可读、后台任务和通知投递器仍在运行，
+并在数据库恢复维护期间返回 503；没有 Agent 连接不会使 Server 变为未就绪：
+
+```bash
+curl --fail https://sms.example.com/readyz
+```
+
+Server 必须保持单 worker、单实例。`hub-server` 显式使用 `workers=1`；自定义启动方式也不能
+增加 Uvicorn worker 或复制多个实例共享同一数据库，因为 WebSocket 连接与命令路由归属当前进程。
+自检器会拒绝大于 1 的 `WEB_CONCURRENCY` 和 `UVICORN_WORKERS`。
+
 使用仓库自带的自检器验证完整入口。它读取 Token 后只在内存中使用，不会把
 Token 打印到输出，也不会创建临时 Agent 记录：
 
@@ -189,7 +200,7 @@ python3 deploy/self_check.py \
   --token-file "$token_file"
 ```
 
-检查器失败时会分别报告 `/healthz`、TLS/升级头和 Token 校验。局域网直连的
+检查器失败时会分别报告 `/healthz`、`/readyz`、TLS/升级头和 Token 校验。局域网直连的
 明文临时验收可以使用 `--allow-http`，不应将该选项用于公网部署。
 
 WebSocket 握手检查（把占位符替换为本机安全保存的 Token，不要把真实值提交到文件）：
@@ -479,7 +490,7 @@ SQLite（`[agent].db`）中，重连后补传，不会因重启丢失。
 
 按以下顺序验证：
 
-1. `https://sms.example.com/healthz` 返回成功；
+1. `https://sms.example.com/healthz` 和 `https://sms.example.com/readyz` 返回成功；
 2. Agent 日志出现 `link established`；
 3. Web 仪表盘显示模块在线，IMEI / ICCID 与本机设备一致；
 4. 向 SIM 发送测试短信，Web 会话中出现该消息；
@@ -504,7 +515,8 @@ SQLite（`[agent].db`）中，重连后补传，不会因重启丢失。
 - 检查证书链和 DNS；
 - 检查反向代理是否传递 WebSocket 升级头；
 - 检查 Token 是否一致；
-- 使用 `curl https://sms.example.com/healthz` 验证普通 HTTP 链路。
+- 使用 `curl https://sms.example.com/healthz` 验证普通 HTTP 链路；若容器被标记为 unhealthy，
+  再检查 `curl -i https://sms.example.com/readyz` 返回的 checks。
 
 ### WebSocket 返回 HTTP 200 / 404 / 502
 

@@ -15,25 +15,27 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import functools
 import hashlib
 import json
 import logging
 import os
 import secrets
 import sqlite3
-import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from datetime import time as datetime_time
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Literal
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from anyio import CancelScope
+
+from .metrics import MeasuredRLock, RuntimeMetrics
 
 log = logging.getLogger(__name__)
 
@@ -797,6 +799,7 @@ SCHEMA += OPERATION_SCHEMA
 class Database:
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
+        self.metrics = RuntimeMetrics()
         if str(self.path) != ":memory:":
             self.path.parent.mkdir(parents=True, exist_ok=True)
         # Whether this file already held a schema *before* we touched it.  Read
@@ -808,7 +811,7 @@ class Database:
             self.path, isolation_level=None, check_same_thread=False
         )
         self._db.row_factory = sqlite3.Row
-        self._lock = threading.RLock()
+        self._lock = MeasuredRLock(self.metrics)
         # Admit at most 64 operations, including the one running. Submit whole
         # transactions so a cancelled caller cannot leave half an event behind.
         self._async_slots = asyncio.Semaphore(64)
@@ -1451,10 +1454,16 @@ class Database:
         caller is cancelled, the worker is still awaited before propagating the
         cancellation, which keeps a committed event and its ACK in order.
         """
+        queued_at = time.perf_counter()
+
+        def call():
+            self.metrics.observe("db_queue_wait", time.perf_counter() - queued_at)
+            with self.metrics.measure("db_worker"):
+                return operation(*args, **kwargs)
+
         async with self._async_slots:
             with CancelScope(shield=True):
                 loop = asyncio.get_running_loop()
-                call = functools.partial(operation, *args, **kwargs)
                 future = loop.run_in_executor(self._async_writer, call)
                 cancelled = None
                 while not future.done():
@@ -1618,6 +1627,18 @@ class Database:
     @contextmanager
     def _readonly_connection(self) -> Iterator[sqlite3.Connection]:
         """Own a WAL reader for a query or stream, closing it on every exit."""
+        with self.metrics.measure("db_read_session"):
+            try:
+                with self._open_readonly_connection() as connection:
+                    yield connection
+            except sqlite3.Error as exc:
+                # In-memory reads share the measured writer lock.
+                if str(self.path) != ":memory:":
+                    self.metrics.note_sqlite_error(exc)
+                raise
+
+    @contextmanager
+    def _open_readonly_connection(self) -> Iterator[sqlite3.Connection]:
         if str(self.path) == ":memory:":
             with self._lock:
                 yield self._db
@@ -1669,7 +1690,9 @@ class Database:
         old one's.  An agent that reports no stream id keeps the empty value, so
         its numbering is compared only against its own history.
         """
-        with self._lock:
+        with self._lock, self.metrics.measure(
+            "event_transaction", failure_counter="events_failed",
+        ):
             self._db.execute("BEGIN IMMEDIATE")
             try:
                 cursor = self._db.execute(
@@ -1685,6 +1708,7 @@ class Database:
                         (seq, agent_id),
                     )
                     self._db.execute("COMMIT")
+                    self.metrics.increment("events_duplicate")
                     return False, None
 
                 result = apply()
@@ -1693,6 +1717,7 @@ class Database:
                     (seq, agent_id),
                 )
                 self._db.execute("COMMIT")
+                self.metrics.increment("events_committed")
                 return True, result
             except BaseException:
                 try:
@@ -2637,16 +2662,82 @@ class Database:
         )
         return int(row["n"]) if row else 0
 
-    def message_trend(self, *, since: str) -> list[dict[str, Any]]:
-        """Daily per-card counts since a normalized UTC timestamp."""
-        return self.read_query(
-            "SELECT date(ts) AS day, sim_id, "
+    def message_trend(
+        self,
+        *,
+        since: str,
+        until: str | None = None,
+        timezone: str = "UTC",
+    ) -> list[dict[str, Any]]:
+        """Daily per-card counts in the operator's calendar timezone.
+
+        SQLite stores normalized UTC timestamps.  Its date functions cannot
+        apply an arbitrary IANA timezone (and a fixed offset is wrong around
+        DST), so the local day is computed in Python once per day and each
+        day's UTC interval is aggregated in SQL.  Aggregation stays inside
+        SQLite (which releases the GIL) instead of a per-row Python loop, so
+        a trend query cannot starve other read workers.  ``until`` is
+        exclusive.
+        """
+        try:
+            local_zone = ZoneInfo(timezone)
+        except (ZoneInfoNotFoundError, ValueError):
+            local_zone = UTC
+
+        def parse(value: str) -> datetime:
+            parsed = datetime.fromisoformat(value)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            return parsed
+
+        start_utc, end_utc = parse(since), parse(until) if until else None
+        # Walk local days by date arithmetic; converting each day's midnight
+        # separately keeps 23/25-hour DST days at their true length.  Without
+        # an explicit end, walk only up to the newest stored message.
+        first_day = start_utc.astimezone(local_zone).date()
+        day_sql = (
+            "SELECT sim_id, "
             "       SUM(CASE WHEN direction = 'in' THEN 1 ELSE 0 END) AS received, "
             "       SUM(CASE WHEN direction = 'out' THEN 1 ELSE 0 END) AS sent "
-            "FROM messages WHERE ts >= ? "
-            "GROUP BY date(ts), sim_id ORDER BY day",
-            (since,),
+            "FROM messages WHERE ts >= ? AND ts < ? "
+            "GROUP BY sim_id"
         )
+        rows: list[dict[str, Any]] = []
+        day = first_day
+        with self._readonly_connection() as connection:
+            if end_utc is None:
+                newest = connection.execute("SELECT MAX(ts) FROM messages").fetchone()
+                end_utc = parse(newest[0]) if newest and newest[0] else start_utc
+            while end_utc > start_utc:
+                day_start = datetime.combine(day, datetime_time.min, tzinfo=local_zone)
+                day_end = datetime.combine(
+                    day + timedelta(days=1), datetime_time.min, tzinfo=local_zone
+                )
+                window_start = max(day_start, start_utc)
+                window_end = min(day_end, end_utc)
+                if window_start >= window_end:
+                    break
+                for group in connection.execute(day_sql, (
+                    window_start.astimezone(UTC).isoformat(timespec="seconds"),
+                    window_end.astimezone(UTC).isoformat(timespec="seconds"),
+                )):
+                    rows.append(
+                        {
+                            "day": day.isoformat(),
+                            "sim_id": group["sim_id"],
+                            "received": group["received"] or 0,
+                            "sent": group["sent"] or 0,
+                        }
+                    )
+                if day_end >= end_utc:
+                    break
+                day += timedelta(days=1)
+        rows.sort(
+            key=lambda row: (
+                row["day"], row["sim_id"] is not None, row["sim_id"] or 0
+            )
+        )
+        return rows
 
     # -- notification outbox -------------------------------------------------
 

@@ -504,7 +504,7 @@ def build_router(state: AppState) -> APIRouter:
             "SELECT d.*, s.iccid, s.label AS sim_label, s.phone_number "
             "FROM devices d LEFT JOIN sims s ON s.id = d.sim_id ORDER BY d.name"
         )
-        today = utcnow()[:10]
+        today_start, today_end = state.settings.calendar_day_bounds()
         return {
             "agents": db.query("SELECT * FROM agents"),
             "devices": devices,
@@ -514,14 +514,19 @@ def build_router(state: AppState) -> APIRouter:
                     "SELECT COUNT(*) AS n FROM messages"
                 )["n"],
                 "messages_today": db.read_one(
-                    "SELECT COUNT(*) AS n FROM messages WHERE ts >= ?",
-                    (today,),
+                    "SELECT COUNT(*) AS n FROM messages WHERE ts >= ? AND ts < ?",
+                    (today_start, today_end),
                 )["n"],
                 "devices_online": sum(1 for d in devices if d["online"]),
                 "devices_total": len(devices),
                 "tasks_enabled": db.one(
                     "SELECT COUNT(*) AS n FROM tasks WHERE enabled = 1"
                 )["n"],
+            },
+            "calendar": {
+                "timezone": state.settings.calendar_timezone_name,
+                "start": today_start,
+                "end": today_end,
             },
             "recent_messages": db.messages(limit=10),
         }
@@ -1174,12 +1179,18 @@ def build_router(state: AppState) -> APIRouter:
 
     @router.get("/stats/messages", dependencies=guard)
     def message_stats(
+        response: Response,
         days: int = Query(30, ge=1, le=365),
     ) -> list[dict[str, Any]]:
         """Daily per-card message counts for the dashboard trend chart."""
-        since_day = (datetime.now(UTC) - timedelta(days=days - 1)).date()
-        since = f"{since_day.isoformat()}T00:00:00+00:00"
-        rows = state.db.message_trend(since=since)
+        since, until = state.settings.calendar_range(days)
+        response.headers["X-Hub-Calendar-Timezone"] = state.settings.calendar_timezone_name
+        response.headers["X-Hub-Calendar-Start"] = since
+        response.headers["X-Hub-Calendar-End"] = until
+        response.headers["X-Hub-Calendar-Bucket"] = "local-day"
+        rows = state.db.message_trend(
+            since=since, until=until, timezone=state.settings.calendar_timezone_name
+        )
         sims = {s["id"]: s for s in state.db.query("SELECT * FROM sims")}
         for row in rows:
             sim = sims.get(row["sim_id"])
@@ -1409,7 +1420,8 @@ def build_router(state: AppState) -> APIRouter:
     # -- operations -------------------------------------------------------
 
     @router.get("/operations/diagnostics", dependencies=guard)
-    def diagnostics() -> dict[str, Any]:
+    def diagnostics(response: Response) -> dict[str, Any]:
+        response.headers["Cache-Control"] = "no-store"
         db_path = state.settings.db_path
         wal_path = db_path.with_name(db_path.name + "-wal")
         disk = shutil.disk_usage(state.settings.data_dir)
@@ -1452,6 +1464,7 @@ def build_router(state: AppState) -> APIRouter:
                 # says whether pushes are actually moving.
                 "notify_queue": state.db.notify_backlog(),
                 "offline_timers": state.alerter.pending_count,
+                "metrics": state.db.metrics.snapshot(),
             },
             "storage": {
                 "database_bytes": db_path.stat().st_size if db_path.exists() else 0,

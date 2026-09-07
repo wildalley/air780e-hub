@@ -17,6 +17,7 @@ import itertools
 import json
 import logging
 import secrets
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -297,21 +298,30 @@ class Gateway:
         and not on the id it asked for.
         """
         await websocket.accept()
+        close_recorded = False
+
+        async def close(code: int, reason: str, category: str) -> None:
+            """Close this session and record one server-side close reason."""
+            nonlocal close_recorded
+            if not close_recorded:
+                self.db.metrics.note_gateway_close(category, code)
+                close_recorded = True
+            await websocket.close(code=code, reason=reason)
 
         if self.maintenance:
-            await websocket.close(code=1013, reason="database restore in progress")
+            await close(1013, "database restore in progress", "maintenance")
             return
 
         if not await self.db.run(self.authenticate, websocket.headers.get("authorization")):
             log.warning("agent connection rejected: bad token")
-            await websocket.close(code=CLOSE_AUTH_FAILED, reason="bad token")
+            await close(CLOSE_AUTH_FAILED, "bad token", "auth_failed")
             return
 
         # Deployment checks need to verify the complete HTTP upgrade and the
         # bearer token without registering a fake agent in the database.
         if websocket.query_params.get("self_check") == "1":
             await websocket.send_text(json.dumps({"type": "self_check", "ok": True}))
-            await websocket.close(code=1000, reason="self-check complete")
+            await close(1000, "self-check complete", "self_check")
             return
 
         registered: AgentConnection | None = None
@@ -319,19 +329,17 @@ class Gateway:
             while True:
                 raw = await websocket.receive_text()
                 if len(raw) > MAX_FRAME_CHARS:
-                    await websocket.close(
-                        code=CLOSE_PROTOCOL_ERROR, reason="frame too large"
-                    )
+                    await close(CLOSE_PROTOCOL_ERROR, "frame too large", "protocol")
                     return
                 try:
                     frame = json.loads(raw)
                 except ValueError:
-                    await websocket.close(code=CLOSE_PROTOCOL_ERROR, reason="bad json")
+                    await close(CLOSE_PROTOCOL_ERROR, "bad json", "protocol")
                     return
                 if not isinstance(frame, dict) or not isinstance(
                     frame.get("type"), str
                 ):
-                    await websocket.close(code=CLOSE_PROTOCOL_ERROR, reason="no type")
+                    await close(CLOSE_PROTOCOL_ERROR, "no type", "protocol")
                     return
 
                 if frame["type"] == "hello":
@@ -343,26 +351,18 @@ class Gateway:
                             "agent %s sent a second hello; closing",
                             registered.agent_id,
                         )
-                        await websocket.close(
-                            code=CLOSE_PROTOCOL_ERROR, reason="hello already sent"
-                        )
+                        await close(CLOSE_PROTOCOL_ERROR, "hello already sent", "protocol")
                         return
                     candidate = str(frame.get("agent_id") or "").strip()
                     if not candidate or len(candidate) > MAX_ID_CHARS:
-                        await websocket.close(
-                            code=CLOSE_PROTOCOL_ERROR, reason="no agent_id"
-                        )
+                        await close(CLOSE_PROTOCOL_ERROR, "no agent_id", "protocol")
                         return
                     if candidate in self.connections:
                         log.warning("agent %s already connected; rejecting", candidate)
-                        await websocket.close(
-                            code=CLOSE_AGENT_CONFLICT, reason="already connected"
-                        )
+                        await close(CLOSE_AGENT_CONFLICT, "already connected", "agent_conflict")
                         return
                     if self.maintenance or self.retiring_for_restore:
-                        await websocket.close(
-                            code=1013, reason="database restore in progress"
-                        )
+                        await close(1013, "database restore in progress", "maintenance")
                         return
                     registered = await self._register(candidate, websocket, frame)
                     # Keep-alive tasks are the one piece of state the agent
@@ -374,16 +374,18 @@ class Gateway:
                     continue
 
                 if registered is None:
-                    await websocket.close(
-                        code=CLOSE_PROTOCOL_ERROR, reason="hello must come first"
-                    )
+                    await close(CLOSE_PROTOCOL_ERROR, "hello must come first", "protocol")
                     return
 
                 await self._ingest(registered, frame)
         except Exception as exc:
             # A disconnect surfaces as WebSocketDisconnect; anything else is
             # worth a look but must not take the server down.
-            if type(exc).__name__ != "WebSocketDisconnect" and not self.retiring_for_restore:
+            if type(exc).__name__ == "WebSocketDisconnect":
+                self.db.metrics.note_gateway_close(
+                    "peer_disconnect", getattr(exc, "code", None)
+                )
+            elif not self.retiring_for_restore:
                 log.exception(
                     "agent %s connection failed",
                     registered.agent_id if registered else "?",
@@ -391,10 +393,7 @@ class Gateway:
                 try:
                     # Stop this ordered stream before any higher cumulative
                     # ACK can overtake the event that just rolled back.
-                    await websocket.close(
-                        code=CLOSE_INTERNAL_ERROR,
-                        reason="event application failed",
-                    )
+                    await close(CLOSE_INTERNAL_ERROR, "event application failed", "internal_error")
                 except Exception:
                     pass
         finally:
@@ -620,6 +619,7 @@ class Gateway:
     async def _ingest(self, connection: AgentConnection, frame: dict[str, Any]) -> None:
         if self.retiring_for_restore or not connection.ready:
             return
+        started = time.perf_counter()
         agent_id = connection.agent_id
         kind = frame["type"]
         seq = frame.get("seq")
@@ -657,7 +657,12 @@ class Gateway:
         if self.retiring_for_restore or not connection.ready:
             return
         # Ack either way: a duplicate is still safely delivered.
-        await connection.send({"type": "ack", "seq": seq})
+        try:
+            await connection.send({"type": "ack", "seq": seq})
+        except Exception:
+            self.db.metrics.increment("ack_send_failed")
+            raise
+        self.db.metrics.observe("gateway_ack", time.perf_counter() - started)
 
     def _apply(
         self, agent_id: str, kind: str, frame: dict[str, Any], event_key: str = "",

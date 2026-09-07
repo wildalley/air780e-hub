@@ -7,11 +7,13 @@ import json
 import sqlite3
 import threading
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import httpx
 import pytest
 from anyio import CancelScope
 
+import hub_server.db as db_module
 from hub_server.alerts import OfflineAlerter
 from hub_server.config import Settings
 from hub_server.db import Database, MessageScope, utcnow
@@ -75,6 +77,9 @@ async def test_repeated_cancellation_waits_for_the_whole_transaction(db, outcome
         assert db.count_messages() == (outcome == "commit")
         assert db.one("SELECT COUNT(*) AS n FROM ingested")["n"] == (outcome == "commit")
         assert not db._db.in_transaction
+        counters = db.metrics.snapshot()["counters"]
+        assert counters["events_committed"] == (outcome == "commit")
+        assert counters["events_failed"] == (outcome == "rollback")
     finally:
         release.set()
         await asyncio.gather(task, return_exceptions=True)
@@ -130,6 +135,37 @@ async def test_backpressure_cancels_an_unsubmitted_operation(db):
         assert worker_id != threading.get_ident()
         assert await db.run(threading.get_ident) == worker_id
         assert db.count_messages() == 0
+    finally:
+        release.set()
+        await asyncio.gather(running, *([queued] if queued else []), return_exceptions=True)
+
+
+@pytest.mark.parametrize("slots", [1, 64])
+async def test_queue_wait_includes_admission_and_executor_wait(db, monkeypatch, slots):
+    db._async_slots = asyncio.Semaphore(slots)
+    clock = SimpleNamespace(now=10.0)
+    monkeypatch.setattr(db_module, "time", SimpleNamespace(perf_counter=lambda: clock.now))
+    started, release = threading.Event(), threading.Event()
+
+    def hold():
+        started.set()
+        assert release.wait(3)
+
+    running = asyncio.create_task(db.run(hold))
+    queued = None
+    try:
+        await wait_for(started)
+        clock.now = 11.0
+        queued = asyncio.create_task(db.run(lambda: "done"))
+        await asyncio.sleep(0)
+        assert db.metrics.snapshot()["timings"]["db_queue_wait"]["count"] == 1
+        clock.now = 13.0
+        release.set()
+        await running
+        assert await queued == "done"
+        wait = db.metrics.snapshot()["timings"]["db_queue_wait"]
+        assert wait["count"] == 2
+        assert wait["total_ms"] == 2000
     finally:
         release.set()
         await asyncio.gather(running, *([queued] if queued else []), return_exceptions=True)

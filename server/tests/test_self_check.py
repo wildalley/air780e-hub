@@ -65,6 +65,7 @@ def test_self_check_reaches_health_and_authenticated_websocket(
     assert self_check.main(["--url", url, "--allow-http"]) == 0
     output = capsys.readouterr()
     assert "[PASS] health endpoint" in output.out
+    assert "[PASS] readiness endpoint" in output.out
     assert "[PASS] WebSocket" in output.out
     assert "test-token" not in output.out + output.err
     assert app.state.hub.db.query("SELECT id FROM agents") == []
@@ -109,6 +110,7 @@ def test_self_check_lines_stay_in_order_when_piped(live_server, monkeypatch):
     ] == [
         "[PASS] deployment environment",
         "[PASS] health endpoint (agents_connected=0)",
+        "[PASS] readiness endpoint",
         "[FAIL] WebSocket: WebSocket closed with code 4001: bad token",
     ]
     assert "wrong-token" not in completed.stdout
@@ -117,6 +119,25 @@ def test_self_check_lines_stay_in_order_when_piped(live_server, monkeypatch):
 def test_self_check_requires_https_unless_explicitly_allowed():
     with pytest.raises(self_check.CheckError, match="plain HTTP"):
         self_check.normalize_base_url("http://example.com", allow_http=False)
+
+
+@pytest.mark.parametrize("name", ["WEB_CONCURRENCY", "UVICORN_WORKERS"])
+def test_self_check_rejects_multiple_server_workers(name):
+    with pytest.raises(self_check.CheckError, match=name):
+        self_check.validate_environment({name: "2"}, using_https=True)
+
+
+def test_self_check_reports_unready_server(live_server, monkeypatch, capsys):
+    url, app = live_server
+    monkeypatch.setenv("HUB_AGENT_TOKEN", "test-token")
+    app.state.hub.restore.active = True
+    try:
+        assert self_check.main(["--url", url, "--allow-http"]) == 1
+        output = capsys.readouterr()
+        assert "[PASS] health endpoint" in output.out
+        assert "[FAIL] readiness endpoint" in output.err
+    finally:
+        app.state.hub.restore.active = False
 
 
 def test_self_check_rejects_unsafe_environment_values():

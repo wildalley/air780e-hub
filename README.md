@@ -173,7 +173,7 @@ npm ci
 npm run build
 ```
 
-开发服务器会把 `/api`、`/ws` 和 `/healthz` 代理到 `127.0.0.1:8080`。
+开发服务器会把 `/api`、`/ws`、`/healthz` 和 `/readyz` 代理到 `127.0.0.1:8080`。
 
 ## 文档
 

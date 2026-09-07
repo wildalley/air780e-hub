@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 
 from .api import build_router
 from .config import Settings
+from .metrics import MetricsMiddleware, monitor_loop
 from .restore import RestoreMiddleware
 from .state import AppState
 
@@ -135,6 +136,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         state.background_factories = [
             lambda: _housekeeping(state), lambda: state.gateway.run_task_sync(),
             lambda: state.gateway.run_operations(),
+            lambda: monitor_loop(state.db.metrics),
         ]
         # Anything the last run left owed in the outbox goes out now: the queue
         # is what makes a push survive a restart, and nothing else drains it.
@@ -168,6 +170,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.add_middleware(AuditMiddleware, state=state)
     app.add_middleware(RestoreMiddleware, state=state)
+    app.add_middleware(MetricsMiddleware, metrics=state.db.metrics)
 
     router = build_router(state)
     app.include_router(router)
@@ -182,6 +185,48 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "ok": True,
             "agents_connected": len(state.gateway.connections),
         })
+
+    @app.get("/readyz")
+    def readyz() -> JSONResponse:
+        """Report whether this process can accept normal application work.
+
+        Liveness stays deliberately cheap at ``/healthz``.  Readiness also
+        verifies the database and the background workers that drain durable
+        jobs; an empty Agent registry is healthy because Agents reconnect
+        independently and are not required for the Server to serve the UI.
+        """
+        database = False
+        if not state.restore.active:
+            try:
+                database = state.db.read_one("SELECT COUNT(*) AS n FROM settings") is not None
+            except Exception:
+                log.exception("readiness database check failed")
+        expected = len(state.background_factories)
+        background = (
+            expected > 0
+            and len(state.background_tasks) == expected
+            and all(not task.done() for task in state.background_tasks)
+        )
+        checks = {
+            "database": database,
+            "background": background,
+            "notifier": state.notifier.running,
+            "maintenance": not state.restore.active,
+        }
+        ready = all(checks.values())
+        headers = {"Cache-Control": "no-store"}
+        if not ready:
+            headers["Retry-After"] = "2"
+        return JSONResponse(
+            {
+                "ok": ready,
+                "ready": ready,
+                "checks": checks,
+                "agents_connected": len(state.gateway.connections),
+            },
+            status_code=200 if ready else 503,
+            headers=headers,
+        )
 
     _mount_frontend(app)
     return app
@@ -214,7 +259,7 @@ def _mount_frontend(app: FastAPI) -> None:
     @app.get("/{path:path}", response_model=None)
     async def spa(path: str) -> FileResponse | JSONResponse:
         # Never let the catch-all shadow the API or the socket.
-        if path.startswith(("api/", "ws", "healthz")):
+        if path.startswith(("api/", "ws", "healthz", "readyz")):
             return JSONResponse({"detail": "not found"}, status_code=404)
         candidate = (FRONTEND_DIR / path).resolve()
         if path and candidate.is_file() and candidate.is_relative_to(FRONTEND_DIR):

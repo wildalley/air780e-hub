@@ -291,3 +291,62 @@ Webhook/URL 等凭据，返回 `secret_fields` 元数据。更新渠道时省略
 
 验证：Server 全量 306 项通过（保留 1 条既有 Starlette TestClient 弃用警告），前端 17 个
 测试文件 164 项通过，Ruff 通过。该边界仍未替代真实代理、跨来源请求和生产密钥轮换演练。
+
+### 2026-09-06：B12 readiness 与业务日历时间口径
+
+B12 本轮完成了就绪检查和时间口径：新增公开 `/readyz`，逐项检查数据库、后台任务、通知投递器
+和恢复维护状态，Docker 健康检查改用该入口；没有 Agent 连接不会被误报为未就绪。overview 的
+“今日短信”和趋势接口统一使用 `HUB_TZ` 的本地日 UTC 边界，趋势按 IANA 时区分桶并返回
+`X-Hub-Calendar-*` 元数据；前端趋势按服务端窗口补零和标注时区。
+
+CLI 显式保持单 worker，部署自检增加 readiness 检查并拒绝多 worker 环境配置。
+
+验证：Server 全量 323 项通过（1 条既有 TestClient 弃用警告），前端 18 个测试文件 167 项通过，
+Ruff、lint、类型检查和生产构建通过。100k 基准全部通过，30/365 天趋势中位数为
+20.563/224.928 ms，CSV 约 87,377 行/秒、Python 堆峰值 1.037 MiB；[原始 JSON](benchmarks/2026-09-06-calendar.json)
+记录机器信息和查询计划。IANA 分桶增加了 Python CPU 成本，不能把本轮描述为纯性能提升。
+
+Chromium 在 1440、375、320 px 下验证服务端日期、7/30 天切换、时区文字与页面无水平溢出；
+浏览器使用另一时区并固定到 2030 年，趋势仍采用服务端窗口。临时预览的部署自检全部通过，
+未连接真实 Agent 或发送外部通知。schema 和协议版本不变，尚未部署；指标采集与生产代理演练待后续推进。
+
+### 2026-09-07：B12 第一批运行指标与趋势 GIL 回归修复
+
+B12 指标采集第一版：管理员接口 `/api/operations/diagnostics` 的 `runtime.metrics` 暴露
+进程内指标（响应 `Cache-Control: no-store`），包括 HTTP 路由模板级耗时、loop lag、数据库
+队列/执行器/共享锁、只读会话、事件事务与网关 ACK 计时，以及事件提交/重复/失败、ACK
+发送失败和 SQLite BUSY/LOCKED 计数。每项分位数仅用最近 256 个样本，HTTP 标签最多 256
+组，超限进入 `http_overflow`；不记录路径参数、查询串、SQL、正文、凭据或异常文本。
+指标跨在线恢复保留，采样任务随维护暂停与恢复重启。字段边界见
+[性能文档](performance.md#运行指标口径2026-09-06)。
+
+同轮发现并修复 IANA 趋势分桶引入的读路径回归：逐行 Python `astimezone` 分桶在 4 个并发
+读者下把全量 CSV 从约 1.4 秒拖到约 14 秒（GIL 车队效应；SQL 聚合在 SQLite C 代码中
+执行并释放 GIL）。`message_trend` 改为按本地日边界的 UTC 区间逐天 SQL `GROUP BY`，
+每天只做一次时区转换，聚合留在 SQLite 中；DST 23/25 小时日由逐日独立转换保留。无
+`until` 时按 `MAX(ts)` 限制遍历，空表不遍历。隔离复现：CSV 单独 981 ms，与 4 个新式
+trend 并发时旧实现为 7,671 ms。
+
+验证：Server 全量 339 项通过（1 条既有 Starlette TestClient 弃用警告），Ruff 通过；
+`benchmarks/messages.py --repeat 3 --json --enforce` 全部通过（列表＋总数 4.342 ms、
+搜索 54.621 ms、单会话 2.126 ms、会话聚合 30.689 ms、30/365 天趋势 20.363/223.885 ms，
+CSV 约 98,012 行/秒、Python 堆峰值 1.038 MiB）。并发基准导出 `runtime_metrics` 并逐轮
+校验 ACK、提交计数与指标样本一致；修复后组合负载下 CSV 回到约 1.4 秒量级。
+[原始 JSON](benchmarks/2026-09-06-metrics-messages.json)、
+[并发 JSON](benchmarks/2026-09-06-metrics-concurrency.json)。尚未部署；逐 SQL 计时、
+网关关闭原因分布、渠道投递耗时等仍按后端方案规划推进。
+
+### 2026-09-07：B12 第二批通知与网关关闭指标
+
+接续第一批运行指标，新增 provider 调用级 `notify_send` 耗时和通知尝试/成功/失败/取消/重试
+计数；耗时边界不包含 DB 或队列等待。网关对 Server 发起和对端触发的 Agent WebSocket 关闭按
+固定类别与规范化 code 聚合，最多 32 组且不保存 close reason、Agent ID 或任意对端文本。
+认证失败、维护、自检、协议错误、重复 Agent、内部错误和对端断开均可从 diagnostics 区分。
+schema、协议和通知队列语义不变。
+
+验证：Server 全量 `341 passed`（48.86 秒，保留 1 条既有 Starlette TestClient 弃用警告），
+`.venv/bin/ruff check src tests benchmarks`、`git diff --check` 通过；指标、通知和实际 WebSocket
+相关回归覆盖在全量测试中，通知重试 3 次调用准确得到 2 次失败、1 次成功和 2 次重试计数。
+修复了上一轮时间模块别名冲突（`datetime.time` 覆盖 `time.perf_counter`）。前端验证为 18 个
+测试文件、167 项通过，lint 和生产构建通过。尚未部署、未调用真实通知服务商或进行生产 WSS
+演练。仍待逐 SQL 计时、Agent 本地积压上报、作业阶段指标、request_id 日志关联和外部指标存储。

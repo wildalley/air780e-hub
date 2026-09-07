@@ -1,0 +1,881 @@
+{
+  "environment": {
+    "python": "3.13.14",
+    "sqlite": "3.53.1",
+    "platform": "Linux-7.1.8-arch1-3-x86_64-with-glibc2.44",
+    "cpu_count": 16
+  },
+  "workload": {
+    "rows": 100000,
+    "readers": 4,
+    "iterations": 8,
+    "events": 200,
+    "repeat": 3
+  },
+  "runs": [
+    {
+      "mode": "shared_sync_reference",
+      "elapsed_seconds": 14.788,
+      "ack": {
+        "count": 200,
+        "p50_ms": 1.589,
+        "p95_ms": 2.952,
+        "max_ms": 78.001
+      },
+      "loop_lag": {
+        "count": 1393,
+        "p50_ms": 0.25,
+        "p95_ms": 1.56,
+        "max_ms": 70.382
+      },
+      "query": {
+        "count": 32,
+        "p50_ms": 68.103,
+        "p95_ms": 7443.507,
+        "max_ms": 7539.873
+      },
+      "shared_lock_wait": {
+        "count": 234,
+        "p50_ms": 0.009,
+        "p95_ms": 0.036,
+        "max_ms": 77.113
+      },
+      "shared_lock_hold": {
+        "count": 234,
+        "p50_ms": 1.544,
+        "p95_ms": 26.42,
+        "max_ms": 91.151
+      },
+      "csv": {
+        "count": 1,
+        "p50_ms": 14769.561,
+        "p95_ms": 14769.561,
+        "max_ms": 14769.561,
+        "rows": 100000
+      },
+      "purge": {
+        "count": 1,
+        "p50_ms": 1.354,
+        "p95_ms": 1.354,
+        "max_ms": 1.354
+      },
+      "runtime_metrics": {
+        "scope": "process",
+        "sample_limit": 256,
+        "percentiles": "latest_samples_nearest_rank",
+        "http_series_limit": 256,
+        "counters": {
+          "db_busy": 0,
+          "events_committed": 200,
+          "events_duplicate": 0,
+          "events_failed": 0,
+          "ack_send_failed": 0
+        },
+        "timings": {
+          "loop_lag": {
+            "count": 0,
+            "sample_count": 0,
+            "total_ms": 0.0,
+            "max_ms": null,
+            "p50_ms": null,
+            "p95_ms": null,
+            "p99_ms": null
+          },
+          "db_queue_wait": {
+            "count": 0,
+            "sample_count": 0,
+            "total_ms": 0.0,
+            "max_ms": null,
+            "p50_ms": null,
+            "p95_ms": null,
+            "p99_ms": null
+          },
+          "db_worker": {
+            "count": 0,
+            "sample_count": 0,
+            "total_ms": 0.0,
+            "max_ms": null,
+            "p50_ms": null,
+            "p95_ms": null,
+            "p99_ms": null
+          },
+          "db_lock_wait": {
+            "count": 1437,
+            "sample_count": 256,
+            "total_ms": 483.05,
+            "max_ms": 77.107,
+            "p50_ms": 0.004,
+            "p95_ms": 0.017,
+            "p99_ms": 72.109
+          },
+          "db_lock_hold": {
+            "count": 1437,
+            "sample_count": 256,
+            "total_ms": 1205.016,
+            "max_ms": 91.171,
+            "p50_ms": 1.481,
+            "p95_ms": 26.049,
+            "p99_ms": 76.938
+          },
+          "db_read_session": {
+            "count": 9,
+            "sample_count": 9,
+            "total_ms": 72055.241,
+            "max_ms": 14769.116,
+            "p50_ms": 7204.454,
+            "p95_ms": 14769.116,
+            "p99_ms": 14769.116
+          },
+          "event_transaction": {
+            "count": 200,
+            "sample_count": 200,
+            "total_ms": 314.327,
+            "max_ms": 8.509,
+            "p50_ms": 1.452,
+            "p95_ms": 2.568,
+            "p99_ms": 3.674
+          },
+          "gateway_ack": {
+            "count": 200,
+            "sample_count": 200,
+            "total_ms": 564.245,
+            "max_ms": 77.981,
+            "p50_ms": 1.575,
+            "p95_ms": 2.931,
+            "p99_ms": 71.645
+          }
+        },
+        "http": [],
+        "http_overflow": {
+          "count": 0,
+          "sample_count": 0,
+          "total_ms": 0.0,
+          "max_ms": null,
+          "p50_ms": null,
+          "p95_ms": null,
+          "p99_ms": null
+        }
+      }
+    },
+    {
+      "mode": "wal_readers_async_writer",
+      "elapsed_seconds": 15.016,
+      "ack": {
+        "count": 200,
+        "p50_ms": 1.9,
+        "p95_ms": 3.238,
+        "max_ms": 7.04
+      },
+      "loop_lag": {
+        "count": 1436,
+        "p50_ms": 0.254,
+        "p95_ms": 1.284,
+        "max_ms": 6.623
+      },
+      "query": {
+        "count": 32,
+        "p50_ms": 33.998,
+        "p95_ms": 7431.558,
+        "max_ms": 7496.754
+      },
+      "shared_lock_wait": {
+        "count": 204,
+        "p50_ms": 0.008,
+        "p95_ms": 0.016,
+        "max_ms": 0.026
+      },
+      "shared_lock_hold": {
+        "count": 204,
+        "p50_ms": 1.389,
+        "p95_ms": 2.448,
+        "max_ms": 6.321
+      },
+      "csv": {
+        "count": 1,
+        "p50_ms": 15015.419,
+        "p95_ms": 15015.419,
+        "max_ms": 15015.419,
+        "rows": 100000
+      },
+      "purge": {
+        "count": 1,
+        "p50_ms": 6.627,
+        "p95_ms": 6.627,
+        "max_ms": 6.627
+      },
+      "runtime_metrics": {
+        "scope": "process",
+        "sample_limit": 256,
+        "percentiles": "latest_samples_nearest_rank",
+        "http_series_limit": 256,
+        "counters": {
+          "db_busy": 0,
+          "events_committed": 200,
+          "events_duplicate": 0,
+          "events_failed": 0,
+          "ack_send_failed": 0
+        },
+        "timings": {
+          "loop_lag": {
+            "count": 0,
+            "sample_count": 0,
+            "total_ms": 0.0,
+            "max_ms": null,
+            "p50_ms": null,
+            "p95_ms": null,
+            "p99_ms": null
+          },
+          "db_queue_wait": {
+            "count": 205,
+            "sample_count": 205,
+            "total_ms": 47.989,
+            "max_ms": 1.305,
+            "p50_ms": 0.179,
+            "p95_ms": 0.517,
+            "p99_ms": 1.009
+          },
+          "db_worker": {
+            "count": 205,
+            "sample_count": 205,
+            "total_ms": 302.346,
+            "max_ms": 6.342,
+            "p50_ms": 1.408,
+            "p95_ms": 2.47,
+            "p99_ms": 3.441
+          },
+          "db_lock_wait": {
+            "count": 1407,
+            "sample_count": 256,
+            "total_ms": 4.013,
+            "max_ms": 0.022,
+            "p50_ms": 0.003,
+            "p95_ms": 0.006,
+            "p99_ms": 0.009
+          },
+          "db_lock_hold": {
+            "count": 1407,
+            "sample_count": 256,
+            "total_ms": 328.845,
+            "max_ms": 6.327,
+            "p50_ms": 1.227,
+            "p95_ms": 2.295,
+            "p99_ms": 3.409
+          },
+          "db_read_session": {
+            "count": 41,
+            "sample_count": 41,
+            "total_ms": 74577.216,
+            "max_ms": 15014.833,
+            "p50_ms": 32.209,
+            "p95_ms": 7427.922,
+            "p99_ms": 15014.833
+          },
+          "event_transaction": {
+            "count": 200,
+            "sample_count": 200,
+            "total_ms": 290.978,
+            "max_ms": 6.308,
+            "p50_ms": 1.379,
+            "p95_ms": 2.436,
+            "p99_ms": 3.369
+          },
+          "gateway_ack": {
+            "count": 200,
+            "sample_count": 200,
+            "total_ms": 404.785,
+            "max_ms": 7.025,
+            "p50_ms": 1.887,
+            "p95_ms": 3.206,
+            "p99_ms": 5.879
+          }
+        },
+        "http": [],
+        "http_overflow": {
+          "count": 0,
+          "sample_count": 0,
+          "total_ms": 0.0,
+          "max_ms": null,
+          "p50_ms": null,
+          "p95_ms": null,
+          "p99_ms": null
+        }
+      }
+    },
+    {
+      "mode": "wal_readers_async_writer",
+      "elapsed_seconds": 15.068,
+      "ack": {
+        "count": 200,
+        "p50_ms": 1.881,
+        "p95_ms": 3.053,
+        "max_ms": 11.172
+      },
+      "loop_lag": {
+        "count": 1439,
+        "p50_ms": 0.259,
+        "p95_ms": 1.294,
+        "max_ms": 7.048
+      },
+      "query": {
+        "count": 32,
+        "p50_ms": 33.774,
+        "p95_ms": 7565.189,
+        "max_ms": 7565.721
+      },
+      "shared_lock_wait": {
+        "count": 204,
+        "p50_ms": 0.008,
+        "p95_ms": 0.012,
+        "max_ms": 0.025
+      },
+      "shared_lock_hold": {
+        "count": 204,
+        "p50_ms": 1.31,
+        "p95_ms": 2.463,
+        "max_ms": 10.851
+      },
+      "csv": {
+        "count": 1,
+        "p50_ms": 15067.207,
+        "p95_ms": 15067.207,
+        "max_ms": 15067.207,
+        "rows": 100000
+      },
+      "purge": {
+        "count": 1,
+        "p50_ms": 6.405,
+        "p95_ms": 6.405,
+        "max_ms": 6.405
+      },
+      "runtime_metrics": {
+        "scope": "process",
+        "sample_limit": 256,
+        "percentiles": "latest_samples_nearest_rank",
+        "http_series_limit": 256,
+        "counters": {
+          "db_busy": 0,
+          "events_committed": 200,
+          "events_duplicate": 0,
+          "events_failed": 0,
+          "ack_send_failed": 0
+        },
+        "timings": {
+          "loop_lag": {
+            "count": 0,
+            "sample_count": 0,
+            "total_ms": 0.0,
+            "max_ms": null,
+            "p50_ms": null,
+            "p95_ms": null,
+            "p99_ms": null
+          },
+          "db_queue_wait": {
+            "count": 205,
+            "sample_count": 205,
+            "total_ms": 43.06,
+            "max_ms": 1.491,
+            "p50_ms": 0.168,
+            "p95_ms": 0.455,
+            "p99_ms": 0.993
+          },
+          "db_worker": {
+            "count": 205,
+            "sample_count": 205,
+            "total_ms": 312.265,
+            "max_ms": 10.874,
+            "p50_ms": 1.335,
+            "p95_ms": 2.482,
+            "p99_ms": 6.161
+          },
+          "db_lock_wait": {
+            "count": 1407,
+            "sample_count": 256,
+            "total_ms": 3.998,
+            "max_ms": 0.016,
+            "p50_ms": 0.003,
+            "p95_ms": 0.005,
+            "p99_ms": 0.009
+          },
+          "db_lock_hold": {
+            "count": 1407,
+            "sample_count": 256,
+            "total_ms": 339.018,
+            "max_ms": 10.857,
+            "p50_ms": 1.144,
+            "p95_ms": 2.398,
+            "p99_ms": 6.145
+          },
+          "db_read_session": {
+            "count": 41,
+            "sample_count": 41,
+            "total_ms": 74809.794,
+            "max_ms": 15066.723,
+            "p50_ms": 31.088,
+            "p95_ms": 7559.303,
+            "p99_ms": 15066.723
+          },
+          "event_transaction": {
+            "count": 200,
+            "sample_count": 200,
+            "total_ms": 301.136,
+            "max_ms": 10.836,
+            "p50_ms": 1.298,
+            "p95_ms": 2.454,
+            "p99_ms": 6.129
+          },
+          "gateway_ack": {
+            "count": 200,
+            "sample_count": 200,
+            "total_ms": 401.183,
+            "max_ms": 11.156,
+            "p50_ms": 1.869,
+            "p95_ms": 3.04,
+            "p99_ms": 7.011
+          }
+        },
+        "http": [],
+        "http_overflow": {
+          "count": 0,
+          "sample_count": 0,
+          "total_ms": 0.0,
+          "max_ms": null,
+          "p50_ms": null,
+          "p95_ms": null,
+          "p99_ms": null
+        }
+      }
+    },
+    {
+      "mode": "shared_sync_reference",
+      "elapsed_seconds": 14.87,
+      "ack": {
+        "count": 200,
+        "p50_ms": 1.698,
+        "p95_ms": 3.582,
+        "max_ms": 85.655
+      },
+      "loop_lag": {
+        "count": 1391,
+        "p50_ms": 0.271,
+        "p95_ms": 2.251,
+        "max_ms": 82.95
+      },
+      "query": {
+        "count": 32,
+        "p50_ms": 66.953,
+        "p95_ms": 7529.103,
+        "max_ms": 7618.878
+      },
+      "shared_lock_wait": {
+        "count": 234,
+        "p50_ms": 0.009,
+        "p95_ms": 6.248,
+        "max_ms": 84.958
+      },
+      "shared_lock_hold": {
+        "count": 234,
+        "p50_ms": 1.648,
+        "p95_ms": 25.233,
+        "max_ms": 84.656
+      },
+      "csv": {
+        "count": 1,
+        "p50_ms": 14858.641,
+        "p95_ms": 14858.641,
+        "max_ms": 14858.641,
+        "rows": 100000
+      },
+      "purge": {
+        "count": 1,
+        "p50_ms": 1.13,
+        "p95_ms": 1.13,
+        "max_ms": 1.13
+      },
+      "runtime_metrics": {
+        "scope": "process",
+        "sample_limit": 256,
+        "percentiles": "latest_samples_nearest_rank",
+        "http_series_limit": 256,
+        "counters": {
+          "db_busy": 0,
+          "events_committed": 200,
+          "events_duplicate": 0,
+          "events_failed": 0,
+          "ack_send_failed": 0
+        },
+        "timings": {
+          "loop_lag": {
+            "count": 0,
+            "sample_count": 0,
+            "total_ms": 0.0,
+            "max_ms": null,
+            "p50_ms": null,
+            "p95_ms": null,
+            "p99_ms": null
+          },
+          "db_queue_wait": {
+            "count": 0,
+            "sample_count": 0,
+            "total_ms": 0.0,
+            "max_ms": null,
+            "p50_ms": null,
+            "p95_ms": null,
+            "p99_ms": null
+          },
+          "db_worker": {
+            "count": 0,
+            "sample_count": 0,
+            "total_ms": 0.0,
+            "max_ms": null,
+            "p50_ms": null,
+            "p95_ms": null,
+            "p99_ms": null
+          },
+          "db_lock_wait": {
+            "count": 1437,
+            "sample_count": 256,
+            "total_ms": 603.795,
+            "max_ms": 84.951,
+            "p50_ms": 0.004,
+            "p95_ms": 5.805,
+            "p99_ms": 78.09
+          },
+          "db_lock_hold": {
+            "count": 1437,
+            "sample_count": 256,
+            "total_ms": 1184.001,
+            "max_ms": 84.671,
+            "p50_ms": 1.58,
+            "p95_ms": 25.176,
+            "p99_ms": 68.252
+          },
+          "db_read_session": {
+            "count": 9,
+            "sample_count": 9,
+            "total_ms": 72391.115,
+            "max_ms": 14858.258,
+            "p50_ms": 7104.626,
+            "p95_ms": 14858.258,
+            "p99_ms": 14858.258
+          },
+          "event_transaction": {
+            "count": 200,
+            "sample_count": 200,
+            "total_ms": 338.937,
+            "max_ms": 7.359,
+            "p50_ms": 1.547,
+            "p95_ms": 2.798,
+            "p99_ms": 7.217
+          },
+          "gateway_ack": {
+            "count": 200,
+            "sample_count": 200,
+            "total_ms": 591.788,
+            "max_ms": 85.636,
+            "p50_ms": 1.684,
+            "p95_ms": 3.567,
+            "p99_ms": 63.008
+          }
+        },
+        "http": [],
+        "http_overflow": {
+          "count": 0,
+          "sample_count": 0,
+          "total_ms": 0.0,
+          "max_ms": null,
+          "p50_ms": null,
+          "p95_ms": null,
+          "p99_ms": null
+        }
+      }
+    },
+    {
+      "mode": "shared_sync_reference",
+      "elapsed_seconds": 14.645,
+      "ack": {
+        "count": 200,
+        "p50_ms": 1.511,
+        "p95_ms": 2.609,
+        "max_ms": 76.641
+      },
+      "loop_lag": {
+        "count": 1378,
+        "p50_ms": 0.251,
+        "p95_ms": 1.731,
+        "max_ms": 73.491
+      },
+      "query": {
+        "count": 32,
+        "p50_ms": 66.926,
+        "p95_ms": 7225.932,
+        "max_ms": 7330.516
+      },
+      "shared_lock_wait": {
+        "count": 234,
+        "p50_ms": 0.009,
+        "p95_ms": 0.025,
+        "max_ms": 75.72
+      },
+      "shared_lock_hold": {
+        "count": 234,
+        "p50_ms": 1.461,
+        "p95_ms": 24.224,
+        "max_ms": 93.66
+      },
+      "csv": {
+        "count": 1,
+        "p50_ms": 14637.972,
+        "p95_ms": 14637.972,
+        "max_ms": 14637.972,
+        "rows": 100000
+      },
+      "purge": {
+        "count": 1,
+        "p50_ms": 1.32,
+        "p95_ms": 1.32,
+        "max_ms": 1.32
+      },
+      "runtime_metrics": {
+        "scope": "process",
+        "sample_limit": 256,
+        "percentiles": "latest_samples_nearest_rank",
+        "http_series_limit": 256,
+        "counters": {
+          "db_busy": 0,
+          "events_committed": 200,
+          "events_duplicate": 0,
+          "events_failed": 0,
+          "ack_send_failed": 0
+        },
+        "timings": {
+          "loop_lag": {
+            "count": 0,
+            "sample_count": 0,
+            "total_ms": 0.0,
+            "max_ms": null,
+            "p50_ms": null,
+            "p95_ms": null,
+            "p99_ms": null
+          },
+          "db_queue_wait": {
+            "count": 0,
+            "sample_count": 0,
+            "total_ms": 0.0,
+            "max_ms": null,
+            "p50_ms": null,
+            "p95_ms": null,
+            "p99_ms": null
+          },
+          "db_worker": {
+            "count": 0,
+            "sample_count": 0,
+            "total_ms": 0.0,
+            "max_ms": null,
+            "p50_ms": null,
+            "p95_ms": null,
+            "p99_ms": null
+          },
+          "db_lock_wait": {
+            "count": 1437,
+            "sample_count": 256,
+            "total_ms": 376.881,
+            "max_ms": 75.712,
+            "p50_ms": 0.004,
+            "p95_ms": 0.013,
+            "p99_ms": 64.843
+          },
+          "db_lock_hold": {
+            "count": 1437,
+            "sample_count": 256,
+            "total_ms": 1149.935,
+            "max_ms": 93.68,
+            "p50_ms": 1.401,
+            "p95_ms": 24.189,
+            "p99_ms": 71.964
+          },
+          "db_read_session": {
+            "count": 9,
+            "sample_count": 9,
+            "total_ms": 71578.532,
+            "max_ms": 14637.508,
+            "p50_ms": 7198.38,
+            "p95_ms": 14637.508,
+            "p99_ms": 14637.508
+          },
+          "event_transaction": {
+            "count": 200,
+            "sample_count": 200,
+            "total_ms": 305.192,
+            "max_ms": 6.543,
+            "p50_ms": 1.363,
+            "p95_ms": 2.343,
+            "p99_ms": 5.57
+          },
+          "gateway_ack": {
+            "count": 200,
+            "sample_count": 200,
+            "total_ms": 538.72,
+            "max_ms": 76.626,
+            "p50_ms": 1.488,
+            "p95_ms": 2.582,
+            "p99_ms": 66.247
+          }
+        },
+        "http": [],
+        "http_overflow": {
+          "count": 0,
+          "sample_count": 0,
+          "total_ms": 0.0,
+          "max_ms": null,
+          "p50_ms": null,
+          "p95_ms": null,
+          "p99_ms": null
+        }
+      }
+    },
+    {
+      "mode": "wal_readers_async_writer",
+      "elapsed_seconds": 14.934,
+      "ack": {
+        "count": 200,
+        "p50_ms": 1.844,
+        "p95_ms": 3.129,
+        "max_ms": 7.049
+      },
+      "loop_lag": {
+        "count": 1430,
+        "p50_ms": 0.252,
+        "p95_ms": 1.33,
+        "max_ms": 7.914
+      },
+      "query": {
+        "count": 32,
+        "p50_ms": 36.702,
+        "p95_ms": 7398.735,
+        "max_ms": 7465.575
+      },
+      "shared_lock_wait": {
+        "count": 204,
+        "p50_ms": 0.008,
+        "p95_ms": 0.012,
+        "max_ms": 0.028
+      },
+      "shared_lock_hold": {
+        "count": 204,
+        "p50_ms": 1.345,
+        "p95_ms": 2.346,
+        "max_ms": 5.689
+      },
+      "csv": {
+        "count": 1,
+        "p50_ms": 14933.201,
+        "p95_ms": 14933.201,
+        "max_ms": 14933.201,
+        "rows": 100000
+      },
+      "purge": {
+        "count": 1,
+        "p50_ms": 8.743,
+        "p95_ms": 8.743,
+        "max_ms": 8.743
+      },
+      "runtime_metrics": {
+        "scope": "process",
+        "sample_limit": 256,
+        "percentiles": "latest_samples_nearest_rank",
+        "http_series_limit": 256,
+        "counters": {
+          "db_busy": 0,
+          "events_committed": 200,
+          "events_duplicate": 0,
+          "events_failed": 0,
+          "ack_send_failed": 0
+        },
+        "timings": {
+          "loop_lag": {
+            "count": 0,
+            "sample_count": 0,
+            "total_ms": 0.0,
+            "max_ms": null,
+            "p50_ms": null,
+            "p95_ms": null,
+            "p99_ms": null
+          },
+          "db_queue_wait": {
+            "count": 205,
+            "sample_count": 205,
+            "total_ms": 50.032,
+            "max_ms": 4.389,
+            "p50_ms": 0.18,
+            "p95_ms": 0.516,
+            "p99_ms": 0.823
+          },
+          "db_worker": {
+            "count": 205,
+            "sample_count": 205,
+            "total_ms": 296.747,
+            "max_ms": 6.473,
+            "p50_ms": 1.364,
+            "p95_ms": 2.365,
+            "p99_ms": 5.674
+          },
+          "db_lock_wait": {
+            "count": 1407,
+            "sample_count": 256,
+            "total_ms": 3.975,
+            "max_ms": 0.025,
+            "p50_ms": 0.003,
+            "p95_ms": 0.006,
+            "p99_ms": 0.009
+          },
+          "db_lock_hold": {
+            "count": 1407,
+            "sample_count": 256,
+            "total_ms": 322.966,
+            "max_ms": 5.695,
+            "p50_ms": 1.189,
+            "p95_ms": 2.249,
+            "p99_ms": 5.355
+          },
+          "db_read_session": {
+            "count": 41,
+            "sample_count": 41,
+            "total_ms": 74097.739,
+            "max_ms": 14932.681,
+            "p50_ms": 31.35,
+            "p95_ms": 7388.495,
+            "p99_ms": 14932.681
+          },
+          "event_transaction": {
+            "count": 200,
+            "sample_count": 200,
+            "total_ms": 284.426,
+            "max_ms": 5.667,
+            "p50_ms": 1.333,
+            "p95_ms": 2.335,
+            "p99_ms": 5.334
+          },
+          "gateway_ack": {
+            "count": 200,
+            "sample_count": 200,
+            "total_ms": 395.063,
+            "max_ms": 7.035,
+            "p50_ms": 1.831,
+            "p95_ms": 3.116,
+            "p99_ms": 5.959
+          }
+        },
+        "http": [],
+        "http_overflow": {
+          "count": 0,
+          "sample_count": 0,
+          "total_ms": 0.0,
+          "max_ms": null,
+          "p50_ms": null,
+          "p95_ms": null,
+          "p99_ms": null
+        }
+      }
+    }
+  ]
+}

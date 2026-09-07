@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import secrets
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -108,11 +108,56 @@ class Settings:
 
     def calendar_today(self) -> date:
         """Current calendar date in the operator-configured timezone."""
+        return self._calendar_now().date()
+
+    def _calendar_timezone(self) -> tzinfo:
         try:
-            timezone = ZoneInfo(self.timezone)
+            return ZoneInfo(self.timezone)
         except (ZoneInfoNotFoundError, ValueError):
-            timezone = UTC
-        return datetime.now(timezone).date()
+            return UTC
+
+    @property
+    def calendar_timezone_name(self) -> str:
+        """The effective IANA name used for calendar calculations."""
+        zone = self._calendar_timezone()
+        return getattr(zone, "key", "UTC")
+
+    def _calendar_now(self) -> datetime:
+        return datetime.now(self._calendar_timezone())
+
+    def calendar_range(
+        self, days: int, now: datetime | None = None
+    ) -> tuple[str, str]:
+        """Return ``days`` local calendar dates ending today as a UTC interval.
+
+        The end is the start of the next local day.  Constructing both
+        boundaries in the configured zone keeps DST days at 23 or 25 hours
+        instead of assuming that a calendar day is always 86,400 seconds.
+        """
+        if days < 1:
+            raise ValueError("days must be positive")
+        timezone = self._calendar_timezone()
+        current = now if now is not None else self._calendar_now()
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=UTC)
+        end_date = current.astimezone(timezone).date() + timedelta(days=1)
+        start_date = end_date - timedelta(days=days)
+        start_local = datetime.combine(start_date, time.min, tzinfo=timezone)
+        end_local = datetime.combine(end_date, time.min, tzinfo=timezone)
+        return (
+            start_local.astimezone(UTC).isoformat(timespec="seconds"),
+            end_local.astimezone(UTC).isoformat(timespec="seconds"),
+        )
+
+    def calendar_day_bounds(self, now: datetime | None = None) -> tuple[str, str]:
+        """Return the configured local day as a half-open UTC interval.
+
+        Message timestamps are normalized to UTC at ingest. Building both
+        boundaries in the configured zone before converting them preserves
+        23/25-hour days around DST transitions and avoids string-prefix date
+        comparisons at the API layer.
+        """
+        return self.calendar_range(1, now=now)
 
     @classmethod
     def from_env(cls) -> Settings:

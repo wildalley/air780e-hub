@@ -111,6 +111,63 @@ def test_healthz_is_public(client):
     assert client.get("/healthz").json()["ok"] is True
 
 
+def test_readyz_checks_runtime_without_requiring_an_agent(client):
+    response = client.get("/readyz")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ok"] is True
+    assert body["ready"] is True
+    assert body["checks"] == {
+        "database": True,
+        "background": True,
+        "notifier": True,
+        "maintenance": True,
+    }
+    assert body["agents_connected"] == 0
+    assert response.headers["Cache-Control"] == "no-store"
+
+
+def test_readyz_returns_503_during_restore_maintenance(client, monkeypatch):
+    state = client.app.state.hub
+    state.restore.active = True
+
+    def no_read(*args, **kwargs):
+        pytest.fail("readiness must not open a database during restore")
+
+    monkeypatch.setattr(state.db, "read_one", no_read)
+    response = client.get("/readyz")
+    assert response.status_code == 503
+    assert response.json()["checks"]["maintenance"] is False
+    assert response.headers["Retry-After"] == "2"
+
+
+def test_readyz_reports_database_failure_without_exposing_details(client, monkeypatch):
+    def failed_read(*args, **kwargs):
+        raise RuntimeError("private database failure")
+
+    monkeypatch.setattr(client.app.state.hub.db, "read_one", failed_read)
+    response = client.get("/readyz")
+    assert response.status_code == 503
+    assert response.json()["checks"]["database"] is False
+    assert "private" not in response.text
+    assert client.get("/healthz").status_code == 200
+
+
+def test_readyz_reports_missing_background_workers(client, monkeypatch):
+    with monkeypatch.context() as patch:
+        patch.setattr(client.app.state.hub, "background_tasks", [])
+        response = client.get("/readyz")
+    assert response.status_code == 503
+    assert response.json()["checks"]["background"] is False
+
+
+def test_readyz_reports_stopped_notifier(client):
+    client.portal.call(client.app.state.hub.notifier.pause, 0)
+    response = client.get("/readyz")
+    assert response.status_code == 503
+    assert response.json()["checks"]["notifier"] is False
+
+
 def test_calendar_today_uses_the_configured_timezone(tmp_path):
     east = Settings(data_dir=tmp_path, timezone="Pacific/Kiritimati")
     west = Settings(data_dir=tmp_path, timezone="Pacific/Pago_Pago")
@@ -121,6 +178,31 @@ def test_calendar_today_uses_the_configured_timezone(tmp_path):
         ZoneInfo("Pacific/Pago_Pago")
     ).date()
     assert east.calendar_today() > west.calendar_today()
+
+
+@pytest.mark.parametrize("zone,now,start,end", [
+    ("Asia/Shanghai", "2025-12-31T16:00:00+00:00",
+     "2025-12-31T16:00:00+00:00", "2026-01-01T16:00:00+00:00"),
+    ("Asia/Shanghai", "2026-01-01T00:00:00+00:00",
+     "2025-12-31T16:00:00+00:00", "2026-01-01T16:00:00+00:00"),
+    ("Asia/Shanghai", "2026-02-28T16:00:00+00:00",
+     "2026-02-28T16:00:00+00:00", "2026-03-01T16:00:00+00:00"),
+    ("America/New_York", "2024-03-10T12:00:00+00:00",
+     "2024-03-10T05:00:00+00:00", "2024-03-11T04:00:00+00:00"),
+    ("America/New_York", "2024-11-03T12:00:00+00:00",
+     "2024-11-03T04:00:00+00:00", "2024-11-04T05:00:00+00:00"),
+])
+def test_calendar_day_boundaries(tmp_path, zone, now, start, end):
+    settings = Settings(data_dir=tmp_path, timezone=zone)
+    assert settings.calendar_day_bounds(datetime.fromisoformat(now)) == (start, end)
+
+
+def test_calendar_timezone_fallback_is_reported(tmp_path):
+    settings = Settings(data_dir=tmp_path, timezone="Invalid/Timezone")
+    assert settings.calendar_timezone_name == "UTC"
+    assert settings.calendar_day_bounds(datetime(2026, 1, 1, tzinfo=UTC)) == (
+        "2026-01-01T00:00:00+00:00", "2026-01-02T00:00:00+00:00",
+    )
 
 
 def test_openapi_is_not_exposed(client):
@@ -212,6 +294,28 @@ def test_agent_needs_a_valid_token(client):
             ws.send_json(HELLO)
             ws.receive_json()
     assert excinfo.value.code == 4001
+
+
+def test_gateway_close_metrics_explain_controlled_session_ends(admin):
+    from starlette.websockets import WebSocketDisconnect
+
+    with pytest.raises(WebSocketDisconnect):
+        with _connect(admin, token="wrong") as ws:
+            ws.send_json(HELLO)
+            ws.receive_json()
+
+    with admin.websocket_connect(
+        "/ws?self_check=1", headers={"Authorization": "Bearer test-token"}
+    ) as ws:
+        assert ws.receive_json() == {"type": "self_check", "ok": True}
+
+    closes = admin.get("/api/operations/diagnostics").json()["runtime"]["metrics"][
+        "gateway_closes"
+    ]
+    assert {row["category"] for row in closes} >= {"auth_failed", "self_check"}
+    assert next(
+        row for row in closes if row["category"] == "auth_failed"
+    )["code"] == 4001
 
 
 def test_websocket_self_check_authenticates_without_registering_agent(client):
@@ -2397,6 +2501,60 @@ def test_overview_counters(admin):
         assert overview["counters"]["devices_total"] == 2
         assert overview["counters"]["messages_total"] == 1
         assert len(overview["recent_messages"]) == 1
+
+
+def test_message_stats_uses_the_configured_calendar(admin, monkeypatch):
+    settings = admin.app.state.hub.settings
+    monkeypatch.setattr(settings, "_calendar_now", lambda: datetime(2026, 1, 1, tzinfo=UTC))
+    start, end = settings.calendar_range(2)
+    start_at = datetime.fromisoformat(start) + timedelta(minutes=1)
+    admin.app.state.hub.db.insert_message(
+        agent_id="stats-agent", device="a", direction="in", peer="10086",
+        body="calendar", ts=start_at.isoformat(), iccid="8986000000000000001",
+    )
+    response = admin.get("/api/stats/messages?days=2")
+    assert response.status_code == 200
+    assert response.headers["X-Hub-Calendar-Timezone"] == "Asia/Shanghai"
+    assert response.headers["X-Hub-Calendar-Start"] == start
+    assert response.headers["X-Hub-Calendar-End"] == end
+    assert response.headers["X-Hub-Calendar-Bucket"] == "local-day"
+    assert response.json() == [{
+        "day": start_at.astimezone(ZoneInfo("Asia/Shanghai")).date().isoformat(),
+        "sim_id": 1,
+        "received": 1,
+        "sent": 0,
+        "sim_label": "8986000000000000001",
+    }]
+
+
+def test_today_counter_matches_local_day_trend_and_sim_calendar(admin, monkeypatch):
+    state = admin.app.state.hub
+    monkeypatch.setattr(
+        state.settings, "_calendar_now", lambda: datetime(2026, 1, 1, tzinfo=UTC)
+    )
+    for ts in (
+        "2025-12-31T15:59:59+00:00",  # Previous local day.
+        "2025-12-31T16:00:00+00:00",  # Local midnight, before UTC midnight.
+        "2026-01-01T00:00:00+00:00",
+        "2026-01-01T15:59:59+00:00",
+        "2026-01-01T16:00:00+00:00",  # Next local day.
+    ):
+        state.db.insert_message(
+            agent_id="stats-agent", device="a", direction="in", peer="10086",
+            body="calendar boundary", ts=ts,
+        )
+    overview = admin.get("/api/overview").json()
+    assert overview["counters"]["messages_today"] == 3
+    assert overview["calendar"] == {
+        "timezone": "Asia/Shanghai",
+        "start": "2025-12-31T16:00:00+00:00",
+        "end": "2026-01-01T16:00:00+00:00",
+    }
+    stats = admin.get("/api/stats/messages?days=1").json()
+    assert stats == [{
+        "day": state.settings.calendar_today().isoformat(), "sim_id": None,
+        "received": 3, "sent": 0, "sim_label": None,
+    }]
 
 
 def test_status_events_do_not_erase_device_identity(admin):

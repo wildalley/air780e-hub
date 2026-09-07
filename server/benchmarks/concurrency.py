@@ -24,15 +24,15 @@ from hub_server.gateway import AgentConnection, Gateway
 class TimedLock:
     """Measure outer shared-connection lock waits and holds, excluding recursion."""
 
-    def __init__(self):
-        self.lock = threading.RLock()
+    def __init__(self, lock):
+        self.lock = lock
         self.local = threading.local()
         self.wait_ms = []
         self.hold_ms = []
 
     def __enter__(self):
         started = time.perf_counter()
-        self.lock.acquire()
+        self.lock.__enter__()
         depth = getattr(self.local, "depth", 0)
         if depth == 0:
             self.local.started = time.perf_counter()
@@ -40,11 +40,11 @@ class TimedLock:
         self.local.depth = depth + 1
         return self
 
-    def __exit__(self, *_args):
+    def __exit__(self, *args):
         self.local.depth -= 1
         if self.local.depth == 0:
             self.hold_ms.append((time.perf_counter() - self.local.started) * 1000)
-        self.lock.release()
+        self.lock.__exit__(*args)
 
 
 class SharedSynchronousDatabase(Database):
@@ -88,7 +88,7 @@ async def run_load(path, *, reference, readers, iterations, events, rows):
     device_id = db.upsert_device("load", {"name": "a", "online": True})
     for _ in range(1200):
         db.record_status(device_id, {"ts": "2000-01-01"})
-    db._lock = lock = TimedLock()
+    db._lock = lock = TimedLock(db._lock)
     socket = AckSocket()
     gateway = Gateway(db, Settings(data_dir=path.parent, agent_token="synthetic-only"))
     connection = AgentConnection("load", socket, stream_id="benchmark")
@@ -154,6 +154,9 @@ async def run_load(path, *, reference, readers, iterations, events, rows):
         assert socket.count == events
         assert results[0] == rows
         assert db.one("SELECT COUNT(*) AS n FROM ingested")["n"] == events
+        metrics = db.metrics.snapshot()
+        assert metrics["counters"]["events_committed"] == events
+        assert metrics["timings"]["gateway_ack"]["count"] == events
         return {
             "mode": "shared_sync_reference" if reference else "wal_readers_async_writer",
             "elapsed_seconds": round(time.perf_counter() - started, 3),
@@ -162,6 +165,7 @@ async def run_load(path, *, reference, readers, iterations, events, rows):
             "shared_lock_hold": summary(lock.hold_ms),
             "csv": {**summary(csv_ms), "rows": results[0]},
             "purge": summary(purge_ms),
+            "runtime_metrics": metrics,
         }
     finally:
         stopped.set()

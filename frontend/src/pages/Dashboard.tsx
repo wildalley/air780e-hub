@@ -47,6 +47,7 @@ import { LIVE_MS } from '../swr'
 import { STATUS, VIZ, seriesColor } from '../tokens'
 import { useTheme } from '@mui/material/styles'
 import type { Mode } from '../tokens'
+import { calendarDayKeys, shortCalendarDay } from '../calendar'
 
 /** The trend chart moves on the scale of days — it does not need 15 s. */
 const TREND_MS = 60_000
@@ -202,7 +203,14 @@ export function DashboardPage() {
           loading={statsLoading}
           onRetry={reloadStats}
         />
-        <TrendCard stats={stats ?? null} days={statsDays} onDaysChange={setStatsDays} viz={viz} />
+        <TrendCard
+          stats={stats ?? null}
+          days={statsDays}
+          timezone={overview.calendar?.timezone}
+          calendarEnd={overview.calendar?.end}
+          onDaysChange={setStatsDays}
+          viz={viz}
+        />
       </Box>
 
       <Box
@@ -428,11 +436,15 @@ function AttentionPanel({ incidents, total }: { incidents: Incident[]; total: nu
 function TrendCard({
   stats,
   days,
+  timezone,
+  calendarEnd,
   onDaysChange,
   viz,
 }: {
   stats: MessageStat[] | null
   days: number
+  timezone?: string
+  calendarEnd?: string
   onDaysChange: (days: number) => void
   viz: (typeof VIZ)[Mode]
 }) {
@@ -445,27 +457,31 @@ function TrendCard({
       byDay.set(row.day, entry)
     }
     const out: { day: string; received: number; sent: number }[] = []
-    const today = new Date()
-    for (let i = days - 1; i >= 0; i--) {
-      const d = new Date(today)
-      d.setDate(today.getDate() - i)
-      const key = d.toISOString().slice(0, 10)
+    const end = calendarEnd ? new Date(new Date(calendarEnd).getTime() - 1) : undefined
+    for (const key of calendarDayKeys(days, timezone ?? 'UTC', end)) {
       out.push(byDay.get(key) ?? { day: key, received: 0, sent: 0 })
     }
     return out
-  }, [stats, days])
-
-  const shortDay = (iso: string) => {
-    const d = new Date(`${iso}T00:00:00`)
-    return `${d.getMonth() + 1}/${d.getDate()}`
-  }
+  }, [stats, days, timezone, calendarEnd])
 
   return (
     <Card>
       <CardHeader
         title={<Typography variant="h3">短信趋势</Typography>}
+        subheader={timezone ? `按 ${timezone} 日历` : undefined}
+        slotProps={{ subheader: { sx: { overflowWrap: 'anywhere' } } }}
+        sx={{
+          flexWrap: { xs: 'wrap', sm: 'nowrap' },
+          '& .MuiCardHeader-content': { minWidth: 0 },
+          '& .MuiCardHeader-action': {
+            m: 0,
+            mt: { xs: 1, sm: 0 },
+            width: { xs: '100%', sm: 'auto' },
+          },
+        }}
         action={
           <ToggleButtonGroup
+            aria-label="短信趋势时间范围"
             size="small"
             exclusive
             value={days}
@@ -499,7 +515,7 @@ function TrendCard({
               <XAxis
                 dataKey="day"
                 tick={{ fontSize: 11, fill: viz.axis }}
-                tickFormatter={shortDay}
+                tickFormatter={shortCalendarDay}
                 interval="preserveStartEnd"
                 minTickGap={24}
                 stroke={viz.axis}
@@ -517,7 +533,7 @@ function TrendCard({
                   borderRadius: 12,
                   fontSize: 13,
                 }}
-                labelFormatter={(label) => (typeof label === 'string' ? shortDay(label) : '')}
+                labelFormatter={(label) => (typeof label === 'string' ? shortCalendarDay(label) : '')}
                 formatter={(value, name) => [
                   String(value ?? ''),
                   name === 'received' ? '收到' : '发出',

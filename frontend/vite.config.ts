@@ -39,6 +39,7 @@ export default defineConfig({
         '/api': { target: `http://${target}`, changeOrigin: true },
         '/ws': { target: `ws://${target}`, ws: true },
         '/healthz': { target: `http://${target}`, changeOrigin: true },
+        '/readyz': { target: `http://${target}`, changeOrigin: true },
       }
     })(),
   },

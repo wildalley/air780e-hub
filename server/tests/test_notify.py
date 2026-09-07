@@ -380,6 +380,12 @@ async def test_retry_then_success(db, settings):
     assert results[0]["attempts"] == 3
     assert len(recorder.requests) == 3
     assert notify_logs(db)[0]["attempts"] == 3
+    metrics = db.metrics.snapshot()
+    assert metrics["counters"]["notify_attempts"] == 3
+    assert metrics["counters"]["notify_failed"] == 2
+    assert metrics["counters"]["notify_succeeded"] == 1
+    assert metrics["counters"]["notify_retry_scheduled"] == 2
+    assert metrics["timings"]["notify_send"]["count"] == 3
 
 
 async def test_retry_exhausted_records_the_providers_complaint(db, settings):

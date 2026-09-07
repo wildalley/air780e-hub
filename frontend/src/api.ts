@@ -422,6 +422,7 @@ export interface Overview {
   agents: { id: string; version: string; connected: number; last_seen_at: string }[]
   devices: Device[]
   sims: Sim[]
+  calendar?: { timezone: string; start: string; end: string }
   counters: {
     messages_total: number
     messages_today: number
