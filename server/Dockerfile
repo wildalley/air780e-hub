@@ -18,7 +18,7 @@ RUN npm run build
 
 
 # --- Python environment ------------------------------------------------------
-FROM python:3.12-slim AS python-build
+FROM python:3.14-slim AS python-build
 
 COPY --from=ghcr.io/astral-sh/uv:0.11.28 /uv /usr/local/bin/uv
 
@@ -38,7 +38,7 @@ RUN uv sync --frozen --no-dev --no-editable
 
 
 # --- runtime ----------------------------------------------------------------
-FROM python:3.12-slim AS runtime
+FROM python:3.14-slim AS runtime
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
